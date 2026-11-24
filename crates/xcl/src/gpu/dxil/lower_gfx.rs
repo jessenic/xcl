@@ -14,7 +14,7 @@ use super::lower::{err, LResult, Lw};
 use super::module::{Pred, Value};
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded};
-use crate::gpu::recomp::{elements_at, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, PsInterface, VsInterface};
+use crate::gpu::recomp::{elements_at, ps_input_vgpr, ps_slot_attribute, ranked, PsInterface, VsInterface};
 
 /// An output element: its signature handle, components and the temporaries holding them.
 pub struct GfxOut {
@@ -340,25 +340,54 @@ impl Lw {
                 32..=63 => {
                     let vs = self.gfx().vs.clone().expect("vs");
                     let k = (tgt - 32) as usize;
-                    let at = vs_param_register(&vs, k).map(|r| elements_at(&vs.outputs, true, r)).unwrap_or_default();
-                    for j in at {
-                        let ct = ranked(&vs.outputs, true)[j].component_type;
-                        let (vars, n) = {
-                            let o = &self.gfx().params[j];
-                            (o.vars.clone(), o.comps)
-                        };
-                        for c in 0..n as usize {
-                            if enabled(c) {
-                                let raw = comp(self, c);
-                                let v = if compr && is_float_ct(ct) {
-                                    let f = self.s.f16_to_f32(raw);
-                                    self.bits(f)
-                                } else if compr && is_sint_ct(ct) {
-                                    self.sx16(raw)
-                                } else {
-                                    raw
+                    let Some((lo_reg, hi_reg, packed16)) = crate::gpu::recomp::param_slot_regs(&vs.outputs, vs.params.as_deref(), k) else {
+                        return Ok(());
+                    };
+                    let unpack_half = |lw: &mut Lw, raw: Value, ct: u32| -> Value {
+                        if is_float_ct(ct) {
+                            let f = lw.s.f16_to_f32(raw);
+                            lw.bits(f)
+                        } else if is_sint_ct(ct) {
+                            lw.sx16(raw)
+                        } else {
+                            raw
+                        }
+                    };
+                    if packed16 && !compr {
+                        let ranked_outs = ranked(&vs.outputs, true);
+                        for (half_group, reg_opt) in [(0usize, Some(lo_reg)), (2usize, hi_reg)] {
+                            let Some(reg) = reg_opt else { continue };
+                            for j in elements_at(&vs.outputs, true, reg) {
+                                let ct = ranked_outs[j].component_type;
+                                let (vars, n) = {
+                                    let o = &self.gfx().params[j];
+                                    (o.vars.clone(), o.comps)
                                 };
-                                self.set_out(vars[c], v);
+                                for c in 0..n as usize {
+                                    let ch = half_group + c / 2;
+                                    if enabled(ch) {
+                                        let w = srcs[ch];
+                                        let raw = if c % 2 == 0 { self.andc(w, 0xFFFF) } else { self.lshrc(w, 16) };
+                                        let v = unpack_half(self, raw, ct);
+                                        self.set_out(vars[c], v);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let ranked_outs = ranked(&vs.outputs, true);
+                        for j in elements_at(&vs.outputs, true, lo_reg) {
+                            let ct = ranked_outs[j].component_type;
+                            let (vars, n) = {
+                                let o = &self.gfx().params[j];
+                                (o.vars.clone(), o.comps)
+                            };
+                            for c in 0..n as usize {
+                                if enabled(c) {
+                                    let raw = comp(self, c);
+                                    let v = if compr { unpack_half(self, raw, ct) } else { raw };
+                                    self.set_out(vars[c], v);
+                                }
                             }
                         }
                     }
@@ -418,17 +447,22 @@ impl Lw {
     pub fn interp_gfx(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let Some(ps) = self.gfx.as_ref().and_then(|g| g.ps.clone()) else { return err(d, "interpolation outside PS") };
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
-        let (vdst, ij, attr, chan) = if d.enc.name == "ENC_VINTRP" {
-            (f("VDST"), f("VSRC"), f("ATTR"), f("ATTRCHAN"))
+        let (vdst, ij, attr, chan, high) = if d.enc.name == "ENC_VINTRP" {
+            (f("VDST"), f("VSRC"), f("ATTR"), f("ATTRCHAN"), 0)
         } else {
+            let s0 = f("SRC0");
             let s1 = f("SRC1");
-            (f("VDST"), if s1 >= 256 { s1 - 256 } else { s1 }, f("SRC0") & 0x3F, f("SRC0") >> 6 & 3)
+            (f("VDST"), if s1 >= 256 { s1 - 256 } else { s1 }, s0 & 0x3F, (s0 >> 6) & 3, (s0 >> 8) & 1)
         };
-        let Some(slot) = ps_attribute_slot(&ps, attr as usize, chan as usize) else { return err(d, "attribute outside ISG1") };
+        let is_f16 = name.ends_with("_f16");
+        let Some((slot, comp)) = crate::gpu::recomp::ps_attribute_slot_and_comp(&ps, attr as usize, chan as usize, high as usize, is_f16) else {
+            return err(d, "attribute outside ISG1");
+        };
+        let clamp = d.enc.name != "ENC_VINTRP" && f("CLAMP") == 1;
         let load = |lw: &mut Lw| -> Value {
             let g = lw.gfx.as_mut().expect("gfx");
             let (sig, _) = g.ps_in[slot];
-            let x = g.io.load_input(&mut lw.s, sig, 0, chan as u8);
+            let x = g.io.load_input(&mut lw.s, sig, 0, comp as u8);
             let i32 = lw.s.m.i32();
             lw.s.m.bitcast(x, i32)
         };
@@ -436,7 +470,14 @@ impl Lw {
         match name {
             "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => {}
             "v_interp_p2_f32" => {
-                let v = load(self);
+                let x = load(self);
+                let v = if clamp {
+                    let xf = self.f(x);
+                    let s = self.un(super::ops::FUnary::Saturate, xf);
+                    self.bits(s)
+                } else {
+                    x
+                };
                 self.write32(&dst, v);
             }
             "v_interp_mov_f32" => {
@@ -448,7 +489,10 @@ impl Lw {
             }
             "v_interp_p2_f16" => {
                 let x = load(self);
-                let xf = self.f(x);
+                let mut xf = self.f(x);
+                if clamp {
+                    xf = self.un(super::ops::FUnary::Saturate, xf);
+                }
                 let h = self.to_f16(xf);
                 let cur = self.vreg(vdst);
                 let hi = rdna2::field_value(d.enc, &d.words, "OP_SEL").unwrap_or(0) >> 3 & 1 == 1;

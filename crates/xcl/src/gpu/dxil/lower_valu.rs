@@ -1377,16 +1377,16 @@ impl Lw {
         let src_code = Self::fv(d, "SRC0");
         let vdst = Self::fv(d, "VDST");
         let m0 = self.sreg(124);
+        let m0_lo = self.andc(m0, 0xFF);
         let top = self.touched_top_vgpr().max(vdst).max(src_code.saturating_sub(256));
         let (rd_idx, wr_idx) = match name {
-            "v_movrels_b32" => (Some(m0), None),
-            "v_movreld_b32" => (None, Some(m0)),
-            "v_movrelsd_b32" => (Some(m0), Some(m0)),
+            "v_movrels_b32" => (Some(m0_lo), None),
+            "v_movreld_b32" => (None, Some(m0_lo)),
+            "v_movrelsd_b32" => (Some(m0_lo), Some(m0_lo)),
             "v_movrelsd_2_b32" => {
-                let r = self.andc(m0, 0x3FF);
                 let w = self.lshrc(m0, 16);
-                let w = self.andc(w, 0x3FF);
-                (Some(r), Some(w))
+                let w = self.andc(w, 0xFF);
+                (Some(m0_lo), Some(w))
             }
             _ => return err(d, "movrel"),
         };
@@ -1457,9 +1457,10 @@ impl Lw {
         let base = src_code - 256;
         let top = self.touched_top_vgpr().max(vdst).max(base);
         let m0 = self.sreg(124);
+        let m0_lo = self.andc(m0, 0xFF);
         let a = self.act();
         let td = self.vreg(vdst);
-        if let Some(k) = self.s.m.const_u64(m0) {
+        if let Some(k) = self.s.m.const_u64(m0_lo) {
             let ts = if base + k <= top { self.vreg(base + k) } else { self.c(0) };
             let nv = self.sel(a, ts, td);
             self.wr(VAR_VGPR + vdst as u32, nv);
@@ -1470,17 +1471,17 @@ impl Lw {
             }
             return Ok(());
         }
-        let lim = top.saturating_sub(base).min(self.value_upper_bound(m0) as u64);
+        let lim = top.saturating_sub(base).min(self.value_upper_bound(m0_lo) as u64);
         let mut ts = self.c(0);
         for k in 0..=lim {
             let r = self.vreg(base + k);
-            let is = self.cmpc(Pred::Eq, m0, k as u32);
+            let is = self.cmpc(Pred::Eq, m0_lo, k as u32);
             ts = self.sel(is, r, ts);
         }
         let nv = self.sel(a, ts, td);
         self.wr(VAR_VGPR + vdst as u32, nv);
         for k in 0..=lim {
-            let is = self.cmpc(Pred::Eq, m0, k as u32);
+            let is = self.cmpc(Pred::Eq, m0_lo, k as u32);
             let c = self.land(a, is);
             let old = self.vreg(base + k);
             let v = self.sel(c, td, old);
@@ -1520,5 +1521,130 @@ mod fidelity_tests {
         if let Err(e) = validate::validate(&k.dxil) {
             panic!("DXIL validation failed: {e}");
         }
+    }
+
+    #[test]
+    fn direct_dxil_movrel_masks_m0_low_byte() {
+        // Non-zero M0[31:8] must be ignored (`M0 & 0xFF`) for v_movrel* / v_swaprel_b32 / s_movrel*.
+        let code: Vec<u8> = [
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 14), ("SRC0", 128)][..], None),
+            ("S_OR_B32", "ENC_SOP2", &[("SDST", 124), ("SSRC0", 0), ("SSRC1", 255)], Some(0x1234_0000)),
+            ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 10)], None),
+            ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 1)], None),
+            ("V_MOVRELSD_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 10)], None),
+            ("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 10)], None),
+            ("S_MOVRELS_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 4)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let k = crate::gpu::dxil::kernel::translate_full(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).unwrap();
+        validate::validate(&k.dxil).expect("DXIL validation failed");
+        let dis = validate::disassemble(&k.dxil).expect("DXIL disassemble failed");
+        assert!(dis.contains("and i32") && dis.contains(", 255"), "expected M0 & 255 mask in DXIL:\n{dis}");
+    }
+
+    #[test]
+    fn direct_dxil_packed_f16_vs_ps_and_ms_validate() {
+        use crate::gpu::dxbc::SigElement;
+        use crate::gpu::dxil::kernel::{translate_mesh, translate_pixel, translate_vertex};
+        use crate::gpu::recomp::{MsInterface, PsAttr, PsInterface, VsInterface, VS_PARAM_PACKED16};
+
+        let vs_code: Vec<u8> = [
+            ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3)][..], None),
+            ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 33), ("EN", 0x3), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 0), ("VSRC3", 0)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let outs = vec![
+            SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 },
+            SigElement { name: "TEXCOORD".into(), index: 1, system_value: 0, component_type: 6, register: 1, mask: 0x7, rw_mask: 0x7, stream: 0 },
+            SigElement { name: "TEXCOORD".into(), index: 4, system_value: 0, component_type: 6, register: 2, mask: 0xF, rw_mask: 0xF, stream: 0 },
+            SigElement { name: "TEXCOORD".into(), index: 10, system_value: 0, component_type: 3, register: 3, mask: 0x3, rw_mask: 0x3, stream: 0 },
+        ];
+        let vsi = VsInterface {
+            inputs: vec![],
+            outputs: outs.clone(),
+            attr_base: 4,
+            params: Some(vec![1 | VS_PARAM_PACKED16, 3]),
+        };
+        let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        let kv = translate_vertex(&vs_code, o, &vsi).expect("direct VS packed16");
+        validate::validate(&kv.dxil).expect("VS DXIL validate");
+        let dis_v = validate::disassemble(&kv.dxil).expect("VS dis");
+        assert!(dis_v.contains("dx.op.legacyF16ToF32"), "expected f16 unpack in VS DXIL:\n{dis_v}");
+
+        let msi = MsInterface { outputs: outs.clone(), threads: 64, max_vertices: 64, max_primitives: 64 };
+        let km = translate_mesh(&vs_code, o, &msi).expect("direct MS packed16");
+        validate::validate(&km.dxil).expect("MS DXIL validate");
+
+        let ps_code: Vec<u8> = [
+            ("V_INTERP_P1LL_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", 0x000), ("SRC1", V + 0)][..], None),
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", 0x000), ("SRC1", V + 1), ("SRC2", V + 10)], None),
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", 0x100), ("SRC1", V + 1), ("SRC2", V + 10), ("OP_SEL", 8)], None),
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", 0x1C0), ("SRC1", V + 1), ("SRC2", V + 11), ("CLAMP", 1)], None),
+            ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 12), ("VSRC", 1), ("ATTR", 1), ("ATTRCHAN", 0)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("DONE", 1), ("VSRC0", 10), ("VSRC1", 11), ("VSRC2", 12), ("VSRC3", 12)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let psi = PsInterface {
+            inputs: outs,
+            outputs: vec![SigElement { name: "SV_Target".into(), index: 0, system_value: 64, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
+            input_ena: 0x0002,
+            attrs: Some(vec![
+                PsAttr { kind: 6, register: 1, mask: 0x3, flat: false, hi_register: Some(2), packed16: true },
+                PsAttr { kind: 6, register: 3, mask: 0x3, flat: false, hi_register: None, packed16: false },
+            ]),
+        };
+        let kp = translate_pixel(&ps_code, o, &psi).expect("direct PS packed16");
+        validate::validate(&kp.dxil).expect("PS DXIL validate");
+        let dis_p = validate::disassemble(&kp.dxil).expect("PS dis");
+        assert!(dis_p.contains("dx.op.unary.f32(i32 7,"), "expected saturate clamp on v_interp_p2_f16:\n{dis_p}");
+    }
+
+    #[test]
+    fn direct_dxil_mesh_non_uniform_barrier_guard() {
+        use crate::gpu::dxbc::SigElement;
+        use crate::gpu::dxil::kernel::translate_mesh;
+        use crate::gpu::recomp::MsInterface;
+
+        let ms = MsInterface {
+            outputs: vec![SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
+            threads: 128,
+            max_vertices: 64,
+            max_primitives: 64,
+        };
+        let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+
+        // Uniform s_barrier: every wave executes it -> Direct DXIL accepts & validates.
+        let uniform: Vec<u8> = [
+            ("S_BARRIER", "ENC_SOPP", &[][..], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let ku = translate_mesh(&uniform, o, &ms).expect("uniform MS barrier");
+        validate::validate(&ku.dxil).expect("uniform MS DXIL validate");
+
+        // Early-exit s_endpgm bypassing s_barrier in a multi-wave MS -> rejected so caller uses HLSL xcl_s_barrier().
+        let non_uniform: Vec<u8> = [
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 128)][..], None),
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_BARRIER", "ENC_SOPP", &[], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let err = translate_mesh(&non_uniform, o, &ms).err().expect("non-uniform multi-wave MS barrier must fall back");
+        assert!(err.contains("non-uniform s_barrier"), "unexpected error: {err}");
     }
 }

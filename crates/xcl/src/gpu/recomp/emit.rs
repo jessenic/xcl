@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::{elements_at, ps_input_vgpr, ps_slot_attribute, ranked, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use super::upper_lanes::Read;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
@@ -1713,18 +1713,20 @@ impl Em {
             return Err("scalar movrel register");
         }
         let m0 = self.sreg(124);
+        let m0_lo = format!("({m0} & 0xFFu)");
         let m0_ub = self.m0_bounds.get(&d.pc).copied().unwrap_or(u32::MAX);
+        let m0_lo_ub = m0_ub.min(0xFF) as u64;
         let (rd, wr, wide, rd_max, wr_max) = match name {
-            "s_movrels_b32" => (Some(m0.clone()), None, false, m0_ub as u64, 0u64),
-            "s_movrels_b64" => (Some(m0.clone()), None, true, m0_ub as u64, 0u64),
-            "s_movreld_b32" => (None, Some(m0.clone()), false, 0u64, m0_ub as u64),
-            "s_movreld_b64" => (None, Some(m0.clone()), true, 0u64, m0_ub as u64),
+            "s_movrels_b32" => (Some(m0_lo.clone()), None, false, m0_lo_ub, 0u64),
+            "s_movrels_b64" => (Some(m0_lo.clone()), None, true, m0_lo_ub, 0u64),
+            "s_movreld_b32" => (None, Some(m0_lo.clone()), false, 0u64, m0_lo_ub),
+            "s_movreld_b64" => (None, Some(m0_lo.clone()), true, 0u64, m0_lo_ub),
             "s_movrelsd_2_b32" => (
-                Some(format!("({m0} & 0x3FFu)")),
-                Some(format!("(({m0} >> 16) & 0x3FFu)")),
+                Some(m0_lo),
+                Some(format!("(({m0} >> 16) & 0xFFu)")),
                 false,
-                m0_ub.min(0x3FF) as u64,
-                (m0_ub >> 16).min(0x3FF) as u64,
+                m0_lo_ub,
+                (m0_ub >> 16).min(0xFF) as u64,
             ),
             _ => return Err("scalar movrel"),
         };
@@ -2318,29 +2320,63 @@ impl Em {
             }
             (Mode::Vertex(_), 13..=15) => {} // misc vector / clip distances: SV_ClipDistance comes from its param
             (Mode::Vertex(vs), 32..=63) => {
-                // param N is a register: channel c goes to component c of every element there
+                // param N is a register (or a pair of 16-bit registers packed two components per channel)
                 let k = (tgt - 32) as usize;
                 let params = ranked(&vs.outputs, true);
-                let at = vs_param_register(vs, k).map(|r| elements_at(&vs.outputs, true, r)).unwrap_or_default();
-                if at.is_empty() {
+                let Some((lo_reg, hi_reg, packed16)) = super::param_slot_regs(&vs.outputs, vs.params.as_deref(), k) else {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
-                }
-                for j in at {
-                    let e = params[j];
-                    let n = out_comps(e);
-                    for c in 0..n {
-                        if enabled(c) {
-                            let raw = Self::exp_comp(srcs, compr, c);
-                            let v = match (e.component_type, compr) {
-                                (3 | 6, true) => format!("f16tof32({raw})"),
-                                (3 | 6, false) => format!("asfloat({raw})"),
-                                (2 | 5, true) => format!("(((int)({raw} << 16)) >> 16)"),
-                                (2 | 5, false) => format!("(int){raw}"),
-                                (_, _) => raw,
-                            };
-                            let comp = if n == 1 { String::new() } else { format!("[{c}]") };
-                            st.push(format!("xo.p{j}{comp} = {v};"));
+                };
+                if packed16 && !compr {
+                    let mut wrote = false;
+                    for (half_group, reg_opt) in [(0usize, Some(lo_reg)), (2usize, hi_reg)] {
+                        let Some(reg) = reg_opt else { continue };
+                        for j in elements_at(&vs.outputs, true, reg) {
+                            wrote = true;
+                            let e = params[j];
+                            let n = out_comps(e);
+                            for c in 0..n {
+                                let ch = half_group + c / 2;
+                                if enabled(ch) {
+                                    let r = &srcs[ch];
+                                    let raw = if c % 2 == 0 { format!("({r} & 0xFFFFu)") } else { format!("({r} >> 16)") };
+                                    let v = match e.component_type {
+                                        3 | 6 => format!("f16tof32({raw})"),
+                                        2 | 5 => format!("(((int)({raw} << 16)) >> 16)"),
+                                        _ => raw,
+                                    };
+                                    let comp = if n == 1 { String::new() } else { format!("[{c}]") };
+                                    st.push(format!("xo.p{j}{comp} = {v};"));
+                                }
+                            }
+                        }
+                    }
+                    if !wrote {
+                        self.line("/* param without an OSG1 element (dummy) */");
+                        return Ok(());
+                    }
+                } else {
+                    let at = elements_at(&vs.outputs, true, lo_reg);
+                    if at.is_empty() {
+                        self.line("/* param without an OSG1 element (dummy) */");
+                        return Ok(());
+                    }
+                    for j in at {
+                        let e = params[j];
+                        let n = out_comps(e);
+                        for c in 0..n {
+                            if enabled(c) {
+                                let raw = Self::exp_comp(srcs, compr, c);
+                                let v = match (e.component_type, compr) {
+                                    (3 | 6, true) => format!("f16tof32({raw})"),
+                                    (3 | 6, false) => format!("asfloat({raw})"),
+                                    (2 | 5, true) => format!("(((int)({raw} << 16)) >> 16)"),
+                                    (2 | 5, false) => format!("(int){raw}"),
+                                    (_, _) => raw,
+                                };
+                                let comp = if n == 1 { String::new() } else { format!("[{c}]") };
+                                st.push(format!("xo.p{j}{comp} = {v};"));
+                            }
                         }
                     }
                 }
@@ -2386,18 +2422,57 @@ impl Em {
             }
             (Mode::Mesh(_), 13..=15) => {} // misc vector / clip distances (from their params)
             (Mode::Mesh(ms), 32..=63) => {
-                // param N is a register: its record slot is that of every element there (the
-                // pass-through reads an element's slot as the whole register, as for the GS)
+                // param N is a register (or a pair of 16-bit registers packed two components per channel)
                 let k = (tgt - 32) as usize;
-                let at = param_registers(&ms.outputs, true).get(k).map(|&r| elements_at(&ms.outputs, true, r)).unwrap_or_default();
-                if at.is_empty() {
+                let params = ranked(&ms.outputs, true);
+                let Some((lo_reg, hi_reg, packed16)) = super::param_slot_regs(&ms.outputs, None, k) else {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
-                }
-                for j in at {
-                    for c in 0..4 {
-                        if enabled(c) {
-                            st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {});", 4 * (j + 1) + c, Self::exp_comp(srcs, compr, c)));
+                };
+                if packed16 && !compr {
+                    let mut wrote = false;
+                    for (half_group, reg_opt) in [(0usize, Some(lo_reg)), (2usize, hi_reg)] {
+                        let Some(reg) = reg_opt else { continue };
+                        for j in elements_at(&ms.outputs, true, reg) {
+                            wrote = true;
+                            let ct = params[j].component_type;
+                            for c in 0..4 {
+                                let ch = half_group + c / 2;
+                                if enabled(ch) {
+                                    let r = &srcs[ch];
+                                    let raw = if c % 2 == 0 { format!("({r} & 0xFFFFu)") } else { format!("({r} >> 16)") };
+                                    let v = match ct {
+                                        3 | 6 => format!("asuint(f16tof32({raw}))"),
+                                        2 | 5 => format!("(uint)(((int)({raw} << 16)) >> 16)"),
+                                        _ => raw,
+                                    };
+                                    st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {v});", 4 * (j + 1) + c));
+                                }
+                            }
+                        }
+                    }
+                    if !wrote {
+                        self.line("/* param without an OSG1 element (dummy) */");
+                        return Ok(());
+                    }
+                } else {
+                    let at = elements_at(&ms.outputs, true, lo_reg);
+                    if at.is_empty() {
+                        self.line("/* param without an OSG1 element (dummy) */");
+                        return Ok(());
+                    }
+                    for j in at {
+                        let ct = params[j].component_type;
+                        for c in 0..4 {
+                            if enabled(c) {
+                                let raw = Self::exp_comp(srcs, compr, c);
+                                let v = match (ct, compr) {
+                                    (3 | 6, true) => format!("asuint(f16tof32({raw}))"),
+                                    (2 | 5, true) => format!("(uint)(((int)({raw} << 16)) >> 16)"),
+                                    (_, _) => raw,
+                                };
+                                st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {v});", 4 * (j + 1) + c));
+                            }
                         }
                     }
                 }
@@ -2423,25 +2498,28 @@ impl Em {
         Ok(())
     }
 
-    /// (vdst, I/J VGPR or interp_mov parameter, attribute, channel)
-    fn interp_fields(d: &Decoded) -> (u64, u64, u64, u64) {
+    /// (vdst, I/J VGPR or interp_mov parameter, attribute, channel, high-half bit)
+    fn interp_fields(d: &Decoded) -> (u64, u64, u64, u64, u64) {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         if d.enc.name == "ENC_VINTRP" {
-            (f("VDST"), f("VSRC"), f("ATTR"), f("ATTRCHAN"))
+            (f("VDST"), f("VSRC"), f("ATTR"), f("ATTRCHAN"), 0)
         } else {
+            let s0 = f("SRC0");
             let s1 = f("SRC1");
-            (f("VDST"), if s1 >= 256 { s1 - 256 } else { s1 }, f("SRC0") & 0x3F, f("SRC0") >> 6 & 3)
+            (f("VDST"), if s1 >= 256 { s1 - 256 } else { s1 }, s0 & 0x3F, (s0 >> 6) & 3, (s0 >> 8) & 1)
         }
     }
 
     /// v_interp_*: attributes come interpolated from the PC rasteriser (PS mode).
     fn interp(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let Mode::Pixel(ps) = &self.opt.mode else { return Err("interpolation outside PS") };
-        let (vdst, ij, attr, chan) = Self::interp_fields(d);
-        let Some(slot) = ps_attribute_slot(ps, attr as usize, chan as usize) else {
+        let (vdst, ij, attr, chan, high) = Self::interp_fields(d);
+        let is_f16 = name.ends_with("_f16");
+        let Some((slot, comp)) = super::ps_attribute_slot_and_comp(ps, attr as usize, chan as usize, high as usize, is_f16) else {
             return Err("attribute outside ISG1");
         };
-        let src = format!("xi.a{slot}[{chan}]");
+        let clamp = d.enc.name != "ENC_VINTRP" && rdna2::field_value(d.enc, &d.words, "CLAMP") == Some(1);
+        let src = format!("xi.a{slot}[{comp}]");
         let act = self.act();
         match name {
             "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => {
@@ -2450,7 +2528,8 @@ impl Em {
             "v_interp_p2_f32" => {
                 let v = self.vreg(vdst);
                 // P2 supplies a floating-point interpolation result.
-                self.line(&format!("{v} = select({act}, asuint((float){src}), {v});"));
+                let val = if clamp { format!("saturate((float){src})") } else { format!("(float){src}") };
+                self.line(&format!("{v} = select({act}, asuint({val}), {v});"));
             }
             "v_interp_mov_f32" => {
                 if ij != 2 {
@@ -2463,7 +2542,8 @@ impl Em {
             "v_interp_p2_f16" => {
                 let v = self.vreg(vdst);
                 let hi = rdna2::field_value(d.enc, &d.words, "OP_SEL").unwrap_or(0) >> 3 & 1 == 1;
-                let h = to_f16_expr(self.dynamic_f16_rm, &format!("(float){src}"));
+                let val = if clamp { format!("saturate((float){src})") } else { format!("(float){src}") };
+                let h = to_f16_expr(self.dynamic_f16_rm, &val);
                 let e = if hi { format!("({v} & 0xFFFFu) | ({h} << 16)") } else { format!("({v} & 0xFFFF0000u) | {h}") };
                 self.line(&format!("{v} = select({act}, {e}, {v});"));
             }
@@ -3336,20 +3416,22 @@ impl Em {
         let src_code = f("SRC0");
         let vdst = f("VDST");
         let m0 = self.sreg(124);
+        let m0_lo = format!("({m0} & 0xFFu)");
         let m0_ub = self.m0_bounds.get(&d.pc).copied().unwrap_or(u32::MAX);
+        let m0_lo_ub = m0_ub.min(0xFF) as u64;
         let act = self.act();
         let top = self.max_vgpr.max(vdst).max(src_code.saturating_sub(256));
         let _ = vop3;
         let t = self.t();
         let (rd_idx, wr_idx, rd_max, wr_max) = match name {
-            "v_movrels_b32" => (Some(m0.clone()), None, m0_ub as u64, 0u64),
-            "v_movreld_b32" => (None, Some(m0.clone()), 0u64, m0_ub as u64),
-            "v_movrelsd_b32" => (Some(m0.clone()), Some(m0.clone()), m0_ub as u64, m0_ub as u64),
+            "v_movrels_b32" => (Some(m0_lo.clone()), None, m0_lo_ub, 0u64),
+            "v_movreld_b32" => (None, Some(m0_lo.clone()), 0u64, m0_lo_ub),
+            "v_movrelsd_b32" => (Some(m0_lo.clone()), Some(m0_lo.clone()), m0_lo_ub, m0_lo_ub),
             "v_movrelsd_2_b32" => (
-                Some(format!("({m0} & 0x3FFu)")),
-                Some(format!("(({m0} >> 16) & 0x3FFu)")),
-                m0_ub.min(0x3FF) as u64,
-                (m0_ub >> 16).min(0x3FF) as u64,
+                Some(m0_lo),
+                Some(format!("(({m0} >> 16) & 0xFFu)")),
+                m0_lo_ub,
+                (m0_ub >> 16).min(0xFF) as u64,
             ),
             _ => return Err("movrel"),
         };
@@ -3402,7 +3484,8 @@ impl Em {
         let base = src_code - 256;
         let top = self.max_vgpr.max(vdst).max(base);
         let m0 = self.sreg(124);
-        let lim = top.saturating_sub(base).min(self.m0_bounds.get(&d.pc).copied().unwrap_or(u32::MAX) as u64);
+        let m0_lo = format!("({m0} & 0xFFu)");
+        let lim = top.saturating_sub(base).min(self.m0_bounds.get(&d.pc).copied().unwrap_or(u32::MAX).min(0xFF) as u64);
         let act = self.act();
         let (td, ts) = (self.t(), self.t());
         let vd = self.vreg(vdst);
@@ -3411,13 +3494,13 @@ impl Em {
         for k in 0..=lim {
             cases.push_str(&format!(" case {k}u: {ts} = {}; break;", self.vreg(base + k)));
         }
-        self.line(&format!("uint {ts} = 0u; switch ({m0}) {{{cases} default: break; }}"));
+        self.line(&format!("uint {ts} = 0u; switch ({m0_lo}) {{{cases} default: break; }}"));
         let mut cases = String::new();
         for k in 0..=lim {
             let v = self.vreg(base + k);
             cases.push_str(&format!(" case {k}u: {v} = {td}; break;"));
         }
-        self.line(&format!("if ({act}) {{ {vd} = {ts}; switch ({m0}) {{{cases} default: break; }} }}"));
+        self.line(&format!("if ({act}) {{ {vd} = {ts}; switch ({m0_lo}) {{{cases} default: break; }} }}"));
         Ok(())
     }
 
@@ -5365,8 +5448,8 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
             None => format!("uint4(0u, 0u, 0u, 0u).{sw}"),
         };
         let v = match e.component_type {
-            1 => raw,
-            2 => format!("asint({raw})"),
+            1 | 4 => raw,
+            2 | 5 => format!("asint({raw})"),
             _ => format!("asfloat({raw})"),
         };
         let _ = writeln!(fill, "        o.p{k} = {v};");
@@ -5727,7 +5810,7 @@ pub fn ps_attr_modes(insts: &[Decoded], ena: u32) -> BTreeMap<u32, String> {
         for d in &insts[start..end] {
             let name = d.inst.name.to_ascii_lowercase();
             if name.starts_with("v_interp_") {
-                let (_, ij, attr, _) = Em::interp_fields(d);
+                let (_, ij, attr, _, _) = Em::interp_fields(d);
                 if name == "v_interp_mov_f32" {
                     record(attr as u32, "nointerpolation");
                 } else if (ij as usize) < 256 {
@@ -6269,6 +6352,105 @@ mod fidelity_tests {
         let t = crate::gpu::recomp::translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         assert!(t.hlsl.contains("f16tof32("), "VS compr float16 param must unpack f16:\n{}", t.hlsl);
+    }
+
+    #[test]
+    fn ps_packed_f16_interp_high_bit_and_paired_attrs() {
+        // Paired 16-bit attributes: TEXCOORD0 (f32) @ attr0, TEXCOORD1 (f16x3) + TEXCOORD4 (f16x4)
+        // sharing attr1 across chan 0..1 and chan 2..3 with SRC0 bit-8 HIGH=0/1, plus TEXCOORD10 @ attr2.
+        let code: Vec<u8> = [
+            ("V_INTERP_P1LL_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", 0x001), ("SRC1", V + 0)][..], None),
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", 0x001), ("SRC1", V + 1), ("SRC2", V + 10)], None), // attr1 chan0 high0 -> a1[0]
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", 0x101), ("SRC1", V + 1), ("SRC2", V + 10), ("OP_SEL", 8)], None), // attr1 chan0 high1 -> a1[1], high dst half
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", 0x041), ("SRC1", V + 1), ("SRC2", V + 11)], None), // attr1 chan1 high0 -> a1[2]
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 12), ("SRC0", 0x081), ("SRC1", V + 1), ("SRC2", V + 12)], None), // attr1 chan2 high0 -> a2[0]
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 13), ("SRC0", 0x1C1), ("SRC1", V + 1), ("SRC2", V + 13), ("CLAMP", 1)], None), // attr1 chan3 high1 -> a2[3] + clamp
+            ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 14), ("VSRC", 1), ("ATTR", 2), ("ATTRCHAN", 0)], None), // attr2 -> a3[0]
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("DONE", 1), ("VSRC0", 10), ("VSRC1", 11), ("VSRC2", 12), ("VSRC3", 13)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let psi = crate::gpu::recomp::PsInterface {
+            inputs: vec![
+                SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 },
+                SigElement { name: "TEXCOORD".into(), index: 0, system_value: 0, component_type: 3, register: 1, mask: 0x3, rw_mask: 0x3, stream: 0 },
+                SigElement { name: "TEXCOORD".into(), index: 1, system_value: 0, component_type: 6, register: 2, mask: 0x7, rw_mask: 0x7, stream: 0 },
+                SigElement { name: "TEXCOORD".into(), index: 4, system_value: 0, component_type: 6, register: 3, mask: 0xF, rw_mask: 0xF, stream: 0 },
+                SigElement { name: "TEXCOORD".into(), index: 10, system_value: 0, component_type: 3, register: 5, mask: 0xF, rw_mask: 0xF, stream: 0 },
+            ],
+            outputs: vec![SigElement { name: "SV_Target".into(), index: 0, system_value: 64, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
+            input_ena: 0x0002,
+            attrs: Some(vec![
+                crate::gpu::recomp::PsAttr { kind: 6, register: 1, mask: 0x3, flat: false, hi_register: None, packed16: false },
+                crate::gpu::recomp::PsAttr { kind: 6, register: 2, mask: 0x3, flat: false, hi_register: Some(3), packed16: true },
+                crate::gpu::recomp::PsAttr { kind: 6, register: 5, mask: 0xF, flat: false, hi_register: None, packed16: false },
+            ]),
+        };
+        let t = crate::gpu::recomp::translate(&code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains("xi.a1[0]") && t.hlsl.contains("xi.a1[1]") && t.hlsl.contains("xi.a1[2]"), "expected TEXCOORD1.xyz:\n{}", t.hlsl);
+        assert!(t.hlsl.contains("xi.a2[0]") && t.hlsl.contains("saturate((float)xi.a2[3])"), "expected TEXCOORD4.xw + clamp:\n{}", t.hlsl);
+        assert!(t.hlsl.contains("xi.a3[0]"), "expected unshifted TEXCOORD10.x:\n{}", t.hlsl);
+        assert!(t.hlsl.contains("(v10 & 0xFFFF0000u) |") && t.hlsl.contains("(v10 & 0xFFFFu) |"), "expected paired half preservation on v10:\n{}", t.hlsl);
+    }
+
+    #[test]
+    fn vs_and_ms_packed_f16_param_unpack() {
+        let code: Vec<u8> = [
+            ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3)][..], None),
+            ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 33), ("EN", 0x3), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 0), ("VSRC3", 0)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let outs = vec![
+            SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 },
+            SigElement { name: "COLOR".into(), index: 0, system_value: 0, component_type: 6, register: 1, mask: 0xF, rw_mask: 0xF, stream: 0 },
+            SigElement { name: "TEXCOORD".into(), index: 0, system_value: 0, component_type: 3, register: 2, mask: 0x3, rw_mask: 0x3, stream: 0 },
+            SigElement { name: "TEXCOORD".into(), index: 1, system_value: 0, component_type: 6, register: 3, mask: 0xF, rw_mask: 0xF, stream: 0 },
+        ];
+        let vsi = crate::gpu::recomp::VsInterface {
+            inputs: vec![],
+            outputs: outs.clone(),
+            attr_base: 4,
+            params: Some(vec![1 | crate::gpu::recomp::VS_PARAM_PACKED16, 2]),
+        };
+        let tv = crate::gpu::recomp::translate(&code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
+        assert!(tv.complete(), "{:?}", tv.unsupported_why);
+        assert!(tv.hlsl.contains("xo.p0[0] = f16tof32((v4 & 0xFFFFu));") && tv.hlsl.contains("xo.p0[1] = f16tof32((v4 >> 16));"), "lo_reg COLOR0 unpack:\n{}", tv.hlsl);
+        assert!(tv.hlsl.contains("xo.p2[0] = f16tof32((v6 & 0xFFFFu));") && tv.hlsl.contains("xo.p2[3] = f16tof32((v7 >> 16));"), "hi_reg TEXCOORD1 unpack:\n{}", tv.hlsl);
+        assert!(tv.hlsl.contains("xo.p1[0] = asfloat(v8);"), "param1 TEXCOORD0:\n{}", tv.hlsl);
+
+        let msi = crate::gpu::recomp::MsInterface { outputs: outs, threads: 64, max_vertices: 64, max_primitives: 64 };
+        let tm = crate::gpu::recomp::translate(&code, &Options { mode: Mode::Mesh(msi.clone()), wave64: true, ..Default::default() }).unwrap();
+        assert!(tm.complete(), "{:?}", tm.unsupported_why);
+        assert!(tm.hlsl.contains("asuint(f16tof32((v4 & 0xFFFFu)))") && tm.hlsl.contains("asuint(f16tof32((v7 >> 16)))"), "MS packed16 unpack:\n{}", tm.hlsl);
+        let pt = super::mesh_passthrough(&msi);
+        assert!(pt.contains("float4 p0 : COLOR0;") && pt.contains("float4 p2 : TEXCOORD1;"));
+    }
+
+    #[test]
+    fn v_movrel_and_swaprel_mask_m0_low_byte() {
+        let code: Vec<u8> = [
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 128)][..], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(0x1234_0002)),
+            ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 10)], None),
+            ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 1)], None),
+            ("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 10)], None),
+            ("S_MOVRELS_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 4)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let t = crate::gpu::recomp::translate(&code, &Options { mode: Mode::Kernel, wave64: true, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains("switch ((m0 & 0xFFu))"), "expected M0[7:0] mask in HLSL:\n{}", t.hlsl);
+        assert!(!t.hlsl.contains("switch (m0)"), "unmasked switch(m0) must not appear:\n{}", t.hlsl);
     }
 }
 
