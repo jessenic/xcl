@@ -138,6 +138,9 @@ static FALLBACK_PSO: AtomicU64 = AtomicU64::new(0);
 static FAILED_PSO: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_RS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATED_PSO: AtomicU64 = AtomicU64::new(0);
+/// console MS containers moved from the AS slot and translated (logged sparsely: a title
+/// creates tens of thousands of these pipelines during boot)
+static AS_SLOT_MS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// XCL shader ABI root signature on the backend device (raw, kept for the process lifetime)
 static ABI_RS: AtomicUsize = AtomicUsize::new(0);
@@ -5870,10 +5873,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 fn mesh_shader_slots<'a>(ms_slot: Option<&'a [u8]>, as_slot: Option<&'a [u8]>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
     use crate::gpu::recomp::pso::is_console;
     match (ms_slot, as_slot) {
-        (None, Some(a)) if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") => {
-            crate::xlog_info!("D3D12.X: mesh pipeline with its MS {:016x} in the AS slot – translated as MS", crate::gpu::shader::fnv64(a));
-            (Some(a), None)
-        }
+        (None, Some(a)) if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") => (Some(a), None),
         (ms, a) => (ms, a),
     }
 }
@@ -5905,6 +5905,21 @@ mod mesh_slot_tests {
         // nothing: nothing
         assert!(mesh_shader_slots(None, None) == (None, None));
     }
+
+    /// The cached-only attempt defers a moved MS like a console compute pipeline: `defer`
+    /// marks the attempt missed, so `dev_create_pipeline_state` takes the background path
+    /// (stand-in now, translation on the worker / first bind) instead of translating on the
+    /// title's thread – tens of thousands of these pipelines during boot delayed the intro
+    /// by seconds on NVIDIA and past a minute on AMD wave64. Outside the attempt (the
+    /// worker's build) nothing is deferred.
+    #[test]
+    fn a_moved_ms_defers_in_the_attempt_only() {
+        let (_, missed) = crate::gpu::recomp::dxc::cached_only(|| {
+            assert!(crate::gpu::recomp::dxc::defer(), "inside the attempt: deferred");
+        });
+        assert!(missed, "the attempt is missed: the caller takes the background path");
+        assert!(!crate::gpu::recomp::dxc::defer(), "outside: the build translates");
+    }
 }
 
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
@@ -5925,6 +5940,9 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
+    // a console MS in the AS slot with no MS subobject: moved, and translated when first
+    // bound (below), not on the title's thread for each of tens of thousands
+    let moved = ms_slot.is_none();
     let (ms, as_slot) = mesh_shader_slots(ms_slot, as_slot);
     let Some(ms) = ms else { return None };
     if !is_console(ms) {
@@ -5942,6 +5960,14 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     // made when first bound (`pso_async::lazy`): not even translated now
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
         return None;
+    }
+    // a moved MS (`mesh_shader_slots`) is deferred above like any console MS; logged sparsely
+    // when it is built (a title creates tens of thousands of these during boot)
+    if moved {
+        let n = AS_SLOT_MS.fetch_add(1, Ordering::Relaxed);
+        if n < 5 || n % 1000 == 0 {
+            crate::xlog_info!("D3D12.X: mesh pipeline with its MS {:016x} in the AS slot – translated as MS (#{})", crate::gpu::shader::fnv64(ms), n + 1);
+        }
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
