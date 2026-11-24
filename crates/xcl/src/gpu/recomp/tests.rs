@@ -304,6 +304,36 @@ fn gpu_structured_branch_targets_match_rdna2() {
 }
 
 #[test]
+fn compute_shared_else_target_stores_the_taken_arms_value() {
+    if !gpu_ready() { return; }
+    // Both conditional branches land at v2 = 13. Only falling through both
+    // sets v2 = 11 and jumps past that assignment.
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 255)], Some(9)),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 5)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 3)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 255)], Some(11)),
+        ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 2)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 255)], Some(13)),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 4), ("SRSRC", 0), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+    ]);
+    let cs = super::CsInterface { threads: [32, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let tr = translate(&code, &Options { mode: Mode::Compute(cs), wave64: false, ..Default::default() }).unwrap();
+    assert!(tr.complete(), "{:?}", tr.unsupported_why);
+    let shader = super::dxc::compile(&tr.hlsl, "main", "cs_6_6", &[]).unwrap();
+    for (s0, s1, expected) in [(0u32, 0u32, 13u32), (4, 0, 13), (4, 1 << 16, 11)] {
+        let first = s0 as usize / 4;
+        let out = runner::dispatch(&shader, [1, 1, 1], &[s0, s1, 256, 0], &[0; 33]).unwrap();
+        assert_eq!(&out[first..first + 32], &[expected; 32], "s0={s0}, s1={s1}");
+    }
+}
+
+#[test]
 fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
     let code = prog(&[
         ("S_BFE_U64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 4), ("SSRC1", 8)], None),
