@@ -733,12 +733,15 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     // most derived PC interface this object implements
     let chain = layout::chain(kind.base());
     let qi: QiFn = std::mem::transmute(*ot);
-    let release: RefFn = std::mem::transmute(*ot.add(2));
     let mut iface = *chain.last().expect("layout chain");
     for i in &chain {
         let iid = layout::parse_guid(i.iid);
         let mut out = std::ptr::null_mut();
         if qi(obj, &iid, &mut out) >= 0 && !out.is_null() {
+            // A debug-layer or DRED wrapper can return a different interface pointer.
+            // For the original object, keep using its native vtable during readoption.
+            let out_vtable = if out == obj { ot } else { vt(out) };
+            let release: RefFn = std::mem::transmute(*out_vtable.add(2));
             release(out);
             iface = i;
             break;
@@ -7428,6 +7431,46 @@ mod this_first_tests {
         if let Some(g) = EXTS.lock().unwrap().as_mut() {
             g.remove(&vtbl);
         }
+    }
+}
+
+#[cfg(test)]
+mod class_probe_tests {
+    use super::*;
+
+    #[repr(C)]
+    struct Interface {
+        vtable: *const usize,
+        query_result: *mut c_void,
+        released_as: u32,
+    }
+
+    unsafe extern "system" fn query(this: *mut c_void, _: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        *out = (*this.cast::<Interface>()).query_result;
+        S_OK
+    }
+
+    unsafe extern "system" fn release_source(this: *mut c_void) -> u32 {
+        (*this.cast::<Interface>()).released_as = 1;
+        0
+    }
+
+    unsafe extern "system" fn release_result(this: *mut c_void) -> u32 {
+        (*this.cast::<Interface>()).released_as = 2;
+        0
+    }
+
+    #[test]
+    fn class_probe_releases_the_queried_interface() {
+        // class_for caches the source vtable address, so keep it unique and live.
+        let source_vtable = Box::leak(Box::new([0usize; 32]));
+        source_vtable[0] = query as usize;
+        source_vtable[2] = release_source as usize;
+        let result_vtable = [0, 0, release_result as usize];
+        let mut result = Interface { vtable: result_vtable.as_ptr(), query_result: std::ptr::null_mut(), released_as: 0 };
+        let mut source = Interface { vtable: source_vtable.as_ptr(), query_result: (&mut result as *mut Interface).cast(), released_as: 0 };
+        unsafe { class_for((&mut source as *mut Interface).cast(), source.vtable as usize, Kind::CommandAllocator) };
+        assert_eq!(result.released_as, 2, "Release belongs to the interface returned by QueryInterface");
     }
 }
 

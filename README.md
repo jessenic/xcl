@@ -197,6 +197,7 @@ KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Ag
 (`D3D12Core.dll`, plus `d3d12SDKLayers.dll` if using `XCL_D3D12_DEBUG=1`) in a `D3D12\` folder
 next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
 (for `cargo test`, use `%LOCALAPPDATA%\XCL\D3D12\` or `%XCL_D3D12_DIR%`).
+`XCL_DRED=1` enables device-removal diagnostics and can be combined with `XCL_D3D12_DEBUG=1`.
 
 - **DXC:** 1.8 or newer is recommended, from the
   [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases): unpack one
