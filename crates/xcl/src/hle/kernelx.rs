@@ -976,6 +976,11 @@ fn contiguous_home(pages: &[usize]) -> Option<usize> {
     contiguous_home_in(&blocks, pages)
 }
 
+/// Whether every page of `pages` (at least one) is a physical page allocated now.
+pub fn physical_pages_live(pages: &[usize]) -> bool {
+    !pages.is_empty() && pages.iter().all(|&p| page_home(p).is_some())
+}
+
 /// Whether a home is only reserved until it is used (a sparse window's, or plain memory's –
 /// the coherent window is committed as a whole).
 fn lazy_home(home: usize) -> bool {

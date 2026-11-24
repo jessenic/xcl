@@ -927,6 +927,22 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
 
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        // #1405: the list as the title holds it now, when it differs from the snapshot and names
+        // only allocated pages (a table slot rewritten after EnqueueRequest)
+        let mut current = vec![0usize; pages.len()];
+        let pages = if read_own(r.destination as usize, current.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages))
+            && current[..] != pages[..]
+            && crate::hle::kernelx::physical_pages_live(&current)
+        {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if k == 1 || k.is_power_of_two() {
+                crate::xlog_info!("DirectStorage: {k} page lists written after their request was enqueued: the pages named at execution are used");
+            }
+            &current[..]
+        } else {
+            pages
+        };
         // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
         // read again now. A retail title keeps its page arrays in its own tables and fills an
         // entry after EnqueueRequest – its streaming requests were refused by the thousand
