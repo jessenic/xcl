@@ -5946,6 +5946,28 @@ mod mesh_slot_tests {
         assert!(out.iter().any(|s| s.0 == 24) && !out.iter().any(|s| s.0 == 25));
     }
 
+    /// The stand-in's target formats are the PC's, as the real pipeline's: the console's
+    /// D16_UNORM_S8_UINT (118) is D24_UNORM_S8_UINT (45) and a B4G4R4A4 target (115) is
+    /// R8G8B8A8 (28). With the console's the driver refuses the stand-in (the title's depth-only
+    /// mesh pipelines; NishantParajuli's follow-up, reproduced natively by thehollowedone).
+    #[test]
+    fn the_stand_in_of_a_stream_has_the_pcs_target_formats() {
+        let mut s = sub(15, &{
+            let mut p = Vec::new();
+            for f in [115u32, 28, 0, 0, 0, 0, 0, 0, 2] {
+                p.extend_from_slice(&f.to_le_bytes());
+            }
+            p
+        });
+        s.extend_from_slice(&sub(16, &118u32.to_le_bytes()));
+        let desc = [s.len(), s.as_ptr() as usize];
+        let (out, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("a stand-in stream");
+        let subs = super::stream_subobjects(&out).unwrap();
+        let word = |p: &[u8], k: usize| u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap());
+        assert_eq!((subs[0].0, word(subs[0].1, 0), word(subs[0].1, 1), word(subs[0].1, 8)), (15, 28, 28, 2));
+        assert_eq!((subs[1].0, word(subs[1].1, 0)), (16, 45));
+    }
+
     /// A console MS container alone in the AS slot becomes the MS; a real AS (console or PC),
     /// an MS already present, or a PC shader in the AS slot are left as they are.
     #[test]
