@@ -44,10 +44,18 @@ pub struct GfxCtx {
 
 fn gct(component_type: u32) -> GCt {
     match component_type {
-        1 => GCt::U32,
-        2 => GCt::I32,
+        1 | 4 => GCt::U32,
+        2 | 5 => GCt::I32,
         _ => GCt::F32,
     }
+}
+
+fn is_float_ct(component_type: u32) -> bool {
+    matches!(component_type, 3 | 6)
+}
+
+fn is_sint_ct(component_type: u32) -> bool {
+    matches!(component_type, 2 | 5)
 }
 
 /// Components of an output element: clip / cull distances by their mask, the rest 4.
@@ -119,7 +127,7 @@ impl Lw {
                 _ => SemKind::Arbitrary,
             };
             let s = io.output(GSig::new(&e.name, e.index, kind, gct(e.component_type), n));
-            outs.push((s, n, e.component_type == 3));
+            outs.push((s, n, is_float_ct(e.component_type)));
         }
         // initial VGPRs: v0 = vertex id, v3 = instance id, the fetch shader's attribute VGPRs
         let mut vgpr = HashMap::new();
@@ -166,7 +174,7 @@ impl Lw {
         for (k, e) in ranked(&ps.inputs, false).iter().enumerate() {
             let attr = ps_slot_attribute(ps, k);
             let m = attr.and_then(|a| modes.get(&(a as u32))).cloned().unwrap_or_default();
-            let float = e.component_type == 3;
+            let float = is_float_ct(e.component_type);
             let interp = if !float {
                 Interp::Constant
             } else {
@@ -192,7 +200,7 @@ impl Lw {
             match e.system_value {
                 64 => {
                     let s = io.output(GSig::new("SV_Target", e.index, SemKind::Target, gct(e.component_type), 4));
-                    targets.insert(e.index, (GfxOut { sig: s, comps: 4, float: e.component_type == 3, vars: Vec::new() }, e.component_type));
+                    targets.insert(e.index, (GfxOut { sig: s, comps: 4, float: is_float_ct(e.component_type), vars: Vec::new() }, e.component_type));
                     any = true;
                 }
                 65 | 67 | 68 => {
@@ -317,7 +325,13 @@ impl Lw {
                     let vars = self.gfx().pos.as_ref().expect("pos").vars.clone();
                     for (c, &var) in vars.iter().enumerate() {
                         if enabled(c) {
-                            let v = comp(self, c);
+                            let raw = comp(self, c);
+                            let v = if compr {
+                                let f = self.s.f16_to_f32(raw);
+                                self.bits(f)
+                            } else {
+                                raw
+                            };
                             self.set_out(var, v);
                         }
                     }
@@ -328,13 +342,22 @@ impl Lw {
                     let k = (tgt - 32) as usize;
                     let at = vs_param_register(&vs, k).map(|r| elements_at(&vs.outputs, true, r)).unwrap_or_default();
                     for j in at {
+                        let ct = ranked(&vs.outputs, true)[j].component_type;
                         let (vars, n) = {
                             let o = &self.gfx().params[j];
                             (o.vars.clone(), o.comps)
                         };
                         for c in 0..n as usize {
                             if enabled(c) {
-                                let v = comp(self, c);
+                                let raw = comp(self, c);
+                                let v = if compr && is_float_ct(ct) {
+                                    let f = self.s.f16_to_f32(raw);
+                                    self.bits(f)
+                                } else if compr && is_sint_ct(ct) {
+                                    self.sx16(raw)
+                                } else {
+                                    raw
+                                };
                                 self.set_out(vars[c], v);
                             }
                         }
@@ -353,13 +376,13 @@ impl Lw {
                             continue;
                         }
                         let raw = comp(self, c);
-                        let v = match (ct, compr) {
-                            (3, true) => {
-                                let f = self.s.f16_to_f32(raw);
-                                self.bits(f)
-                            }
-                            (2, true) => self.sx16(raw),
-                            _ => raw,
+                        let v = if compr && is_float_ct(ct) {
+                            let f = self.s.f16_to_f32(raw);
+                            self.bits(f)
+                        } else if compr && is_sint_ct(ct) {
+                            self.sx16(raw)
+                        } else {
+                            raw
                         };
                         self.set_out(var, v);
                     }

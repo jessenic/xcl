@@ -1552,6 +1552,50 @@ impl Lw {
         Ok(())
     }
 
+    /// Sound unsigned upper bound on an SSA integer `Value` (`u32::MAX` if unknown).
+    /// Walks constants, `dx.op.binary.*` `UMin`, and `phi` nodes with cycle protection.
+    pub fn value_upper_bound(&self, v: Value) -> u32 {
+        let mut seen = BTreeSet::new();
+        self.value_ub_inner(v, &mut seen, 0)
+    }
+
+    fn value_ub_inner(&self, v: Value, seen: &mut BTreeSet<u32>, depth: u32) -> u32 {
+        if let Some(c) = self.s.m.const_u64(v) {
+            return c.min(u32::MAX as u64) as u32;
+        }
+        if depth >= 16 {
+            return u32::MAX;
+        }
+        let Value::Inst(i) = v else { return u32::MAX };
+        if !seen.insert(i) {
+            return u32::MAX;
+        }
+        let res = match self.s.m.inst_info(i) {
+            super::module::InstInfo::Call(name, args)
+                if name.starts_with("dx.op.binary.")
+                    && args.len() >= 3
+                    && self.s.m.const_u64(args[0]) == Some(Binary::UMin as u64) =>
+            {
+                let a = self.value_ub_inner(args[1], seen, depth + 1);
+                let b = self.value_ub_inner(args[2], seen, depth + 1);
+                a.min(b)
+            }
+            super::module::InstInfo::Phi(list) if !list.is_empty() => {
+                let mut hi = 0u32;
+                for &(x, _) in list {
+                    hi = hi.max(self.value_ub_inner(x, seen, depth + 1));
+                    if hi == u32::MAX {
+                        break;
+                    }
+                }
+                hi
+            }
+            _ => u32::MAX,
+        };
+        seen.remove(&i);
+        res
+    }
+
     fn smovrel(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let dst = Self::field(d, "SDST");
         let src = Self::field(d, "SSRC0");
@@ -1575,25 +1619,40 @@ impl Lw {
         let mut vals = Vec::new();
         for word in 0..words {
             if let Some(idx) = rd {
-                // select chain over every register from src + word up to s123
-                let mut v = self.c(0);
-                for k in 0..=123u64.saturating_sub(src + word) {
-                    let r = self.sreg(src + word + k);
-                    let is = self.cmpc(Pred::Eq, idx, k as u32);
-                    v = self.sel(is, r, v);
+                if let Some(k) = self.s.m.const_u64(idx) {
+                    let v = if src + word + k <= 123 { self.sreg(src + word + k) } else { self.c(0) };
+                    vals.push(v);
+                } else {
+                    let lim = 123u64.saturating_sub(src + word).min(self.value_upper_bound(idx) as u64);
+                    // select chain over every reachable register from src + word up to s123
+                    let mut v = self.c(0);
+                    for k in 0..=lim {
+                        let r = self.sreg(src + word + k);
+                        let is = self.cmpc(Pred::Eq, idx, k as u32);
+                        v = self.sel(is, r, v);
+                    }
+                    vals.push(v);
                 }
-                vals.push(v);
             } else {
                 vals.push(self.sreg(src + word));
             }
         }
         if let Some(idx) = wr {
-            for k in 0..=123u64.saturating_sub(dst + words - 1) {
-                let is = self.cmpc(Pred::Eq, idx, k as u32);
-                for w in 0..words {
-                    let old = self.sreg(dst + k + w);
-                    let v = self.sel(is, vals[w as usize], old);
-                    self.wr((dst + k + w) as u32, v);
+            if let Some(k) = self.s.m.const_u64(idx) {
+                if dst + k + words - 1 <= 123 {
+                    for w in 0..words {
+                        self.wr((dst + k + w) as u32, vals[w as usize]);
+                    }
+                }
+            } else {
+                let lim = 123u64.saturating_sub(dst + words - 1).min(self.value_upper_bound(idx) as u64);
+                for k in 0..=lim {
+                    let is = self.cmpc(Pred::Eq, idx, k as u32);
+                    for w in 0..words {
+                        let old = self.sreg(dst + k + w);
+                        let v = self.sel(is, vals[w as usize], old);
+                        self.wr((dst + k + w) as u32, v);
+                    }
                 }
             }
         } else {

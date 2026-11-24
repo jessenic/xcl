@@ -352,10 +352,10 @@ impl Lw {
             return self.valu_pk(d, name);
         }
         if name.starts_with("v_movrel") {
-            return self.movrel(d, name);
+            return self.movrel_bounded(d, name);
         }
         if name == "v_swaprel_b32" {
-            return self.swaprel(d);
+            return self.swaprel_bounded(d);
         }
         if name == "v_swap_b32" && d.variant == Variant::Plain {
             let s0 = Self::fv(d, "SRC0");
@@ -1354,6 +1354,171 @@ impl Lw {
             let m = self.bin(BinOp::LShr, all, s);
             let le = self.cmpc(Pred::ULe, l, 32);
             self.selc(le, 0, m)
+        }
+    }
+
+    /// Highest VGPR touched so far (for relative VGPR indexing upper cap).
+    fn touched_top_vgpr(&self) -> u64 {
+        self.init
+            .touched
+            .iter()
+            .filter(|&&v| (VAR_VGPR..VAR_VGPR + 256).contains(&v))
+            .map(|&v| (v - VAR_VGPR) as u64)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Range-bounded `v_movrel*`: avoids touching/selecting across unrelated VGPRs when `M0`
+    /// is a compile-time constant or carries a provable `UMin`/SSA upper bound.
+    fn movrel_bounded(&mut self, d: &Decoded, name: &str) -> LResult<()> {
+        if d.variant != Variant::Plain {
+            return err(d, "movrel SDWA/DPP");
+        }
+        let src_code = Self::fv(d, "SRC0");
+        let vdst = Self::fv(d, "VDST");
+        let m0 = self.sreg(124);
+        let top = self.touched_top_vgpr().max(vdst).max(src_code.saturating_sub(256));
+        let (rd_idx, wr_idx) = match name {
+            "v_movrels_b32" => (Some(m0), None),
+            "v_movreld_b32" => (None, Some(m0)),
+            "v_movrelsd_b32" => (Some(m0), Some(m0)),
+            "v_movrelsd_2_b32" => {
+                let r = self.andc(m0, 0x3FF);
+                let w = self.lshrc(m0, 16);
+                let w = self.andc(w, 0x3FF);
+                (Some(r), Some(w))
+            }
+            _ => return err(d, "movrel"),
+        };
+        let value = match rd_idx {
+            Some(idx) => {
+                if src_code < 256 {
+                    return err(d, "movrels: the source is not a VGPR");
+                }
+                let base = src_code - 256;
+                if let Some(k) = self.s.m.const_u64(idx) {
+                    if base + k <= top {
+                        self.vreg(base + k)
+                    } else {
+                        self.c(0)
+                    }
+                } else {
+                    let lim = top.saturating_sub(base).min(self.value_upper_bound(idx) as u64);
+                    let mut v = self.c(0);
+                    for k in 0..=lim {
+                        let r = self.vreg(base + k);
+                        let is = self.cmpc(Pred::Eq, idx, k as u32);
+                        v = self.sel(is, r, v);
+                    }
+                    v
+                }
+            }
+            None => self.code32(src_code, d.literal, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?,
+        };
+        let a = self.act();
+        match wr_idx {
+            Some(idx) => {
+                if let Some(k) = self.s.m.const_u64(idx) {
+                    if vdst + k <= top {
+                        let old = self.vreg(vdst + k);
+                        let v = self.sel(a, value, old);
+                        self.wr(VAR_VGPR + (vdst + k) as u32, v);
+                    }
+                } else {
+                    let lim = top.saturating_sub(vdst).min(self.value_upper_bound(idx) as u64);
+                    for k in 0..=lim {
+                        let is = self.cmpc(Pred::Eq, idx, k as u32);
+                        let c = self.land(a, is);
+                        let old = self.vreg(vdst + k);
+                        let v = self.sel(c, value, old);
+                        self.wr(VAR_VGPR + (vdst + k) as u32, v);
+                    }
+                }
+            }
+            None => {
+                let old = self.vreg(vdst);
+                let v = self.sel(a, value, old);
+                self.wr(VAR_VGPR + vdst as u32, v);
+            }
+        }
+        Ok(())
+    }
+
+    /// Range-bounded `v_swaprel_b32`: bounds both read and write ranges by `M0`'s SSA upper bound.
+    fn swaprel_bounded(&mut self, d: &Decoded) -> LResult<()> {
+        if d.variant != Variant::Plain {
+            return err(d, "swaprel SDWA/DPP");
+        }
+        let vdst = Self::fv(d, "VDST");
+        let src_code = Self::fv(d, "SRC0");
+        if src_code < 256 {
+            return err(d, "swaprel: the source is not a VGPR");
+        }
+        let base = src_code - 256;
+        let top = self.touched_top_vgpr().max(vdst).max(base);
+        let m0 = self.sreg(124);
+        let a = self.act();
+        let td = self.vreg(vdst);
+        if let Some(k) = self.s.m.const_u64(m0) {
+            let ts = if base + k <= top { self.vreg(base + k) } else { self.c(0) };
+            let nv = self.sel(a, ts, td);
+            self.wr(VAR_VGPR + vdst as u32, nv);
+            if base + k <= top {
+                let old = self.vreg(base + k);
+                let v = self.sel(a, td, old);
+                self.wr(VAR_VGPR + (base + k) as u32, v);
+            }
+            return Ok(());
+        }
+        let lim = top.saturating_sub(base).min(self.value_upper_bound(m0) as u64);
+        let mut ts = self.c(0);
+        for k in 0..=lim {
+            let r = self.vreg(base + k);
+            let is = self.cmpc(Pred::Eq, m0, k as u32);
+            ts = self.sel(is, r, ts);
+        }
+        let nv = self.sel(a, ts, td);
+        self.wr(VAR_VGPR + vdst as u32, nv);
+        for k in 0..=lim {
+            let is = self.cmpc(Pred::Eq, m0, k as u32);
+            let c = self.land(a, is);
+            let old = self.vreg(base + k);
+            let v = self.sel(c, td, old);
+            self.wr(VAR_VGPR + (base + k) as u32, v);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fidelity_tests {
+    use crate::gpu::dxil::kernel::{translate_compute, KernelOptions};
+    use crate::gpu::dxil::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::CsInterface;
+
+    const V: u64 = 256;
+
+    #[test]
+    fn direct_dxil_movrel_const_and_umin_bound_validate() {
+        // Compute shader with M0 set to constant 2 and later clamped via s_min_u32 m0, s0, 3;
+        // also touches v40 so unbounded movrel would walk v10..v40.
+        let code: Vec<u8> = [
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 40), ("SRC0", 128)][..], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 128 + 2)], None),
+            ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 10)], None),
+            ("S_MIN_U32", "ENC_SOP2", &[("SDST", 124), ("SSRC0", 0), ("SSRC1", 128 + 3)], None),
+            ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 1)], None),
+            ("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 10)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let k = translate_compute(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, &cs).unwrap();
+        if let Err(e) = validate::validate(&k.dxil) {
+            panic!("DXIL validation failed: {e}");
         }
     }
 }
