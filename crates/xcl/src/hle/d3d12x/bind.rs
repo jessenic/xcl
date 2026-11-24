@@ -521,7 +521,9 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     type PcDm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
     let pc_dm: PcDm = std::mem::transmute(super::real::orig_fn(this, 79));
     let raw_pso = with(this, |s| s.pso);
-    let pso = super::pso_async::resolve_wait(raw_pso);
+    // a graphics pipeline still being built is not waited for (`pso_for_draw`): its stand-in
+    // is pending and the call is skipped below
+    let pso = pso_for_draw(raw_pso);
     if let Some(tp) = super::real::two_pass_of(pso) {
         let groups = x.saturating_mul(y.max(1)).saturating_mul(z.max(1));
         if groups == 0 {
@@ -577,7 +579,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
-    let pso = super::pso_async::resolve_wait(raw_pso);
+    let pso = pso_for_draw(raw_pso);
     let (console_args_off, console_count_off) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if let Some(tp) = super::real::two_pass_of(pso) {
@@ -879,14 +881,23 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
 }
 
+/// The pipeline a draw (or an ExecuteIndirect) uses now: a graphics pipeline still being built
+/// is not waited for – its build goes to the workers and its stand-in, which draws nothing, is
+/// used until it is built (`pso_async`). A compute one is waited for. Waiting held a retail
+/// title's threads 1 – 5 s per draw in the driver's compiler (33 s in all as its world loaded,
+/// on an NVIDIA GPU), and its hang watchdog ended it.
+fn pso_for_draw(pso: usize) -> usize {
+    super::pso_async::resolve_for_bind(pso)
+}
+
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
 /// arguments are bound (None: the draw is skipped – a console pipeline without a
 /// translation, or no unified memory).
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    let real = super::pso_async::resolve_wait(pso);
+    // a pipeline still being built in the background is not waited for (`pso_for_draw`)
+    let real = pso_for_draw(pso);
     if !super::real::is_translated_graphics(real) {
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
         // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
@@ -910,7 +921,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
+                let real = super::pso_async::resolve(pso);
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
@@ -1588,6 +1599,31 @@ void main(uint t : SV_GroupIndex) {
             groups.Unmap(0, None);
             assert!(wrong.is_empty(), "{} of {TRIES} ExecuteIndirects ran another group count than the one written before them (try, groups): {wrong:?}", wrong.len());
         }
+    }
+
+    /// A draw does not wait for a graphics pipeline still being built: its build goes to the
+    /// workers and the draw gets the stand-in at once; once built, the real one. A compute
+    /// pipeline is still waited for.
+    #[test]
+    fn a_draw_does_not_wait_for_a_graphics_pipeline_still_being_built() {
+        let (graphics, compute) = (0x7E57_6101usize, 0x7E57_6102usize);
+        pso_async::submit_lazy(graphics, false, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            0x1301
+        }), 0);
+        pso_async::submit_lazy(compute, true, Box::new(|| 0x1302), 0);
+        let t = std::time::Instant::now();
+        assert_eq!(pso_for_draw(graphics), graphics, "the stand-in, not the real one");
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "a draw waited {:?}", t.elapsed());
+        // the draw sent it to the workers: it is built with no further draw
+        let start = std::time::Instant::now();
+        while pso_async::is_pending(graphics) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(pso_for_draw(graphics), 0x1301, "built by a worker");
+        assert_eq!(pso_for_draw(compute), 0x1302, "a compute pipeline is waited for");
+        pso_async::released(graphics);
+        pso_async::released(compute);
     }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
