@@ -1394,6 +1394,10 @@ unsafe fn place_console_buffer_sparse(this: *mut c_void, d: &D3D12_RESOURCE_DESC
     None
 }
 
+fn uma_shadowed() -> bool {
+    crate::gpu::uma::get().is_some_and(|u| u.shadowed())
+}
+
 /// Sanitize a console buffer description and initial state for placement in a coherent
 /// cross-adapter UMA heap (`OpenExistingHeapFromAddress`).
 fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize) -> (D3D12_RESOURCE_DESC, u32) {
@@ -1562,7 +1566,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     // a resource in unified memory: its console address (no PC mapping – the PC's would be
     // the start of the PC resource, before the address for a buffer placed below it)
     if let Some((p, bytes)) = console_buffer(this as usize) {
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p)) {
+        if crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(p)) {
             if !range.is_null() {
                 let r = *(range as *const D3D12_RANGE);
                 if r.End > r.Begin {
@@ -3192,7 +3196,7 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
             let d = super::device_x::pc_resource_desc(&x);
             let st = state as u32 & PC_RESOURCE_STATES;
             if let Some(hr) = place_at_title_address(this, block + offset, &d, st, clear as *const c_void, riid, ppv) {
-                if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && cpu_readback && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(block + offset)) {
+                if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && cpu_readback && crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(block + offset)) {
                     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
                     if st == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32 && (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32) == 0 {
                         note_sparse_readback(*ppv as usize);
