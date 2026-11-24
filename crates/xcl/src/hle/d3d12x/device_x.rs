@@ -1253,6 +1253,7 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::bind::note_signature_dispatches(*ppv as usize, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
+        super::indirect_clamp::note_signature(*ppv as usize, u32::from_le_bytes(pc[..4].try_into().unwrap()), &list);
     }
     hr
 }

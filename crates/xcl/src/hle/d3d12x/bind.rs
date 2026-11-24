@@ -578,6 +578,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
     let pso = super::pso_async::resolve_wait(raw_pso);
+    let (console_args_off, console_count_off) = (args_off, count_off);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if let Some(tp) = super::real::two_pass_of(pso) {
         if let Some(msig) = dispatch_mesh_sig_of(sig) {
@@ -675,20 +676,28 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    match bind_abi(this, list, pso, gfx) {
-        Ok(()) => {
-            count(if gfx { DRAWS } else { DISPATCHES });
-            // an indirect dispatch: its groups are in the argument buffer (`max` of them)
-            let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
-            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
-            super::culprit::after_dispatch(list, mark)
-        }
-        Err(e) => {
-            count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
-            }
+    // the records bounded on the GPU first (a garbage record would hang it): this changes the
+    // list's compute bindings, which `bind_abi` sets again
+    let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
+    let result = bind_abi(this, list, pso, gfx);
+    if let Ok(()) = result {
+        count(if gfx { DRAWS } else { DISPATCHES });
+        // an indirect dispatch: its groups are in the argument buffer (`max` of them)
+        let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
+        fresh_indirect_arguments(this, || match &bounded {
+            Some(b) => pc(this, sig, max, b.raw(), 0, count_buf, count_off),
+            None => pc(this, sig, max, args, args_off, count_buf, count_off),
+        });
+        super::culprit::after_dispatch(list, mark)
+    }
+    if let Some(b) = bounded {
+        b.finish(list);
+    }
+    if let Err(e) = result {
+        count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
         }
     }
 }
