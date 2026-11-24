@@ -563,7 +563,7 @@ struct Ctx<'a> {
     starts: &'a BTreeSet<u64>,
     leaders: &'a [u64],
     loops: &'a [(u64, u64)],
-    /// every branch: (address of the branch, target)
+    /// every branch in instruction order: (address of the branch, target)
     edges: &'a [(u64, u64)],
     /// split wave64 geometry mode: the ES's s_setpc ends the ES phase and `gs_start` is the GS
     /// phase's entry, so no structured stretch may run across it
@@ -828,11 +828,14 @@ fn rotated_loop(c: &Ctx, start: u64, end: u64, u: u64, lo: u64, hi: u64) -> Opti
 /// `if (!c) { [end, t) } else { [t, u) }` holds: both branches structured, the if branch does
 /// not jump into the else branch.
 fn else_ok(c: &Ctx, end: u64, t: u64, u: u64, nest: usize, cont: &Conts) -> bool {
-    let none = BTreeSet::new();
-    match structurable_to(c, end, t, Some(u), nest + 1, cont, &none) {
-        Some(r) if !r.iter().any(|&x| x >= t && x < u) => structurable_to(c, t, u, None, nest + 1, cont, &none).is_some(),
-        _ => false,
+    // A nested conditional to t can be emitted as a plain if, without raising a flag.
+    let first = c.edges.partition_point(|&(src, _)| src < end);
+    if c.edges[first..].iter().take_while(|&&(src, _)| src < t).any(|&(_, dst)| (t..u).contains(&dst)) {
+        return false;
     }
+    let none = BTreeSet::new();
+    structurable_to(c, end, t, Some(u), nest + 1, cont, &none).is_some()
+        && structurable_to(c, t, u, None, nest + 1, cont, &none).is_some()
 }
 
 /// Can [lo, hi) be emitted as structured code (no `pc` guards)? Linear blocks, forward
@@ -935,10 +938,6 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
             Item::If { end, t, u, .. } => {
                 let mut r = structurable_to(c, end, t, u, nest + 1, cont, &none)?;
                 if let Some(u) = u {
-                    if r.contains(&t) {
-                        why(t, &format!("branch from the if to the start of the else {t:#x}"));
-                        return None;
-                    }
                     r.extend(structurable_to(c, t, u, None, nest + 1, cont, &none)?);
                 }
                 r

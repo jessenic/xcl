@@ -157,6 +157,8 @@ A gamepad is recommended ([Controls](#controls)). The game folder is never modif
 
 Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
 An entry partway through it keeps the jump indirect and subject to the recompiler's existing indirect-branch limits.
+The shader recompiler preserves branches when several loop exits share a destination or a
+branch jumps directly into an else block ([#701](https://github.com/ivall/xcl/issues/701)).
 
 </details>
 
