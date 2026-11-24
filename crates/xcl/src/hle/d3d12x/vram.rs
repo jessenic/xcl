@@ -84,24 +84,24 @@ impl<H: Clone> Arenas<H> {
 
     /// Where a placement of `bytes` at `va` (alignment `align`) goes: the newest arena holding
     /// it at an offset `align` allows, else a new arena of its size, `make(size, align)`.
-    /// (heap, offset, arena id); None: no heap.
-    fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64)> {
+    /// (heap, offset, arena id, fresh); None: no heap.
+    fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64, bool)> {
         self.sweep(now);
         let fits = |a: &Arena<H>| a.align >= align && a.base <= va && va + bytes <= a.base + a.size && (va - a.base) % align == 0;
-        let i = match self.list.iter().rposition(fits) {
-            Some(i) => i,
+        let (i, fresh) = match self.list.iter().rposition(fits) {
+            Some(i) => (i, false),
             None => {
                 let size = bytes.div_ceil(align) * align;
                 let heap = make(size, align)?;
                 self.next_id += 1;
                 self.list.push(Arena { base: va, size, align, heap, users: 0, idle_since: None, id: self.next_id });
-                self.list.len() - 1
+                (self.list.len() - 1, true)
             }
         };
         let a = &mut self.list[i];
         a.users += 1;
         a.idle_since = None;
-        Some((a.heap.clone(), va - a.base, a.id))
+        Some((a.heap.clone(), va - a.base, a.id, fresh))
     }
 
     /// A resource in arena `id` released.
@@ -820,7 +820,8 @@ impl Pages {
     }
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
-    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    /// The bool is true when every tile was newly taken rather than shared with an existing page.
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>, bool)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
@@ -867,6 +868,7 @@ impl Pages {
         let mut tiles = Vec::with_capacity(total as usize);
         let mut used = Vec::with_capacity(own);
         let mut used_extra = Vec::new();
+        let mut reused = false;
         for i in 0..total as usize {
             let tile = if i < own {
                 let a = first + i * PAGE;
@@ -874,6 +876,7 @@ impl Pages {
                     Some(p) => {
                         p.users += 1;
                         p.idle_since = None;
+                        reused = true;
                         p.tile
                     }
                     None => {
@@ -890,6 +893,7 @@ impl Pages {
                     Some(p) => {
                         p.users += 1;
                         p.idle_since = None;
+                        reused = true;
                         p.tile
                     }
                     None => {
@@ -904,7 +908,7 @@ impl Pages {
             tiles.push(tile);
         }
         self.map(res, &tiles);
-        Some((used, used_extra))
+        Some((used, used_extra, !reused))
     }
 }
 
@@ -992,6 +996,56 @@ fn canonical_va(va: usize) -> usize {
     if mapped { va } else { src }
 }
 
+struct DiscardQueue { queue: ID3D12CommandQueue, alloc: ID3D12CommandAllocator, list: ID3D12GraphicsCommandList, fence: ID3D12Fence, value: u64 }
+unsafe impl Send for DiscardQueue {}
+static DISCARD: Mutex<std::collections::BTreeMap<usize, Option<DiscardQueue>>> = Mutex::new(std::collections::BTreeMap::new());
+static DISCARDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+fn discards() -> u64 { DISCARDS.load(std::sync::atomic::Ordering::Relaxed) }
+
+impl DiscardQueue {
+    unsafe fn new(dev: &ID3D12Device) -> Option<DiscardQueue> {
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
+        list.Close().ok()?;
+        Some(DiscardQueue { queue, alloc, list, fence: dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?, value: 0 })
+    }
+}
+
+/// State in which a newly backed RT or DS placement is discarded (#940: debug error 1422).
+fn discard_target_state(flags: D3D12_RESOURCE_FLAGS, fresh: bool) -> Option<D3D12_RESOURCE_STATES> {
+    if !fresh { None }
+    else if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 { Some(D3D12_RESOURCE_STATE_DEPTH_WRITE) }
+    else if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0 { Some(D3D12_RESOURCE_STATE_RENDER_TARGET) }
+    else { None }
+}
+
+/// Discard a newly backed RT or DS placement before any queue touches it (#940: debug error 1422),
+/// leaving its subresources in `initial` and waiting for completion (`after_map`: tile mapping fence).
+unsafe fn discard_fresh(dev: &ID3D12Device, res: &ID3D12Resource, initial: D3D12_RESOURCE_STATES, target: D3D12_RESOURCE_STATES, after_map: Option<(ID3D12Fence, u64)>) {
+    super::title_textures::own_work(|| {
+        let mut g = DISCARD.lock().unwrap();
+        let Some(dq) = g.entry(dev.as_raw() as usize).or_insert_with(|| DiscardQueue::new(dev)).as_mut() else { return };
+        if let Some((f, v)) = after_map { let _ = dq.queue.Wait(&f, v); }
+        if dq.alloc.Reset().is_err() || dq.list.Reset(&dq.alloc, None).is_err() { return; }
+        let transition = |from: D3D12_RESOURCE_STATES, to: D3D12_RESOURCE_STATES| {
+            let t = D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(res), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: from, StateAfter: to };
+            D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(t) }, ..Default::default() }
+        };
+        if initial != target { dq.list.ResourceBarrier(&[transition(initial, target)]); }
+        dq.list.DiscardResource(res, None);
+        if initial != target { dq.list.ResourceBarrier(&[transition(target, initial)]); }
+        let (Ok(()), Ok(cmd)) = (dq.list.Close(), dq.list.cast()) else { return };
+        dq.queue.ExecuteCommandLists(&[Some(cmd)]);
+        dq.value += 1;
+        if dq.queue.Signal(&dq.fence, dq.value).is_ok() {
+            let _ = dq.fence.SetEventOnCompletion(dq.value, windows::Win32::Foundation::HANDLE::default());
+        }
+        DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 /// A texture at `va` as a reserved resource on the title's shared 64 KiB pages
 /// (`console_bytes`: its size on the console; tiles past the owned page boundaries are shared by
 /// `(va, tile_index)` so repeated placements at the same address do not leak). None: it cannot be.
@@ -1047,22 +1101,26 @@ unsafe fn place_on_pages(
     let bound = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
-            if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
+            if let Some((used, used_extra, fresh)) = pages.bind(dev, res, va, console_bytes, total) {
+                let after_map = fresh.then(|| (pages.fence.clone(), pages.value));
                 pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, touched: std::time::Instant::now() });
-                true
+                Some((fresh, after_map))
             } else {
-                false
+                None
             }
         } else {
-            false
+            None
         }
     };
-    if !bound {
+    let Some((fresh, after_map)) = bound else {
         drop(windows::core::IUnknown::from_raw(raw));
         *ppv = std::ptr::null_mut();
         return None;
-    }
+    };
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+    if let Some(target) = discard_target_state(desc.Flags, fresh) {
+        discard_fresh(dev, res, D3D12_RESOURCE_STATES(state as i32), target, after_map);
+    }
     Some(hr)
 }
 
@@ -1103,7 +1161,7 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     if mapped {
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
+    let Some((used, used_extra, _)) = pages.bind(&dev, res, va, console_bytes, total) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
@@ -1398,14 +1456,18 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     let align = (info.Alignment as usize).max(PAGE);
     let now = std::time::Instant::now();
-    let (heap, offset, id) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
+    let (heap, offset, id, fresh) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
     let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         ARENAS.lock().unwrap().release(id, now);
         return None;
     }
-    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
-    ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, id);
+    let raw = *ppv;
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+    ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(raw as usize, id);
+    if let (Some(target), Some(res)) = (discard_target_state(desc.Flags, fresh), ID3D12Resource::from_raw_borrowed(&raw)) {
+        discard_fresh(dev, res, D3D12_RESOURCE_STATES(state as i32), target, None);
+    }
     Some(hr)
 }
 
@@ -1587,8 +1649,8 @@ mod tests {
     fn arenas_sweep_dropped_returns_expired_heaps() {
         let t0 = Instant::now();
         let mut arenas: Arenas<u32> = Arenas::new();
-        let (_, _, id1) = arenas.take(0x10_0000, 0x1_0000, PAGE, t0, |_, _| Some(101)).unwrap();
-        let (_, _, id2) = arenas.take(0x20_0000, 0x1_0000, PAGE, t0, |_, _| Some(202)).unwrap();
+        let (_, _, id1, _) = arenas.take(0x10_0000, 0x1_0000, PAGE, t0, |_, _| Some(101)).unwrap();
+        let (_, _, id2, _) = arenas.take(0x20_0000, 0x1_0000, PAGE, t0, |_, _| Some(202)).unwrap();
         arenas.release(id1, t0);
         arenas.release(id2, t0 + Duration::from_secs(1));
         assert!(arenas.sweep_dropped(t0 + Duration::from_millis(1900)).is_empty());
@@ -1602,13 +1664,13 @@ mod tests {
     fn arenas_sweep_dropped_preserves_newest_fitting_order() {
         let t0 = Instant::now();
         let mut arenas: Arenas<u32> = Arenas::new();
-        let (_, _, id1) = arenas.take(0x10_0000, PAGE, PAGE, t0, |_, _| Some(101)).unwrap();
-        let (_, _, id2) = arenas.take(0x20_0000, PAGE, PAGE, t0, |_, _| Some(202)).unwrap();
-        let (_, _, id3) = arenas.take(0x20_0000, 2 * PAGE, PAGE, t0, |_, _| Some(303)).unwrap();
+        let (_, _, id1, _) = arenas.take(0x10_0000, PAGE, PAGE, t0, |_, _| Some(101)).unwrap();
+        let (_, _, id2, _) = arenas.take(0x20_0000, PAGE, PAGE, t0, |_, _| Some(202)).unwrap();
+        let (_, _, id3, _) = arenas.take(0x20_0000, 2 * PAGE, PAGE, t0, |_, _| Some(303)).unwrap();
         arenas.release(id1, t0);
         let t1 = t0 + IDLE + Duration::from_millis(10);
         assert_eq!(arenas.sweep_dropped(t1), vec![101]);
-        let (heap, off, picked_id) = arenas.take(0x20_0000, PAGE, PAGE, t1, |_, _| panic!("must reuse existing arena")).unwrap();
+        let (heap, off, picked_id, _) = arenas.take(0x20_0000, PAGE, PAGE, t1, |_, _| panic!("must reuse existing arena")).unwrap();
         assert_eq!((heap, off, picked_id), (303, 0, id3), "sweep must preserve insertion order so rposition selects the newest fitting arena");
         assert_ne!(picked_id, id2);
     }
@@ -2342,6 +2404,137 @@ mod tests {
             assert_eq!(mapped, [false, false], "the other 32 tiles came from evictions");
             let _ = (revive(&a), revive(&b));
             drop((a, b, big));
+        }
+    }
+
+    #[test]
+    fn fresh_targets_need_discard_once_and_aliased_arenas_do_not() {
+        let (t, a0, mut a) = (Instant::now(), 0x2_0000_0000, Arenas::new());
+        let take_f = |a: &mut Arenas<u32>, va: usize, bytes: usize, now: Instant| {
+            let n = a.list.len() as u32;
+            let (_, _, id, fresh) = a.take(va, bytes, PAGE, now, |_, _| Some(n)).unwrap();
+            (id, fresh)
+        };
+        let (id, f0) = take_f(&mut a, a0, 8 * MIB, t);
+        assert!(f0 && take_f(&mut a, a0, 8 * MIB, t) == (id, false) && take_f(&mut a, a0 + MIB, 2 * MIB, t) == (id, false));
+        for _ in 0..3 { a.release(id, t); }
+        assert_eq!(take_f(&mut a, a0, 8 * MIB, t + Duration::from_secs(1)), (id, false));
+        a.release(id, t + Duration::from_secs(1));
+        let (id2, f1) = take_f(&mut a, a0, 8 * MIB, t + Duration::from_secs(4));
+        assert!(f1 && id2 != id);
+        for (flags, fresh, want) in [
+            (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, true, Some(D3D12_RESOURCE_STATE_RENDER_TARGET)),
+            (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, true, Some(D3D12_RESOURCE_STATE_DEPTH_WRITE)),
+            (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, true, None),
+            (D3D12_RESOURCE_FLAG_NONE, true, None),
+            (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, false, None),
+            (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, false, None),
+        ] {
+            assert_eq!(discard_target_state(flags, fresh), want);
+        }
+    }
+
+    /// Newly backed placed and reserved RT/DS targets run `DiscardResource` once while keeping
+    /// their initial state; aliased placements at the same address do not discard earlier writes.
+    #[test]
+    fn fresh_placed_and_reserved_targets_discard_without_wiping_aliases() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::{Common::*, *};
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return crate::gpu::recomp::runner::skip_test("software adapter");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return crate::gpu::recomp::runner::skip_test("no tier-2 heap GPU") };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let (riid, sample) = (&ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID, DXGI_SAMPLE_DESC { Count: 1, Quality: 0 });
+            let barrier = |r: &ID3D12Resource, from: D3D12_RESOURCE_STATES, to: D3D12_RESOURCE_STATES| {
+                let t = D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: from, StateAfter: to };
+                D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(t) }, ..Default::default() }
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.Close().unwrap();
+            let (fence, fval): (ID3D12Fence, std::cell::Cell<u64>) = (dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap(), std::cell::Cell::new(0));
+            let run = |rec: &dyn Fn(&ID3D12GraphicsCommandList)| {
+                before_execute(&queue);
+                alloc.Reset().unwrap();
+                list.Reset(&alloc, None).unwrap();
+                rec(&list);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                fval.set(fval.get() + 1);
+                queue.Signal(&fence, fval.get()).unwrap();
+                fence.SetEventOnCompletion(fval.get(), windows::Win32::Foundation::HANDLE::default()).unwrap();
+            };
+            let place_one = |va: usize, d: &D3D12_RESOURCE_DESC, st: D3D12_RESOURCE_STATES, cv: *const c_void, cb: Option<u64>| {
+                let mut p = std::ptr::null_mut();
+                assert!(place(dev.as_raw(), va, d, st.0 as u32, cv, cb, riid, &mut p).is_some_and(|hr| hr >= 0) && !p.is_null());
+                ID3D12Resource::from_raw(p)
+            };
+            let read_back = |r: &ID3D12Resource, d: &D3D12_RESOURCE_DESC, fp: &mut [D3D12_PLACED_SUBRESOURCE_FOOTPRINT]| -> Vec<u8> {
+                let (mut bytes, mut rb) = (0u64, None::<ID3D12Resource>);
+                dev.GetCopyableFootprints(d, 0, fp.len() as u32, 0, Some(fp.as_mut_ptr()), None, None, Some(&mut bytes));
+                let bd = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: sample, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+                let rb = rb.unwrap();
+                run(&|l| for (plane, f) in fp.iter().enumerate() {
+                    let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *f } };
+                    let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: plane as u32 } };
+                    l.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                });
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).unwrap();
+                let out = std::slice::from_raw_parts(p as *const u8, bytes as usize).to_vec();
+                rb.Unmap(0, None);
+                out
+            };
+
+            let ds_desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R32G8X24_TYPELESS, SampleDesc: sample, Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..Default::default() };
+            let ds_cv = D3D12_CLEAR_VALUE { Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT, Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 1.0, Stencil: 0 } } };
+            let (d0, ds0) = (discards(), place_one(0x6A_0000_0000, &ds_desc, D3D12_RESOURCE_STATE_DEPTH_READ, &ds_cv as *const _ as *const c_void, None));
+            assert_eq!(discards(), d0 + 1, "fresh arena depth target must discard");
+            let dsv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, ..Default::default() }).unwrap();
+            let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+            dev.CreateDepthStencilView(&ds0, Some(&D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() }), dsv);
+            run(&|l| {
+                l.ResourceBarrier(&[barrier(&ds0, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE)]);
+                l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.375, 0x3C, None);
+            });
+            let ds1 = place_one(0x6A_0000_0000, &ds_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &ds_cv as *const _ as *const c_void, None);
+            assert_eq!(discards(), d0 + 1, "aliased arena depth target must not discard");
+            run(&|l| l.ResourceBarrier(&[barrier(&ds1, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE)]));
+            let mut ds_fp = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+            let s = read_back(&ds1, &ds_desc, &mut ds_fp);
+            assert_eq!((f32::from_le_bytes(s[ds_fp[0].Offset as usize..ds_fp[0].Offset as usize + 4].try_into().unwrap()), s[ds_fp[1].Offset as usize]), (0.375, 0x3C));
+
+            let mut opt = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opt as *mut _ as *mut c_void, std::mem::size_of_val(&opt) as u32).is_ok() && opt.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0 {
+                let rt_desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: sample, Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..Default::default() };
+                let rgba = [0.2f32, 0.4, 0.6, 1.0];
+                let rt_cv = D3D12_CLEAR_VALUE { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Anonymous: D3D12_CLEAR_VALUE_0 { Color: rgba } };
+                let (d1, rt0) = (discards(), place_one(0x6B_0000_0000, &rt_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &rt_cv as *const _ as *const c_void, Some(PAGE as u64)));
+                assert_eq!(discards(), d1 + 1, "fresh tiled render target must discard");
+                let rtv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).unwrap();
+                let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+                dev.CreateRenderTargetView(&rt0, None, rtv);
+                run(&|l| {
+                    l.ResourceBarrier(&[barrier(&rt0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                    l.ClearRenderTargetView(rtv, &rgba, None);
+                });
+                let rt1 = place_one(0x6B_0000_0000, &rt_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, &rt_cv as *const _ as *const c_void, Some(PAGE as u64));
+                assert_eq!(discards(), d1 + 1, "aliased tiled render target must not discard");
+                let mut rt_fp = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 1];
+                let s = read_back(&rt1, &rt_desc, &mut rt_fp);
+                assert_eq!(&s[rt_fp[0].Offset as usize..rt_fp[0].Offset as usize + 4], &[51, 102, 153, 255]);
+                drop((rt0, rt1));
+            }
+            drop((ds0, ds1));
         }
     }
 }
