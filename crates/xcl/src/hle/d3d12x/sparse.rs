@@ -610,6 +610,38 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
     })
 }
 
+/// pool heap number of the tiles of a shadowed window: they are the window's own buffer, not
+/// pool tiles (never mapped, freed or pinned)
+const SHADOW_POOL: u32 = u32::MAX;
+
+/// A committed window the GPU could not open as a heap (`real::open_uma`): `buf` in video
+/// memory stands for `[base, base + size)` and is kept in step like the tiles of a sparse
+/// window -- the CPU's writes (write-watch, changed 64-byte chunks) go to it before each
+/// ExecuteCommandLists, GPU writes come back on Map and after the lists' memory operations.
+/// All of it counts as mapped from the start: the window is committed. False: no queue for
+/// the copies (the buffer then never sees the CPU's writes).
+pub unsafe fn shadow_window(dev: &ID3D12Device, base: usize, size: usize, buf: &ID3D12Resource) -> bool {
+    let mut g = STATE.lock().unwrap();
+    if g.is_none() {
+        // no sparse window was made (`init`): the copies still need the queue and the lists
+        match new_state(dev, Vec::new()) {
+            Ok(s) => *g = Some(s),
+            Err(e) => {
+                crate::xlog_warn!("shadowed window at {base:#x}: {e}");
+                return false;
+            }
+        }
+    }
+    let Some(s) = g.as_mut() else { return false };
+    s.windows.push((base, buf.clone()));
+    for (i, t) in (base..base + size).step_by(TILE).enumerate() {
+        s.mapped.insert(t, TileEntry::with_holes((SHADOW_POOL, i as u32), 0));
+    }
+    s.runs = None;
+    MAPPED_GEN.fetch_add(1, Ordering::Release);
+    true
+}
+
 /// The sparse windows' buffers on `dev`: `(window_index, buffer_raw, gpu_va)` for each
 /// sparse window in `gpu::uma` (empty: no sparse windows).
 pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
