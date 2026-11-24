@@ -1313,6 +1313,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         for i in 0..n {
             if let Some(at) = away.page.remove(&*arr.add(i)) {
                 away.at.remove(&at);
+                lazy::unmark(at);
                 note_mapping_at(at);
             }
         }
@@ -3317,6 +3318,31 @@ mod tests {
     }
 
     #[test]
+    fn free_physical_pages_unmarks_lazy_away_mapping() {
+        unsafe {
+            let Some(u) = crate::gpu::uma::get() else { return };
+            let mut n = 1usize;
+            let mut page = 0usize;
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, &mut page), 1);
+            let home = page_home(page).expect("page home");
+            if !u.is_sparse(home) {
+                FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut page);
+                return;
+            }
+            let r = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, &mut page) as usize, r);
+            assert!(!committed_page(r), "fresh page mapped into reservation starts lazy");
+            // Freeing the physical page directly must drop the lazy entry so `r` is not
+            // silently committed later by `lazy::ensure` or the VEH handler.
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut page), 1);
+            lazy::ensure(r, 4);
+            assert!(!committed_page(r), "freed away-mapped page must not remain in lazy::LAZY");
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
     fn physical_home_overflow_with_sparse_windows_skips_coherent_window() {
         let u = crate::gpu::uma::Uma::for_runtime(16 << 20).unwrap();
         let coherent_before = u.used();
@@ -3349,6 +3375,44 @@ mod tests {
             let home = alloc_physical_home(&u, 2 * PHYS_PAGE).unwrap();
             assert!(u.is_committed(home), "coherent-only UMA should still back physical homes");
             assert!(u.free(home));
+        }
+    }
+
+    #[test]
+    fn free_physical_pages_stale_lazy_mark_does_not_lose_reused_reservation_writes() {
+        unsafe {
+            let Some(u) = crate::gpu::uma::get() else { return };
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let home_a = page_home(pages[0]).expect("page A home");
+            let home_b = page_home(pages[1]).expect("page B home");
+            if !u.is_sparse(home_a) || !u.is_sparse(home_b) {
+                FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr());
+                return;
+            }
+            let r = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+
+            // 1. Map untouched page A away at `r` (marks `r` lazy), then free A directly.
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, &mut pages[0]) as usize, r);
+            assert!(!committed_page(r));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut pages[0]), 1);
+
+            // 2. Write page B at home, then map B away at `r` and overwrite at `r`.
+            assert_eq!(MapTitlePhysicalPages(home_b as *mut c_void, 1, 0, 4, &mut pages[1]) as usize, home_b);
+            *(home_b as *mut u32) = 0x1122_3344;
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, &mut pages[1]) as usize, r);
+            assert_eq!(*(r as *const u32), 0x1122_3344);
+            *(r as *mut u32) = 0xCAFE_BABE;
+
+            // 3. Map B back home: `unmap_away(r)` must copy `r` back to `home_b` instead of
+            //    skipping the copy on a stale lazy mark left behind by A.
+            assert_eq!(MapTitlePhysicalPages(home_b as *mut c_void, 1, 0, 4, &mut pages[1]) as usize, home_b);
+            assert_eq!(*(home_b as *const u32), 0xCAFE_BABE, "stale lazy mark must not drop writes on B");
+
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut pages[1]), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
 }
