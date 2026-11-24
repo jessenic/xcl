@@ -953,8 +953,21 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         // the request instead of faulting in this worker (#476).
         let late: Vec<usize>;
         let pages = if pages.contains(&0) {
+            // #1464: entries still 0 get up to 50 ms to be filled (read like the snapshot)
             let mut now = vec![0usize; pages.len()];
-            if read_own(r.destination as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
+            let start = std::time::Instant::now();
+            let mut read = false;
+            loop {
+                if !read_own(r.destination as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
+                    break;
+                }
+                read = true;
+                if !pages.iter().zip(&now).any(|(&then, &now)| then == 0 && now == 0) || start.elapsed() >= std::time::Duration::from_millis(50) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if read {
                 late = pages.iter().zip(&now).map(|(&then, &now)| if then != 0 { then } else { now }).collect();
                 &late[..]
             } else {
