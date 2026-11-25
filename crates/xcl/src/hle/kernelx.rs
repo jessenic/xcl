@@ -329,11 +329,24 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // read zeros, in the sparse windows video memory would have doubled them). The window is as
     // large as what the title asked for last time (`uma::coherent_hint`).
     if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && size <= crate::gpu::uma::MAX_SIZE && std::env::var("XCL_COHERENT_HEAPS").map_or(true, |v| v != "0") {
+        let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
+        // `XCL_COHERENT_HEAPS=sparse[:N]`: heaps of at least N MB (all with no N) go to the
+        // sparse windows instead – video memory, the CPU's writes uploaded before each
+        // submission (`d3d12x::sparse`). In the coherent window the GPU reads them over the bus,
+        // uncached, and on NVIDIA its writes that do not fill whole lines run at ~0.1 GB/s
+        // (#505). Costs a second copy in video memory and the write-watch scan of it.
+        if sparse_heaps_min().is_some_and(|min| size >= min) {
+            let rounded = size.max(1).div_ceil(align) * align;
+            if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+                crate::xlog_info!("kernelx: a GPU heap of {} MB in the sparse windows (XCL_COHERENT_HEAPS)", size >> 20);
+                trace_mem("VirtualAlloc (graphics heap, sparse VRAM)", 0, rounded, t as u64, p, q);
+                return q as *mut c_void;
+            }
+        }
         static ASKED: AtomicUsize = AtomicUsize::new(0);
         let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
         crate::gpu::uma::note_coherent_need(asked);
         if let Some(u) = uma {
-            let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
             // what XCL keeps of the window for itself (readback heaps; its per-draw arguments have
             // a pool of their own)
             const KEEP: usize = 96 << 20;
@@ -361,6 +374,21 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
     q
+}
+
+/// `XCL_COHERENT_HEAPS=sparse` (every GPU heap) or `sparse:N` (heaps of at least N MB): the
+/// smallest heap the sparse windows take instead of the coherent window. Read once.
+fn sparse_heaps_min() -> Option<usize> {
+    static MIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("XCL_COHERENT_HEAPS").ok().and_then(|v| parse_sparse_heaps(&v)))
+}
+
+/// `sparse` -> 0, `sparse:N` -> N MB in bytes; anything else -> None
+fn parse_sparse_heaps(v: &str) -> Option<usize> {
+    match v.trim().strip_prefix("sparse")? {
+        "" => Some(0),
+        rest => rest.strip_prefix(':')?.trim().parse::<usize>().ok().and_then(|mb| mb.checked_mul(1 << 20)),
+    }
 }
 
 /// Whether a VirtualAlloc that reached the plain-memory fallback is GPU-visible title memory
@@ -959,6 +987,28 @@ fn page_home(page: usize) -> Option<usize> {
     (live > 0 && index < first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
 }
 
+/// The contiguous home address of `pages` when they are consecutive pages of one live allocation.
+fn contiguous_home_in(blocks: &std::collections::BTreeMap<usize, (usize, usize, usize)>, pages: &[usize]) -> Option<usize> {
+    let first_page = *pages.first()?;
+    if first_page == 0 || !(1..pages.len()).all(|i| i.checked_mul(FRAMES).and_then(|d| first_page.checked_add(d)) == Some(pages[i])) {
+        return None;
+    }
+    let index = page_index(first_page)?;
+    let end = index.checked_add(pages.len())?;
+    let (&first, &(count, live, home)) = blocks.range(..=index).next_back()?;
+    (live > 0 && end <= first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
+}
+
+fn contiguous_home(pages: &[usize]) -> Option<usize> {
+    let blocks = PHYS_BLOCKS.lock().ok()?;
+    contiguous_home_in(&blocks, pages)
+}
+
+/// Whether every page of `pages` (at least one) is a physical page allocated now.
+pub fn physical_pages_live(pages: &[usize]) -> bool {
+    !pages.is_empty() && pages.iter().all(|&p| page_home(p).is_some())
+}
+
 /// Whether a home is only reserved until it is used (a sparse window's, or plain memory's –
 /// the coherent window is committed as a whole).
 fn lazy_home(home: usize) -> bool {
@@ -1296,6 +1346,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         for i in 0..n {
             if let Some(at) = away.page.remove(&*arr.add(i)) {
                 away.at.remove(&at);
+                lazy::unmark(at);
                 note_mapping_at(at);
             }
         }
@@ -1345,9 +1396,8 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
-    // consecutive pages at their home (or no address chosen): that UMA memory itself
-    let consecutive = pages[0] != 0 && (1..n).all(|i| pages[0].checked_add(i * FRAMES) == Some(pages[i]));
-    let home = if consecutive { page_home(pages[0]).filter(|_| page_home(pages[n - 1]).is_some()) } else { None };
+    // consecutive pages of one allocation at their home (or no address chosen): that UMA memory itself
+    let home = contiguous_home(&pages);
     if va.is_null() || home == Some(va as usize) {
         let Some(home) = home else {
             fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED); // scattered pages need an address
@@ -1386,6 +1436,19 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         if p == 0 {
             continue;
         }
+        let home = page_home(p).unwrap();
+        if home == at {
+            if let Some(&old) = away.page.get(&p) {
+                unmap_away(away, old, &(0..0));
+            }
+            if home_again(home).is_none() {
+                fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+                return std::ptr::null_mut();
+            }
+            away.gone.retain(|&h| h != home);
+            (at_run, home_run) = Default::default();
+            continue;
+        }
         if let Some(&old) = away.page.get(&p) {
             // (a move commits `at` and decommits `old`, which may lie in a run already answered:
             // both runs go – #556)
@@ -1403,7 +1466,6 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             }
         }
         let fresh = !in_uma(at) && !committed_page_in(at, &mut at_run);
-        let home = page_home(p).unwrap();
         // a page never used (its home not committed) at the title's own reserved address space:
         // committed on first use (`lazy`) – GPU-owned targets placed there are never touched
         let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at));
@@ -1446,9 +1508,11 @@ pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, ar
 }
 
 /// `BOOL XMemMapPhysicalPagesScatter(void** addresses, SIZE_T count, ULONG64* pages)`: one 64 KiB
-/// page at each address (page 0: the address is unmapped)
+/// page at each address (page 0: the address is unmapped). No page array unmaps every address:
+/// a retail game unmaps that way while it streams its world and stops on its own `int3` when the
+/// call fails.
 pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut c_void, n: usize, pages: *mut u64) -> BOOL {
-    if addresses.is_null() || pages.is_null() {
+    if addresses.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -1458,7 +1522,12 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null());
+    // no page array: page 0 (unmap) for every address
+    let ok = (0..n).all(|i| {
+        let mut none = 0usize;
+        let page = if pages.is_null() { &mut none as *mut usize } else { pages.add(i) as *mut usize };
+        !map_pages(away, *addresses.add(i), 1, page).is_null()
+    });
     give_back_homes(away);
     ok as BOOL
 }
@@ -2075,6 +2144,20 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 mod tests {
     use super::*;
 
+    /// `XCL_COHERENT_HEAPS=sparse[:N]`: which heaps go to the sparse windows
+    #[test]
+    fn sparse_heaps_setting() {
+        assert_eq!(parse_sparse_heaps("sparse"), Some(0), "every heap");
+        assert_eq!(parse_sparse_heaps("sparse:1024"), Some(1024 << 20));
+        assert_eq!(parse_sparse_heaps(" sparse: 512 "), Some(512 << 20));
+        assert_eq!(parse_sparse_heaps("0"), None, "heaps off the coherent window altogether: not this");
+        assert_eq!(parse_sparse_heaps("1"), None);
+        assert_eq!(parse_sparse_heaps("sparse:"), None);
+        assert_eq!(parse_sparse_heaps("sparse:big"), None);
+        assert_eq!(parse_sparse_heaps("sparsex"), None);
+        assert_eq!(parse_sparse_heaps(&format!("sparse:{}", usize::MAX)), None, "no overflow");
+    }
+
     fn real_sleep(ms: u32) {
         std::thread::sleep(std::time::Duration::from_millis(ms as u64));
     }
@@ -2416,6 +2499,121 @@ mod tests {
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
             assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&page_index(pages[0]).unwrap()));
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()).is_null());
+        }
+    }
+
+    /// Consecutive page numbers from two separate `AllocateTitlePhysicalPages` calls do not
+    /// share one contiguous home block: `MapTitlePhysicalPages(NULL, ...)` must refuse them
+    /// instead of returning the first allocation's home over unrelated memory next to it.
+    #[test]
+    fn consecutive_pages_from_separate_allocations_do_not_map_as_one_home() {
+        unsafe {
+            let Some(u) = crate::gpu::uma::get() else { return };
+            let mut found = None;
+            let mut held: Vec<usize> = Vec::new();
+            let mut spacers: Vec<(usize, bool)> = Vec::new();
+            for _ in 0..32 {
+                let mut n1 = 1usize;
+                let mut p1 = 0usize;
+                assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n1, &mut p1), 1);
+                let h1 = page_home(p1).expect("p1 home");
+                // occupy the space between p1 and p2 so p2's home is not adjacent to h1
+                let spacer = if u.is_sparse(h1) {
+                    u.sparse_alloc(PHYS_PAGE, PHYS_PAGE).map(|(p, _)| (p, true))
+                } else {
+                    u.alloc(PHYS_PAGE, PHYS_PAGE).map(|p| (p as usize, false))
+                };
+                if let Some(s) = spacer {
+                    spacers.push(s);
+                }
+                let mut n2 = 1usize;
+                let mut p2 = 0usize;
+                assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n2, &mut p2), 1);
+                let h2 = page_home(p2).expect("p2 home");
+                if p2 == p1 + FRAMES && h2 != h1 + PHYS_PAGE {
+                    found = Some((p1, p2, h1, h2));
+                    break;
+                }
+                held.push(p1);
+                held.push(p2);
+            }
+            let (p1, p2, h1, h2) = found.expect("two separate allocations with consecutive page numbers and non-adjacent homes");
+            assert_ne!(h2, h1 + PHYS_PAGE);
+            let mut pair = [p1, p2];
+            fnd::SetLastError(0);
+            let mapped = MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pair.as_mut_ptr());
+            let err = fnd::GetLastError();
+            assert!(mapped.is_null(), "separate allocations must not map as one contiguous home (got {mapped:p})");
+            assert_eq!(err, fnd::ERROR_NOT_SUPPORTED);
+
+            let mut free_pair = [p1, p2];
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, free_pair.as_mut_ptr()), 1);
+            if !held.is_empty() {
+                assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), held.len(), held.as_mut_ptr()), 1);
+            }
+            for (addr, sparse) in spacers {
+                if sparse {
+                    crate::hle::d3d12x::sparse::free(addr);
+                } else {
+                    u.free(addr);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contiguous_home_requires_one_allocation() {
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(10, (3, 3, 0x1_0000_0000));
+        // separate allocation whose page numbers immediately follow, with a non-adjacent home
+        blocks.insert(13, (2, 2, 0x2_0000_0000));
+        // separate allocation whose home happens to be adjacent (still a distinct reservation)
+        blocks.insert(15, (1, 1, 0x2_0002_0000));
+
+        let p = |i| page_number(i);
+        assert_eq!(contiguous_home_in(&blocks, &[p(10), p(11), p(12)]), Some(0x1_0000_0000));
+        assert_eq!(contiguous_home_in(&blocks, &[p(11), p(12)]), Some(0x1_0000_0000 + PHYS_PAGE));
+        assert_eq!(contiguous_home_in(&blocks, &[p(13), p(14)]), Some(0x2_0000_0000));
+        // spanning two allocations: refused, whether or not the homes are adjacent
+        assert_eq!(contiguous_home_in(&blocks, &[p(12), p(13)]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[p(14), p(15)]), None);
+        // non-consecutive, zero, empty, or overflow
+        assert_eq!(contiguous_home_in(&blocks, &[p(10), p(12)]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[0, p(10)]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[]), None);
+        assert_eq!(contiguous_home_in(&blocks, &[usize::MAX, 0]), None);
+    }
+
+    /// Mapping a non-contiguous slice at the first page's own home must keep that first page
+    /// committed at home (not copy it onto itself and decommit it as an away home).
+    #[test]
+    fn mapping_page_at_its_own_home_in_mixed_call_keeps_it_committed() {
+        unsafe {
+            let Some(_u) = crate::gpu::uma::get() else { return };
+            let mut n2 = 2usize;
+            let mut blk = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n2, blk.as_mut_ptr()), 1);
+            let mut n1 = 1usize;
+            let mut other = 0usize;
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n1, &mut other), 1);
+
+            let h0 = MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 4, &mut blk[0]) as usize;
+            let h_other = MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 4, &mut other) as usize;
+            assert_ne!(h0, 0);
+            assert_ne!(h_other, 0);
+            *(h0 as *mut u32) = 0x1122_3344;
+            *(h_other as *mut u32) = 0x5566_7788;
+
+            // Map [blk[0], other] at h0: blk[0] is at its own home (h0), other goes to h0 + PHYS_PAGE.
+            let mut mixed = [blk[0], other];
+            assert_eq!(MapTitlePhysicalPages(h0 as *mut c_void, 2, 0, 4, mixed.as_mut_ptr()) as usize, h0);
+            assert!(committed_page(h0), "page mapped at its own home must remain committed");
+            assert_eq!(*(h0 as *const u32), 0x1122_3344);
+            assert_eq!(*((h0 + PHYS_PAGE) as *const u32), 0x5566_7788);
+            assert!(!physical_page_at(h0), "page at its own home must not be recorded in AWAY");
+
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, blk.as_mut_ptr()), 1);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut other), 1);
         }
     }
 
@@ -3174,6 +3372,31 @@ mod tests {
     }
 
     #[test]
+    fn free_physical_pages_unmarks_lazy_away_mapping() {
+        unsafe {
+            let Some(u) = crate::gpu::uma::get() else { return };
+            let mut n = 1usize;
+            let mut page = 0usize;
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, &mut page), 1);
+            let home = page_home(page).expect("page home");
+            if !u.is_sparse(home) {
+                FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut page);
+                return;
+            }
+            let r = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, &mut page) as usize, r);
+            assert!(!committed_page(r), "fresh page mapped into reservation starts lazy");
+            // Freeing the physical page directly must drop the lazy entry so `r` is not
+            // silently committed later by `lazy::ensure` or the VEH handler.
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut page), 1);
+            lazy::ensure(r, 4);
+            assert!(!committed_page(r), "freed away-mapped page must not remain in lazy::LAZY");
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
     fn physical_home_overflow_with_sparse_windows_skips_coherent_window() {
         let u = crate::gpu::uma::Uma::for_runtime(16 << 20).unwrap();
         let coherent_before = u.used();
@@ -3208,4 +3431,74 @@ mod tests {
             assert!(u.free(home));
         }
     }
+
+    #[test]
+    fn free_physical_pages_stale_lazy_mark_does_not_lose_reused_reservation_writes() {
+        unsafe {
+            let Some(u) = crate::gpu::uma::get() else { return };
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let home_a = page_home(pages[0]).expect("page A home");
+            let home_b = page_home(pages[1]).expect("page B home");
+            if !u.is_sparse(home_a) || !u.is_sparse(home_b) {
+                FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr());
+                return;
+            }
+            let r = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+
+            // 1. Map untouched page A away at `r` (marks `r` lazy), then free A directly.
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, &mut pages[0]) as usize, r);
+            assert!(!committed_page(r));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut pages[0]), 1);
+
+            // 2. Write page B at home, then map B away at `r` and overwrite at `r`.
+            assert_eq!(MapTitlePhysicalPages(home_b as *mut c_void, 1, 0, 4, &mut pages[1]) as usize, home_b);
+            *(home_b as *mut u32) = 0x1122_3344;
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, &mut pages[1]) as usize, r);
+            assert_eq!(*(r as *const u32), 0x1122_3344);
+            *(r as *mut u32) = 0xCAFE_BABE;
+
+            // 3. Map B back home: `unmap_away(r)` must copy `r` back to `home_b` instead of
+            //    skipping the copy on a stale lazy mark left behind by A.
+            assert_eq!(MapTitlePhysicalPages(home_b as *mut c_void, 1, 0, 4, &mut pages[1]) as usize, home_b);
+            assert_eq!(*(home_b as *const u32), 0xCAFE_BABE, "stale lazy mark must not drop writes on B");
+
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut pages[1]), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// `XMemMapPhysicalPagesScatter` with no page array unmaps each address, as page 0 does (a
+    /// retail game unmaps so while it streams; refused, it stopped on its own `int3`).
+    #[test]
+    fn scatter_without_pages_unmaps() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 2;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let r = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert!(r != 0);
+            let addrs = [r as *mut c_void, (r + PHYS_PAGE) as *mut c_void];
+            let mut ids = [pages[0] as u64, pages[1] as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            (r as *mut u32).write_volatile(7);
+            ((r + PHYS_PAGE) as *mut u32).write_volatile(9);
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, std::ptr::null_mut()), 1, "no page array: unmapped, not refused");
+            for a in addrs {
+                assert!(!crate::gpu::shader::readable(a as usize, 4), "{a:p} still mapped");
+            }
+            // the pages kept what was written: mapped again, they read it
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            assert_eq!(((r as *const u32).read_volatile(), ((r + PHYS_PAGE) as *const u32).read_volatile()), (7, 9));
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, std::ptr::null_mut()), 1);
+            // no addresses: the same answer with and without a page array
+            let mut none = [0u64; 1];
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 0, std::ptr::null_mut()), XMemMapPhysicalPagesScatter(addrs.as_ptr(), 0, none.as_mut_ptr()));
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
 }
