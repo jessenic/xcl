@@ -3099,6 +3099,105 @@ fn gpu_image_load_reads_a_store_of_the_same_dispatch() {
     assert!(bad.is_empty(), "image_load after image_store of the same dispatch (want 1000 + lane, 1000 + (lane ^ 1)):\n{}", bad.join("\n"));
 }
 
+/// Every heap index from a T# is bounded by io[IO_VIEW_LIMIT] with one select to its kind's
+/// guard slot (SRV 2·kind, UAV next to it), S# indices by the sampler heap's size; a program
+/// that indexes no heap keeps its HLSL as it was (no bound loaded).
+#[test]
+fn heap_indices_are_bounded() {
+    let code = prog(&[
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 2)], None),
+        ("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 14), ("VADDR", 3), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)], None),
+        ("IMAGE_STORE", "ENC_MIMG", &[("VDATA", 6), ("VADDR", 3), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("static uint xcl_vlast = 0xFFFFFFFFu;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains(&format!("xcl_vlast = io.Load({}u) - 1u;", super::IO_VIEW_LIMIT * 4)), "{}", t.hlsl);
+    // 3D sample: kind 2; 2D load: kind 1, its store the UAV after
+    assert!(t.hlsl.contains("_T = ResourceDescriptorHeap[NonUniformResourceIndex((s16 <= xcl_vlast ? s16 : xcl_vlast + 5u))];"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex((s32 <= xcl_vlast ? s32 : xcl_vlast + 3u))]"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex((s32 <= xcl_vlast ? s32 : xcl_vlast + 3u) + 1u)]"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("SamplerDescriptorHeap[NonUniformResourceIndex(s27 & 0x7FFu)]"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(s"), "an index left unbounded:\n{}", t.hlsl);
+    let plain = translate(&prog(&[("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 255)], Some(7))]), &Options::default()).unwrap();
+    assert!(!plain.hlsl.contains("xcl_vlast") && !plain.hlsl.contains(&format!("io.Load({}u)", super::IO_VIEW_LIMIT * 4)), "{}", plain.hlsl);
+}
+
+/// A T# from memory the GPU never wrote names a heap index past the views. With
+/// io[IO_VIEW_LIMIT] (the first guard slot, after the test textures) a load or sample through
+/// it reads the null view of its kind (0), not another slot or past the heap, and a store goes
+/// nowhere – word 0 0xFFFFFFFF made the UAV index 0 (wrapped), texture 0's SRV. An S# index past
+/// the sampler heap takes its last sampler (point).
+#[test]
+fn gpu_heap_index_past_the_views_reads_the_guard() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_UINT};
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // tex0 in s[16:23] (SRSRC = 4), a garbage T# in s[32:39] (8), tex1 (UAV) in s[40:47] (10),
+    // another garbage T# in s[48:55] (12); S# linear in s[24:27] (SSAMP = 6), garbage in s[28:31] (7)
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0x4), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 11), ("VADDR", 3), ("SRSRC", 8), ("DMASK", 0x4), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_SAMPLE_LZ", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 8), ("SSAMP", 6), ("DMASK", 0x4), ("DIM", 1)]));
+    code.extend(mimg("IMAGE_SAMPLE_LZ", &[("VDATA", 13), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 7), ("DMASK", 0x4), ("DIM", 1)]));
+    code.extend(mimg("IMAGE_STORE", &[("VDATA", 6), ("VADDR", 8), ("SRSRC", 10), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_STORE", &[("VDATA", 7), ("VADDR", 8), ("SRSRC", 12), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    st.sgpr[32..40].copy_from_slice(&tsharp(0x7FFF_FFF0, 77, 9));
+    st.sgpr[40..48].copy_from_slice(&tsharp(2, 20, 9));
+    st.sgpr[48..56].copy_from_slice(&tsharp(0xFFFF_FFFF, 20, 9));
+    st.sgpr[24..28].copy_from_slice(&[0, 0, 0, 0]);
+    st.sgpr[28..32].copy_from_slice(&[0, 0, 0, 0xFFF]);
+    // the guard slots follow the 2 textures' 4 descriptors
+    st.sgpr[super::IO_VIEW_LIMIT] = 4;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (x, y) = ((l % 4) as u32, (l / 4 % 4) as u32);
+        r[0] = f((x as f32 + 0.5) / 4.0);
+        r[1] = f((y as f32 + 0.5) / 4.0);
+        r[3] = x;
+        r[4] = y;
+        r[6] = 10 + l as u32;
+        r[7] = 0xBAD;
+        r[8] = x; // lanes 16.. land outside the 4x4 texture: their stores are dropped
+        r[9] = l as u32 / 4;
+    }
+    // tex0: 4x4 RGBA32F, texel (x, y) = (x, y, 1 + x + 4y, 1)
+    let mut t0 = Vec::new();
+    for y in 0..4 {
+        for x in 0..4 {
+            for v in [x as f32, y as f32, (1 + x + 4 * y) as f32, 1.0] {
+                t0.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    let tex = vec![
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 1, texel_bytes: 4, data: vec![0xEE; 64], uav: true },
+    ];
+    let samp = vec![TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let texel = (1 + l % 4 + 4 * (l / 4 % 4)) as f32;
+        let fl = |i: usize| f32::from_bits(v[i]);
+        assert_eq!(fl(10), texel, "lane {l}: load through a T# below the bound");
+        assert_eq!(v[11], 0, "lane {l}: load through a T# past the views reads the null view");
+        assert_eq!(v[12], 0, "lane {l}: sample through a T# past the views reads the null view");
+        assert_eq!(fl(13), texel, "lane {l}: an S# index past the sampler heap samples with its last (point) sampler");
+    }
+    let t1: Vec<u32> = r.textures[0].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    for (i, &w) in t1.iter().enumerate() {
+        assert_eq!(w, 10 + i as u32, "texel {i}: the store through tex1's T# only (the other went nowhere)");
+    }
+}
+
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
 /// the console compiler places a root signature's static samplers – and samples the same
 /// texel boundary with each; they become static samplers of the root signature.

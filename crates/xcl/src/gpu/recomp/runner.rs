@@ -158,7 +158,9 @@ impl TexDim {
     }
 }
 
-/// A texture for kernel tests: SRV at heap index 2·i, UAV (if `uav`) at 2·i + 1.
+/// A texture for kernel tests: SRV at heap index 2·i, UAV (if `uav`) at 2·i + 1. The guard
+/// slots follow the last (`console_heap::write_view_guards`): io[`IO_VIEW_LIMIT`] = 2 · textures
+/// bounds the heap indices as the runtime does.
 pub struct TestTexture {
     pub dim: TexDim,
     pub format: DXGI_FORMAT,
@@ -172,7 +174,8 @@ pub struct TestTexture {
     pub uav: bool,
 }
 
-/// A sampler for kernel tests at sampler heap index j.
+/// A sampler for kernel tests at sampler heap index j; the rest of the heap's
+/// `SAMPLER_HEAP_SLOTS` are point samplers (wrap), as in the runtime's.
 pub struct TestSampler {
     pub filter: D3D12_FILTER,
     pub address: D3D12_TEXTURE_ADDRESS_MODE,
@@ -190,7 +193,7 @@ struct Bound {
 /// Create the descriptor heaps (always, so the directly indexed root signature is valid),
 /// the test textures and samplers; record the uploads into `list`.
 unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[TestTexture], samplers: &[TestSampler]) -> Result<Bound, String> {
-    let n = (2 * textures.len()).max(2) as u32;
+    let n = 2 * textures.len() as u32 + 2 * super::VIEW_GUARD_KINDS;
     let heap: ID3D12DescriptorHeap = dev
         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -202,7 +205,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
     let sheap: ID3D12DescriptorHeap = dev
         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-            NumDescriptors: samplers.len().max(1) as u32,
+            NumDescriptors: (samplers.len() as u32).max(super::SAMPLER_HEAP_SLOTS),
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })
@@ -210,6 +213,19 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
     let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
     let sinc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
     let at = |h: &ID3D12DescriptorHeap, k: usize, step: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h.GetCPUDescriptorHandleForHeapStart().ptr + k * step };
+    crate::hle::d3d12x::console_heap::write_view_guards(dev, |k| at(&heap, 2 * textures.len() + k as usize, inc));
+    let point = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+        ..Default::default()
+    };
+    for j in samplers.len()..super::SAMPLER_HEAP_SLOTS as usize {
+        dev.CreateSampler(&point, at(&sheap, j, sinc));
+    }
     for (j, sm) in samplers.iter().enumerate() {
         let mut sd = D3D12_SAMPLER_DESC {
             Filter: sm.filter,
