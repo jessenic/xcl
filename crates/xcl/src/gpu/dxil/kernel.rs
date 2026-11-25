@@ -193,7 +193,7 @@ fn translate_on_this_thread(
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
-    let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry, true);
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
@@ -242,6 +242,9 @@ fn translate_on_this_thread(
             [1, 1, 1]
         }
     };
+    // the safe `s_barrier`'s words and their initial values (entry block, whole group present)
+    lw.setup_barrier_storage();
+    lw.barrier_init();
     // the HLSL kernel loads and stores every register its emitted instructions name: all of
     // them in a program with branches, those up to the first s_endpgm in straight-line code
     let branchy = cfg.insts.iter().any(|d| crate::gpu::rdna2::branch_target(d).is_some());
@@ -397,6 +400,9 @@ fn translate_on_this_thread(
     let tail = lw.block(Some(1));
     lw.br(tail);
     lw.s.m.set_block(tail);
+    // every way out of the program (`s_endpgm`, the end of the code, an exhausted loop budget)
+    // comes through here: the wave leaves the safe `s_barrier`'s live count
+    lw.barrier_exit();
     if let (Some(res), true) = (res, kernel) {
         store_registers(&mut lw, res);
     }
@@ -454,8 +460,10 @@ impl Lw {
     /// partner. The caller then sets up the lanes for its entry (`setup_lanes*`), lowers the
     /// program's blocks, branches from `Block(0)` to the first of them and ends with
     /// [`Lw::finish`]. #1426's block walk (`translate_on_this_thread`) and the recompiler's
-    /// per-lane lowering (`recomp::lower_dxil`) both build their `Lw` here.
-    pub fn new(insts: &[Decoded], leaders: &BTreeSet<u64>, o: KernelOptions, entry: &Entry) -> Lw {
+    /// per-lane lowering (`recomp::lower_dxil`) both build their `Lw` here. `safe_barrier`: the
+    /// caller also runs the safe `s_barrier`'s setup (`setup_barrier_storage`, `barrier_init`
+    /// in the entry block, `barrier_exit` on the one way out; `group_barrier`).
+    pub fn new(insts: &[Decoded], leaders: &BTreeSet<u64>, o: KernelOptions, entry: &Entry, safe_barrier: bool) -> Lw {
         let split = o.wave64 && o.split;
         let kernel = matches!(entry, Entry::Kernel);
         let cs = match entry {
@@ -531,6 +539,8 @@ impl Lw {
             mask_override: None,
             exchange_error: None,
             pc: 0,
+            sbar: super::group_barrier::SBarrier::Sync,
+            bar: None,
         };
         {
             let Lw { s, ssa, init, .. } = &mut lw;
@@ -571,6 +581,14 @@ impl Lw {
         if let (Some(t), true) = (group_threads, split) {
             lw.waves = t.div_ceil(64).max(1);
         }
+        // `s_barrier`: the recompiler's policy for compute and mesh (one hardware wave: a
+        // fence; several, with an `s_barrier`: the early-exit-safe barrier) — before the storage
+        // (LDS words). Geometry, and a caller without the safe barrier's setup, keep the sync.
+        let hw_lanes = if split || !o.wave64 { 32 } else { 64 };
+        let has_barrier = super::group_barrier::has_s_barrier(insts);
+        let barrier_threads = group_threads.filter(|_| !matches!(entry, Entry::Geometry(_)));
+        let safe = safe_barrier && super::group_barrier::safe_barrier_enabled();
+        lw.sbar = super::group_barrier::policy(has_barrier, barrier_threads, hw_lanes, safe);
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
         }

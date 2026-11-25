@@ -581,3 +581,255 @@ fn gpu_direct_unaligned_multi_dword_format_store() {
     let got: Vec<u8> = r.mem.iter().flat_map(|v| v.to_le_bytes()).collect();
     assert_eq!(&got[0xFC..0x118], &want[0xFC..0x118], "bytes 0xFC..0x118 after the store at 0x102");
 }
+
+// ------------------------------------------------------------ s_barrier (`group_barrier`)
+
+/// The `s_barrier` policy follows the recompiler's (`Em::configure_round_modes`): the kernel
+/// ABI keeps its group sync, one hardware wave fences, several get the safe barrier when the
+/// program has an `s_barrier` (unless `XCL_SAFE_BARRIER=0`).
+#[test]
+fn s_barrier_policy_matches_the_recompiler() {
+    use super::group_barrier::{policy, SBarrier};
+    assert_eq!(policy(true, None, 32, true), SBarrier::Sync, "kernel ABI");
+    assert_eq!(policy(true, None, 64, true), SBarrier::Sync, "kernel ABI");
+    for (threads, hw) in [(1, 32), (32, 32), (64, 64), (33, 64)] {
+        assert_eq!(policy(true, Some(threads), hw, true), SBarrier::Fence, "{threads} threads, wave{hw}");
+        assert_eq!(policy(false, Some(threads), hw, true), SBarrier::Fence, "{threads} threads, wave{hw}");
+    }
+    for (threads, hw) in [(33, 32), (64, 32), (128, 32), (128, 64), (1024, 64)] {
+        assert_eq!(policy(true, Some(threads), hw, true), SBarrier::Safe, "{threads} threads, wave{hw}");
+        assert_eq!(policy(true, Some(threads), hw, false), SBarrier::Sync, "XCL_SAFE_BARRIER=0: {threads} threads, wave{hw}");
+        assert_eq!(policy(false, Some(threads), hw, true), SBarrier::Sync, "no s_barrier: {threads} threads, wave{hw}");
+    }
+}
+
+fn cs(threads: [u32; 3]) -> crate::gpu::recomp::CsInterface {
+    crate::gpu::recomp::CsInterface { threads, user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 }
+}
+
+/// Disassembly of a compute translation (validated by `translate_compute` in tests).
+fn cs_dis(code: &[u8], wave64: bool, split: bool, threads: [u32; 3]) -> String {
+    let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+    let k = super::kernel::translate_compute(code, o, &cs(threads))
+        .unwrap_or_else(|e| panic!("wave64 {wave64} split {split} {threads:?}: {}", &e[..e.len().min(1500)]));
+    super::validate::disassemble(&k.dxil).unwrap()
+}
+
+/// `Barrier(mode)` calls (`ops::barrier`: 9 = group sync, 8 = group-shared fence).
+fn barriers(dis: &str, mode: u32) -> usize {
+    dis.matches(&format!("@dx.op.barrier(i32 80, i32 {mode})")).count()
+}
+
+/// Group-shared atomics that leave the live count (`atomicrmw add .., i32 -1`).
+fn alive_decrements(dis: &str) -> usize {
+    dis.lines().filter(|l| l.contains("atomicrmw add") && l.contains("i32 -1")).count()
+}
+
+fn gs_globals(dis: &str) -> Vec<&str> {
+    dis.lines().filter(|l| l.contains("addrspace(3) global")).collect()
+}
+
+const S_BARRIER: (&str, &str, &[(&str, u64)], Option<u32>) = ("S_BARRIER", "ENC_SOPP", &[], None);
+
+/// (wave64, split, threads) of thread groups of several hardware waves: wave32, native
+/// wave64, split wave64 with one console wave (two hardware halves) and with several.
+const MULTI_WAVE: [(bool, bool, [u32; 3]); 6] = [
+    (false, false, [64, 1, 1]),
+    (false, false, [8, 8, 1]),
+    (true, false, [128, 1, 1]),
+    (true, true, [64, 1, 1]),
+    (true, true, [128, 1, 1]),
+    (false, false, [256, 1, 1]),
+];
+
+/// Programs without `s_barrier` pay nothing for the safe barrier: no live count, no
+/// arrival loop, no extra group-shared words.
+#[test]
+fn programs_without_s_barrier_have_no_safe_barrier() {
+    let code = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None)]);
+    for (wave64, split, threads) in MULTI_WAVE {
+        let dis = cs_dis(&code, wave64, split, threads);
+        assert!(!dis.contains("cmpxchg"), "wave64 {wave64} split {split} {threads:?}:\n{dis}");
+        assert_eq!(alive_decrements(&dis), 0, "wave64 {wave64} split {split} {threads:?}:\n{dis}");
+        if !split {
+            assert!(gs_globals(&dis).iter().all(|g| !g.contains("[2 x i32]")), "wave64 {wave64} {threads:?}:\n{dis}");
+        }
+    }
+    // with LDS: the program keeps the whole block (no clamp below the top words)
+    let lds = prog(&[("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None)]);
+    let dis = cs_dis(&lds, false, false, [64, 1, 1]);
+    assert!(!dis.contains("8188"), "{dis}");
+}
+
+/// Several hardware waves and an `s_barrier`: the live count is set up at entry (two group
+/// syncs, every thread present), the `s_barrier` is the bounded arrival barrier (fences and
+/// a compare-exchange, no group sync of its own), and the wave leaves the count once at the
+/// end (and on giving up).
+#[test]
+fn multi_wave_s_barrier_is_early_exit_safe() {
+    if !super::group_barrier::safe_barrier_enabled() {
+        return;
+    }
+    let base = prog(&[]);
+    let one = prog(&[S_BARRIER]);
+    let two = prog(&[S_BARRIER, ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None), S_BARRIER]);
+    for (wave64, split, threads) in MULTI_WAVE {
+        let at = format!("wave64 {wave64} split {split} {threads:?}");
+        let b = cs_dis(&base, wave64, split, threads);
+        for (code, n) in [(&one, 1), (&two, 2)] {
+            let dis = cs_dis(code, wave64, split, threads);
+            assert_eq!(barriers(&dis, 9), barriers(&b, 9) + 2, "{at}: only the entry's two group syncs:\n{dis}");
+            assert_eq!(barriers(&dis, 8), barriers(&b, 8) + 2 * n, "{at}: two fences per s_barrier:\n{dis}");
+            assert_eq!(dis.matches("cmpxchg").count(), 2 * n, "{at}: open the next generation, or on giving up:\n{dis}");
+            assert_eq!(alive_decrements(&dis), 1 + n, "{at}: one decrement at the end, one per give-up path:\n{dis}");
+            if !split {
+                assert_eq!(gs_globals(&dis).iter().filter(|g| g.contains("[2 x i32]")).count(), 1, "{at}: the two words of their own:\n{dis}");
+            }
+        }
+    }
+}
+
+/// `s_endpgm` before the `s_barrier`, and a loop around it (whose budget may run out): every
+/// way out goes through the one decrement.
+#[test]
+fn safe_barrier_decrements_on_every_exit() {
+    if !super::group_barrier::safe_barrier_enabled() {
+        return;
+    }
+    let early_end = prog(&[
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+        S_BARRIER,
+    ]);
+    let looped = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None),
+        S_BARRIER,
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 132)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None),
+    ]);
+    for (wave64, split, threads) in MULTI_WAVE {
+        for (name, code) in [("early s_endpgm", &early_end), ("loop", &looped)] {
+            let dis = cs_dis(code, wave64, split, threads);
+            assert_eq!(alive_decrements(&dis), 2, "{name}, wave64 {wave64} split {split} {threads:?}:\n{dis}");
+            assert_eq!(dis.matches("cmpxchg").count(), 2, "{name}, wave64 {wave64} split {split} {threads:?}:\n{dis}");
+        }
+    }
+}
+
+/// One hardware wave: `s_barrier` is a group-shared fence (nothing to wait for), no live
+/// count.
+#[test]
+fn single_wave_s_barrier_is_a_fence() {
+    let base = prog(&[]);
+    let code = prog(&[S_BARRIER]);
+    for (wave64, split, threads) in [(false, false, [32, 1, 1]), (true, false, [64, 1, 1]), (false, false, [16, 1, 1]), (true, true, [32, 1, 1])] {
+        let at = format!("wave64 {wave64} split {split} {threads:?}");
+        let b = cs_dis(&base, wave64, split, threads);
+        let dis = cs_dis(&code, wave64, split, threads);
+        assert_eq!(barriers(&dis, 9), barriers(&b, 9), "{at}: no group sync:\n{dis}");
+        assert_eq!(barriers(&dis, 8), barriers(&b, 8) + 1, "{at}: one fence:\n{dis}");
+        assert!(!dis.contains("cmpxchg"), "{at}:\n{dis}");
+        assert_eq!(alive_decrements(&dis), 0, "{at}:\n{dis}");
+    }
+}
+
+/// The kernel ABI (one console wave, as the HLSL kernel) keeps its group sync.
+#[test]
+fn kernel_s_barrier_stays_a_group_sync() {
+    let base = prog(&[]);
+    let code = prog(&[S_BARRIER]);
+    for (wave64, split) in [(false, false), (true, false), (true, true)] {
+        let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let b = super::validate::disassemble(&translate(&base, o).unwrap()).unwrap();
+        let dis = super::validate::disassemble(&translate(&code, o).unwrap()).unwrap();
+        assert_eq!(barriers(&dis, 9), barriers(&b, 9) + 1, "wave64 {wave64} split {split}:\n{dis}");
+        assert!(!dis.contains("cmpxchg"), "wave64 {wave64} split {split}:\n{dis}");
+    }
+}
+
+/// With LDS the safe barrier's words are the top of the one 32 KB block (8189, 8190; the
+/// split form's lane counter keeps 8191, its exchange moves below): no second group-shared
+/// array past the D3D12 limit, and the program's accesses are kept off them.
+#[test]
+fn safe_barrier_words_live_in_the_lds_block() {
+    if !super::group_barrier::safe_barrier_enabled() {
+        return;
+    }
+    let code = prog(&[
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None),
+        S_BARRIER,
+        ("DS_READ_B32", "ENC_DS", &[("ADDR", 1), ("VDST", 2)], None),
+    ]);
+    for (wave64, split, threads) in [(false, false, [64, 1, 1]), (true, false, [128, 1, 1]), (false, false, [8, 8, 1])] {
+        let at = format!("wave64 {wave64} split {split} {threads:?}");
+        let dis = cs_dis(&code, wave64, split, threads);
+        let g = gs_globals(&dis);
+        assert_eq!(g.len(), 1, "{at}: only the LDS block:\n{dis}");
+        assert!(g[0].contains("[8192 x i32]"), "{at}:\n{dis}");
+        assert!(dis.contains("i32 8188"), "{at}: accesses to the barrier words go below them:\n{dis}");
+        assert!(dis.contains("i32 8189") && dis.contains("i32 8190"), "{at}:\n{dis}");
+    }
+    for threads in [[64, 1, 1], [128, 1, 1]] {
+        let dis = cs_dis(&code, true, true, threads);
+        let g = gs_globals(&dis);
+        assert_eq!(g.len(), 1, "split {threads:?}: only the LDS block:\n{dis}");
+        assert!(g[0].contains("[8192 x i32]"), "split {threads:?}:\n{dis}");
+        assert!(dis.contains("i32 8189") && dis.contains("i32 8190") && dis.contains("i32 8191"), "split {threads:?}:\n{dis}");
+    }
+}
+
+/// Non-split form with the safe barrier: only words 8189 and 8190 are the barrier's, so the
+/// program's words 8188 and 8191 stay two words. After storing 11 and 22 to them and an
+/// `s_barrier`, every thread reads both back.
+#[test]
+fn gpu_safe_barrier_keeps_lds_words_8188_and_8191_apart() {
+    use crate::gpu::recomp::runner;
+    if !super::group_barrier::safe_barrier_enabled() {
+        return;
+    }
+    const LIT: u64 = 255;
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", LIT)], Some(4 * 8188)),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", LIT)], Some(4 * 8191)),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 128 + 11)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128 + 22)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 3)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 2), ("DATA0", 4)], None),
+        S_BARRIER,
+        ("DS_READ_B32", "ENC_DS", &[("ADDR", 1), ("VDST", 5)], None),
+        ("DS_READ_B32", "ENC_DS", &[("ADDR", 2), ("VDST", 6)], None),
+        // global memory at s0 + tid * 8: the two words read
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 128 + 3), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 7)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 6), ("SADDR", 0x7D), ("OFFSET", 4)], None),
+    ]);
+    if runner::adapter().is_err() {
+        return runner::skip_test("no GPU");
+    }
+    if crate::gpu::recomp::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    // two hardware waves each, so the safe barrier is used
+    let runs = [(false, 64u32, runner::wave32_supported(), "no wave32"), (true, 128, runner::wave64_supported(), "no wave64")];
+    for (wave64, threads, supported, skip) in runs {
+        if supported != Ok(true) {
+            runner::skip_test(skip);
+            continue;
+        }
+        let o = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        let csi = crate::gpu::recomp::CsInterface { user_sgprs: 2, ..cs([threads, 1, 1]) };
+        let k = super::kernel::translate_compute(&code, o, &csi).unwrap_or_else(|e| panic!("wave64 {wave64}: {}", &e[..e.len().min(1500)]));
+        let base = 0x100usize;
+        let mut io = vec![0u32; 128];
+        io[0] = base as u32;
+        let mem = vec![0u32; base / 4 + 2 * threads as usize];
+        let out = runner::dispatch(&k.dxil, [1, 1, 1], &io, &mem).unwrap_or_else(|e| panic!("wave64 {wave64}: {e}"));
+        for (tid, read) in out[base / 4..].chunks(2).enumerate() {
+            assert_eq!(read, [11, 22], "wave64 {wave64} thread {tid}: LDS words 8188 and 8191");
+        }
+    }
+}
