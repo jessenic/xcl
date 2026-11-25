@@ -1423,7 +1423,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, rodata: f.rodata(p), ..Default::default() };
                         let Ok(t) = recomp::translate(code, &opt) else { continue };
                         if !t.complete() {
                             continue;
@@ -2067,9 +2067,9 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                         let t = std::time::Instant::now();
                         let r = {
                             let (tx, rx) = std::sync::mpsc::channel();
-                            let (c, m) = (code.to_vec(), mode.clone());
+                            let (c, m, rodata) = (code.to_vec(), mode.clone(), f.rodata(p));
                             std::thread::spawn(move || {
-                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate));
+                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate, &rodata));
                             });
                             rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
                         };
@@ -2111,7 +2111,7 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                                     recomp::Mode::Pixel(_) => "ps_6_6",
                                     _ => "cs_6_6",
                                 };
-                                let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, ..Default::default() };
+                                let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, rodata: f.rodata(p), ..Default::default() };
                                 let t = recomp::translate(code, &opt).ok().filter(|t| t.complete())?;
                                 dump("hlsl", t.hlsl.as_bytes());
                                 let d = recomp::dxc::compile(&t.hlsl, "main", profile, &[]).ok()?;

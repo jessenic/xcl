@@ -38,7 +38,7 @@ pub struct KernelOptions {
 /// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
 /// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 9;
+pub const TRANSLATOR_VERSION: u32 = 10;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -142,13 +142,33 @@ fn translate_entry(
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
 ) -> Result<Kernel, String> {
+    translate_entry_with(code, o, entry, compact, nest, Vec::new())
+}
+
+/// A program at `entry` with the constant data the console compiler put after it in the code
+/// region (`xbox::Fssm::rodata`, the recompiler's `Options::rodata`): `s_getpc_b64` plus the
+/// compiler's offset is its address, and dword loads at such an address read the table the
+/// module carries (`Lw::rodata_loads`).
+pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
+    let compact = if matches!(entry, Entry::Kernel | Entry::Compute(_)) { compact_mode() } else { None };
+    translate_entry_with(code, o, entry, compact, None, rodata.to_vec())
+}
+
+fn translate_entry_with(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    rodata: Vec<(u32, Vec<u32>)>,
+) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest))
+        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, rodata))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -178,6 +198,7 @@ fn translate_on_this_thread(
     entry: Entry,
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
+    rodata: Vec<(u32, Vec<u32>)>,
 ) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
@@ -194,6 +215,7 @@ fn translate_on_this_thread(
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    lw.rodata = rodata;
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
@@ -496,6 +518,8 @@ impl Lw {
             heap_mem,
             res,
             fmt_table: None,
+            rodata: Vec::new(),
+            rodata_table: None,
             fmt_desc_cache: HashMap::new(),
             fmt_comp1_cache: HashMap::new(),
             reload: None,
