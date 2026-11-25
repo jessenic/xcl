@@ -24,6 +24,11 @@
 //! left out of the shared heap would be lost: lists bind only the shared heap for views.
 //! Without the shared heap (it could not be made) a heap keeps its own PC heap: SRV at 2k,
 //! UAV at 2k + 1.
+//!
+//! The shared heap ends in guard slots (`write_view_guards`): null views a translated shader
+//! reads instead when a T# word 0 indexes past the views (`recomp::IO_VIEW_LIMIT`) – a T# from
+//! memory the GPU never wrote. Past the heap's end NVIDIA wraps onto an unrelated slot, and a
+//! descriptor of the wrong kind there hangs the GPU.
 
 use std::sync::Mutex;
 
@@ -81,6 +86,7 @@ struct Global {
     cpu: u64,
     gpu: u64,
     inc: u32,
+    /// descriptors heaps get at most: the guard slots follow (`view_limit`)
     cap: u32,
     next: u32,
     /// released ranges (first, count)
@@ -92,6 +98,9 @@ unsafe impl Send for Global {}
 
 static GLOBAL: Mutex<Option<Global>> = Mutex::new(None);
 static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// the shared heap (raw PC heap; 0: none yet) and its first guard slot – fixed once it is made
+static GLOBAL_RAW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GLOBAL_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
 pub const GLOBAL_MAX: u32 = 1_000_000;
@@ -169,14 +178,20 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             }
         };
         crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
-        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        let (cpu, inc) = (heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        null_views(dev, cpu, inc);
+        // the guard slots: the heap's last descriptors, never given to a console heap
+        let limit = guard_start(cap);
+        write_view_guards(dev, |k| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + (limit + k) as u64 * inc as u64) as usize });
+        GLOBAL_LIMIT.store(limit, Relaxed);
+        GLOBAL_RAW.store(windows::core::Interface::as_raw(&heap) as usize, Relaxed);
         *g = Some(Global {
             dev: dev.clone(),
-            cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
+            cpu,
             gpu: heap.GetGPUDescriptorHandleForHeapStart().ptr,
-            inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            inc,
             heap,
-            cap,
+            cap: limit,
             // the memory windows' raw UAVs (`set_window_views`) come first
             next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
             free: Vec::new(),
@@ -246,6 +261,80 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
         crate::xlog_warn!("memory windows: could not bind {count} window(s) in the shared descriptor heap");
     }
     ok
+}
+
+/// descriptors of the guard slots: an SRV / UAV pair per kind of view translated shaders read
+const VIEW_GUARDS: u32 = 2 * crate::gpu::recomp::VIEW_GUARD_KINDS;
+
+/// The first guard slot of a shared heap of `cap` descriptors: its last `VIEW_GUARDS`.
+fn guard_start(cap: u32) -> u32 {
+    cap - VIEW_GUARDS
+}
+
+/// Null views at `at(0)`.. `at(VIEW_GUARDS - 1)`: per kind of `recomp::VIEW_GUARD_KINDS` (in its
+/// order) an SRV, then a UAV – what a translated shader reads and writes for a heap index past
+/// the views (`recomp::IO_VIEW_LIMIT`): zeros, stores dropped.
+pub unsafe fn write_view_guards(dev: &ID3D12Device, at: impl Fn(u32) -> D3D12_CPU_DESCRIPTOR_HANDLE) {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R8G8B8A8_UNORM};
+    for k in 0..crate::gpu::recomp::VIEW_GUARD_KINDS {
+        let mut sv = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
+        let mut uv = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: DXGI_FORMAT_R32_UINT, ..Default::default() };
+        let (sd, ud) = match k {
+            0 => {
+                sv.Anonymous.Texture1D = D3D12_TEX1D_SRV { MipLevels: 1, ..Default::default() };
+                (D3D12_SRV_DIMENSION_TEXTURE1D, D3D12_UAV_DIMENSION_TEXTURE1D)
+            }
+            1 => {
+                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+                (D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2D)
+            }
+            2 => {
+                sv.Anonymous.Texture3D = D3D12_TEX3D_SRV { MipLevels: 1, ..Default::default() };
+                uv.Anonymous.Texture3D = D3D12_TEX3D_UAV { WSize: 1, ..Default::default() };
+                (D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_UAV_DIMENSION_TEXTURE3D)
+            }
+            // a cube's UAV is a 2D array (`emit`)
+            3 => {
+                sv.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MipLevels: 1, NumCubes: 1, ..Default::default() };
+                uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: 1, ..Default::default() };
+                (D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+            }
+            4 => {
+                sv.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() };
+                uv.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV { ArraySize: 1, ..Default::default() };
+                (D3D12_SRV_DIMENSION_TEXTURE1DARRAY, D3D12_UAV_DIMENSION_TEXTURE1DARRAY)
+            }
+            5 => {
+                sv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() };
+                uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: 1, ..Default::default() };
+                (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+            }
+            // multisampled UAVs need a device option (and SM 6.7): a 2D one
+            _ => (D3D12_SRV_DIMENSION_TEXTURE2DMS, D3D12_UAV_DIMENSION_TEXTURE2D),
+        };
+        (sv.ViewDimension, uv.ViewDimension) = (sd, ud);
+        dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&sv), at(2 * k));
+        dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&uv), at(2 * k + 1));
+    }
+}
+
+/// io[`recomp::IO_VIEW_LIMIT`] for a draw or dispatch with the PC heaps `bound`: the shared
+/// heap's first guard slot when that heap is bound, else 0 (indices not bounded: a heap of its
+/// own, or `XCL_HEAP_CLAMP=0`).
+pub fn view_limit(bound: &[usize]) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("XCL_HEAP_CLAMP").map_or(true, |v| v != "0"));
+    limit_for(GLOBAL_RAW.load(Relaxed), GLOBAL_LIMIT.load(Relaxed), bound, on)
+}
+
+/// `view_limit` with the shared heap `shared` (0: none) whose guard slots start at `limit`.
+fn limit_for(shared: usize, limit: u32, bound: &[usize], on: bool) -> u32 {
+    if shared == 0 || !on || !bound.contains(&shared) {
+        0
+    } else {
+        limit
+    }
 }
 
 /// `count` descriptors of the shared heap: the index of the first. None: no shared heap, or
@@ -840,6 +929,29 @@ mod tests {
         assert_eq!(take_range(&mut free, &mut next, 100, 20), Some(80));
         assert_eq!(take_range(&mut free, &mut next, 100, 10), Some(30));
         assert!(free.is_empty());
+    }
+
+    /// The guard slots are the shared heap's last descriptors: no range a heap gets reaches
+    /// them, and io[IO_VIEW_LIMIT] names the first only for draws that bind the shared heap.
+    #[test]
+    fn shared_heap_guard_slots() {
+        let cap = 1_000_000;
+        let limit = guard_start(cap);
+        assert_eq!(cap - limit, 2 * crate::gpu::recomp::VIEW_GUARD_KINDS, "an SRV and a UAV per kind");
+        let (mut free, mut next) = (Vec::new(), 0u32);
+        while let Some(f) = take_range(&mut free, &mut next, limit, 2 * PAGE_SLOTS) {
+            assert!(f + 2 * PAGE_SLOTS <= limit, "range {f} reaches the guard slots");
+        }
+        let last = next;
+        assert_eq!(take_range(&mut free, &mut next, limit, limit - last), Some(last), "the rest below the guard slots");
+        assert_eq!(next, limit, "the views fill the heap up to the guard slots, not past");
+        assert_eq!(take_range(&mut free, &mut next, limit, 1), None);
+        let shared = 0x5000_0000;
+        assert_eq!(limit_for(shared, limit, &[0x7000_0000, shared], true), limit);
+        assert_eq!(limit_for(shared, limit, &[0x7000_0000], true), 0, "a heap of its own: no bound");
+        assert_eq!(limit_for(shared, limit, &[], true), 0);
+        assert_eq!(limit_for(0, 0, &[0], true), 0, "no shared heap");
+        assert_eq!(limit_for(shared, limit, &[shared], false), 0, "XCL_HEAP_CLAMP=0");
     }
 
     #[test]

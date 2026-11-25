@@ -746,6 +746,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let mut pso: Option<*const ConsolePso> = None;
     // heap windows (`pso::heap_windows`): a dispatch needs the shared heap even when the list set none
     let mut heaps_set = false;
+    // the PC heaps bound (raw): io[IO_VIEW_LIMIT] comes from them
+    let mut bound: Vec<usize> = Vec::new();
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
@@ -772,6 +774,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 }
                 list.SetDescriptorHeaps(&heaps);
                 heaps_set = true;
+                bound = heaps.iter().map(|h| h.as_ref().map_or(0, |h| h.as_raw() as usize)).collect();
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {
                 let n = get(1) as usize;
@@ -869,12 +872,21 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let user_sgprs = super::real::pso_user_sgprs(real);
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
+                        // (before io: its IO_VIEW_LIMIT comes from the heaps bound)
+                        if !heaps_set && crate::gpu::recomp::pso::heap_windows() {
+                            if let Some(g) = super::console_heap::global_heap() {
+                                bound = vec![g.as_raw() as usize];
+                                list.SetDescriptorHeaps(&[Some(g)]);
+                                heaps_set = true;
+                            }
+                        }
                         let mut io = match layout.as_ref() {
                             Some(l) => user_data_for(l, user_sgprs, &table, table_at as u64),
                             None => vec![table_at as u32, (table_at >> 32) as u32],
                         };
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
                         io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+                        io[crate::gpu::recomp::IO_VIEW_LIMIT] = super::console_heap::view_limit(&bound);
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers
@@ -882,12 +894,6 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
-                        }
-                        if !heaps_set && crate::gpu::recomp::pso::heap_windows() {
-                            if let Some(g) = super::console_heap::global_heap() {
-                                list.SetDescriptorHeaps(&[Some(g)]);
-                                heaps_set = true;
-                            }
                         }
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));

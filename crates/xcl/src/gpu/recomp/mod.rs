@@ -207,6 +207,17 @@ pub const IO_UMA_BASE_HI: usize = 112;
 /// address a title can have (user space ends at 0x7FFF_FFFF_FFFF), so a load from the data is
 /// told from a load of the title's memory at the same low dword (descriptor tables in window 0).
 pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
+/// io slot: the first guard slot of the bound view heap (0: indices not bounded). A heap index
+/// from a T# at or past it reads the null view of its kind there instead (`VIEW_GUARD_KINDS`,
+/// `console_heap::write_view_guards`): a T# from memory the GPU never wrote indexes anywhere.
+pub const IO_VIEW_LIMIT: usize = 113;
+/// Kinds of view a translated shader reads a heap index as, in the order of their guard slots
+/// (an SRV and a UAV each, from io[`IO_VIEW_LIMIT`]): Texture1D, 2D, 3D, CubeArray, 1DArray,
+/// 2DArray, 2DMS – UAVs the RW form of each (a cube's: 2DArray).
+pub const VIEW_GUARD_KINDS: u32 = 7;
+/// Samplers of a shader-visible PC sampler heap (the D3D12 maximum): translated shaders bound
+/// S# word 3 [11:0] to the last, and the PC heaps of console sampler heaps have them all.
+pub const SAMPLER_HEAP_SLOTS: u32 = 2048;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)

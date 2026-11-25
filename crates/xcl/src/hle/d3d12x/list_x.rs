@@ -3746,6 +3746,14 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
     }
 }
 
+/// io[`IO_VIEW_LIMIT`] of a translated draw or dispatch on `list` (`console_heap::view_limit`
+/// of the heaps it binds).
+pub(super) fn view_limit(list: *mut c_void) -> u32 {
+    let mut limit = 0;
+    with_bindings(list, |b| limit = super::console_heap::view_limit(&b.heaps));
+    limit
+}
+
 /// console #32 SetDescriptorHeaps (PC #28)
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;

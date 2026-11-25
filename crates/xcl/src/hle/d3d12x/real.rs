@@ -1144,9 +1144,10 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
         return dev_create_descriptor_heap(this, desc as usize, riid, ppv);
     }
     // views: an SRV / UAV pair per console slot (in the shared shader-visible heap, the
-    // title's own a CPU-only mirror – `console_heap`); samplers: one per slot
-    let pc_n = if sampler { d[1] } else { d[1].saturating_mul(2) };
+    // title's own a CPU-only mirror – `console_heap`); samplers: one per slot, a shader-visible
+    // heap all D3D12 allows (translated shaders bound their sampler index to the last of them)
     let visible = d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0;
+    let pc_n = if sampler && visible { d[1].max(crate::gpu::recomp::SAMPLER_HEAP_SLOTS) } else if sampler { d[1] } else { d[1].saturating_mul(2) };
     let shared = match ID3D12Device::from_raw_borrowed(&this) {
         Some(dev) if !sampler && !desc.is_null() => super::console_heap::shared_heap(dev),
         Some(dev) if sampler && !desc.is_null() => super::console_heap::shared_sampler_heap(dev),
@@ -1178,7 +1179,7 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
                 MinLOD: 0.0,
                 MaxLOD: 0.0,
             };
-            for k in 0..d[1] as u64 {
+            for k in 0..pc_n as u64 {
                 dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize });
             }
         }
