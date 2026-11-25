@@ -325,6 +325,104 @@ impl Lw {
         self.with_mem_many_tys(guard, &tys, f)
     }
 
+    /// Read-only memory load on the active window. Under descriptor-heap windows
+    /// (`self.heap_mem`, `XCL_HEAP_WINDOWS=1`) or a single/constant window (`fixed_mem`),
+    /// executes branchlessly by clamping an inactive or out-of-range lane to window 0 and
+    /// zeroing the result with `select` (passing the active condition to `f` so callers
+    /// also clamp byte addresses to 0). Multi-window non-heap mode falls back to
+    /// [`Self::with_mem_many_tys`]. Never use this for stores or atomics.
+    pub(crate) fn with_mem_load_i32s(
+        &mut self,
+        mut guard: Option<Value>,
+        n: usize,
+        f: &mut dyn FnMut(&mut Lw, RawUav, Option<Value>) -> Vec<Value>,
+    ) -> Vec<Value> {
+        if let Some(c) = guard {
+            match self.s.m.const_u64(c) {
+                Some(1) => guard = None,
+                Some(0) => return vec![self.c(0); n],
+                _ => {}
+            }
+        }
+        if let Some(coherent) = self.heap_mem {
+            let windows = self.mems.len() as u32;
+            let w = self.rd(super::lower::VAR_WIN);
+            let inside = self.cmpc(Pred::ULt, w, windows);
+            let cond = match guard {
+                Some(g) => self.and(g, inside),
+                None => inside,
+            };
+            if self.s.m.const_u64(cond) == Some(0) {
+                return vec![self.c(0); n];
+            }
+            let cond_opt = (self.s.m.const_u64(cond) != Some(1)).then_some(cond);
+            // Clamp the heap window using `inside` alone (independent of lane `guard`) so
+            // consecutive loads in the same window share one CSE'd `createHandleFromHeap`
+            // + `annotateHandle` even when `EXEC` changes between loads.
+            //
+            // Invariant: `MEM_HEAP_BASE + 0` (window 0) is always populated with a valid
+            // raw-buffer UAV by both `console_heap::set_window_views` and `recomp::runner`
+            // (independent of `MEM_HEAP_BASE`'s exact slot offset above the null views),
+            // so clamping inactive/OOB lanes to window 0 + byte offset 0 is always safe to
+            // read and the result is immediately masked to 0 by `select(cond, v, 0)`.
+            let w_safe = if self.s.m.const_u64(inside) == Some(1) {
+                w
+            } else {
+                let z = self.c(0);
+                self.sel(inside, w, z)
+            };
+            let i = self.addc(w_safe, crate::gpu::recomp::MEM_HEAP_BASE);
+            let m = self.s.heap_raw_buffer_uav(i, coherent);
+            let vals = f(self, m, cond_opt);
+            debug_assert_eq!(vals.len(), n);
+            return match cond_opt {
+                Some(c) => {
+                    let z = self.c(0);
+                    vals.into_iter().map(|v| self.sel(c, v, z)).collect()
+                }
+                None => vals,
+            };
+        }
+        let fixed_mem = if self.mems.len() <= 1 {
+            Some(self.mems[0])
+        } else {
+            let w = self.rd(super::lower::VAR_WIN);
+            if let Some(k) = self.s.m.const_u64(w) {
+                if (k as usize) < self.mems.len() {
+                    Some(self.mems[k as usize])
+                } else {
+                    return vec![self.c(0); n];
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(m) = fixed_mem {
+            let vals = f(self, m, guard);
+            debug_assert_eq!(vals.len(), n);
+            return match guard {
+                Some(c) => {
+                    let z = self.c(0);
+                    vals.into_iter().map(|v| self.sel(c, v, z)).collect()
+                }
+                None => vals,
+            };
+        }
+        let i32 = self.s.m.i32();
+        let tys = vec![i32; n];
+        self.with_mem_many_tys(guard, &tys, &mut |lw, m| f(lw, m, None))
+    }
+
+    fn safe_load_addr(&mut self, a: Value, cond: Option<Value>) -> Value {
+        match cond {
+            Some(c) => {
+                let z = self.c(0);
+                self.sel(c, a, z)
+            }
+            None => a,
+        }
+    }
+
     pub(crate) fn with_mem_void(
         &mut self,
         guard: Option<Value>,
@@ -346,14 +444,20 @@ impl Lw {
     /// `mem.Load(a & ~3)`
     pub fn mem_ld(&mut self, a: Value) -> Value {
         let a = self.andc(a, !3);
-        self.with_mem_i32s(None, 1, &mut |lw, m| lw.s.raw_load(m, a, 1))[0]
+        self.with_mem_load_i32s(None, 1, &mut |lw, m, cond| {
+            let a = lw.safe_load_addr(a, cond);
+            lw.s.raw_load(m, a, 1)
+        })[0]
     }
     /// `mem.Load2/3/4(a & ~3)` (1..=4 consecutive dwords in one window switch).
     pub(crate) fn mem_ld_n(&mut self, guard: Option<Value>, a: Value, count: u32) -> Vec<Value> {
         debug_assert!((1..=4).contains(&count));
         let a = self.andc(a, !3);
         let mask = ((1u32 << count) - 1) as u8;
-        self.with_mem_i32s(guard, count as usize, &mut |lw, m| lw.s.raw_load(m, a, mask))
+        self.with_mem_load_i32s(guard, count as usize, &mut |lw, m, cond| {
+            let a = lw.safe_load_addr(a, cond);
+            lw.s.raw_load(m, a, mask)
+        })
     }
     /// `mem.Store(a & ~3, v)`
     pub fn mem_st(&mut self, a: Value, v: Value) {
@@ -374,7 +478,9 @@ impl Lw {
         let b16 = self.addc(b, 16);
         let s = self.andc(a, 3);
         let s = self.shlc(s, 3);
-        let w = self.with_mem_i32s(guard, 5, &mut |lw, m| {
+        let w = self.with_mem_load_i32s(guard, 5, &mut |lw, m, cond| {
+            let b = lw.safe_load_addr(b, cond);
+            let b16 = lw.safe_load_addr(b16, cond);
             let mut v = lw.s.raw_load(m, b, 0xF);
             v.push(lw.s.raw_load(m, b16, 1)[0]);
             v
@@ -398,7 +504,10 @@ impl Lw {
         let b = self.andc(a, !3);
         let s = self.andc(a, 3);
         let s = self.shlc(s, 3);
-        let w = self.with_mem_i32s(guard, 2, &mut |lw, m| lw.s.raw_load(m, b, 0x3));
+        let w = self.with_mem_load_i32s(guard, 2, &mut |lw, m, cond| {
+            let b = lw.safe_load_addr(b, cond);
+            lw.s.raw_load(m, b, 0x3)
+        });
         let k32 = self.c(32);
         let inv = self.sub(k32, s);
         let inv = self.andc(inv, 31);
@@ -1071,18 +1180,22 @@ impl Lw {
             let lim = self.sel(sz, d2, lim);
             let base = self.add(d0, off);
             let base_aligned = self.andc(base, !3);
-            let raw = self.with_mem_i32s(None, count as usize, &mut |lw, m| {
+            let raw = self.with_mem_load_i32s(None, count as usize, &mut |lw, m, cond| {
                 let mut out = Vec::with_capacity(count as usize);
                 let mut done = 0u32;
                 while done < count {
                     let chunk = (count - done).min(4);
                     let at = lw.addc(base_aligned, 4 * done);
+                    let at = lw.safe_load_addr(at, cond);
                     let mask = ((1u32 << chunk) - 1) as u8;
                     out.extend(lw.s.raw_load(m, at, mask));
                     done += chunk;
                 }
                 out
             });
+            // (a V# on the constant data in the code: only with windows, where its high
+            // dword tells it from the title's memory)
+            let raw = if self.windowed() { self.rodata_loads(base_aligned, raw) } else { raw };
             let z = self.c(0);
             (0..count)
                 .map(|i| {
@@ -1109,18 +1222,21 @@ impl Lw {
             let a = self.add(b, k);
             let a = self.add(a, soff);
             let base_aligned = self.andc(a, !3);
-            self.with_mem_i32s(None, count as usize, &mut |lw, m| {
+            let raw = self.with_mem_load_i32s(None, count as usize, &mut |lw, m, cond| {
                 let mut out = Vec::with_capacity(count as usize);
                 let mut done = 0u32;
                 while done < count {
                     let chunk = (count - done).min(4);
                     let at = lw.addc(base_aligned, 4 * done);
+                    let at = lw.safe_load_addr(at, cond);
                     let mask = ((1u32 << chunk) - 1) as u8;
                     out.extend(lw.s.raw_load(m, at, mask));
                     done += chunk;
                 }
                 out
-            })
+            });
+            // (constant data in the code)
+            self.rodata_loads(base_aligned, raw)
         };
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.split && coherent {
@@ -1279,7 +1395,10 @@ impl Lw {
                     let ea3 = self.andc(ea, 3);
                     let ea3_8 = self.shlc(ea3, 3);
                     let s = self.or(ea3_8, c1.off_bits);
-                    let w = self.with_mem_i32s(Some(act), 2, &mut |lw, m| lw.s.raw_load(m, eb, 0x3));
+                    let w = self.with_mem_load_i32s(Some(act), 2, &mut |lw, m, cond| {
+                        let eb = lw.safe_load_addr(eb, cond);
+                        lw.s.raw_load(m, eb, 0x3)
+                    });
                     let lo = self.bin(BinOp::LShr, w[0], s);
                     let k32 = self.c(32);
                     let inv = self.sub(k32, s);
@@ -1952,6 +2071,13 @@ impl Lw {
         } else {
             let vd = Self::fv(d, "VDST");
             let loaded = self.mem_ld_n(Some(act), a, count as u32);
+            // (constant data in the code)
+            let loaded = if self.rodata.is_empty() {
+                loaded
+            } else {
+                let a = self.andc(a, !3);
+                self.rodata_loads(a, loaded)
+            };
             for i in 0..count {
                 self.write32(&Dst::V(vd + i), loaded[i as usize]);
             }
@@ -2463,13 +2589,47 @@ impl Lw {
             32..=63 => {
                 let k = (tgt - 32) as usize;
                 let outputs = self.mesh.as_ref().expect("mesh").outputs.clone();
-                let at = crate::gpu::recomp::param_registers(&outputs, true).get(k).map(|&r| crate::gpu::recomp::elements_at(&outputs, true, r)).unwrap_or_default();
-                for j in at {
-                    for c in 0..4 {
-                        if enabled(c) {
-                            let a = self.addc(vtx, (4 * (j + 1) + c) as u32);
-                            let v = comp(self, c);
-                            st.push((a, v));
+                let Some((lo_reg, hi_reg, packed16)) = crate::gpu::recomp::param_slot_regs(&outputs, None, k) else {
+                    return Ok(());
+                };
+                let unpack_half = |lw: &mut Lw, raw: Value, ct: u32| -> Value {
+                    if matches!(ct, 3 | 6) {
+                        let f = lw.s.f16_to_f32(raw);
+                        lw.bits(f)
+                    } else if matches!(ct, 2 | 5) {
+                        lw.sx16(raw)
+                    } else {
+                        raw
+                    }
+                };
+                let ranked_outs = crate::gpu::recomp::ranked(&outputs, true);
+                if packed16 && !compr {
+                    for (half_group, reg_opt) in [(0usize, Some(lo_reg)), (2usize, hi_reg)] {
+                        let Some(reg) = reg_opt else { continue };
+                        for j in crate::gpu::recomp::elements_at(&outputs, true, reg) {
+                            let ct = ranked_outs[j].component_type;
+                            for c in 0..4 {
+                                let ch = half_group + c / 2;
+                                if enabled(ch) {
+                                    let w = srcs[ch];
+                                    let raw = if c % 2 == 0 { self.andc(w, 0xFFFF) } else { self.lshrc(w, 16) };
+                                    let v = unpack_half(self, raw, ct);
+                                    let a = self.addc(vtx, (4 * (j + 1) + c) as u32);
+                                    st.push((a, v));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for j in crate::gpu::recomp::elements_at(&outputs, true, lo_reg) {
+                        let ct = ranked_outs[j].component_type;
+                        for c in 0..4 {
+                            if enabled(c) {
+                                let a = self.addc(vtx, (4 * (j + 1) + c) as u32);
+                                let raw = comp(self, c);
+                                let v = if compr { unpack_half(self, raw, ct) } else { raw };
+                                st.push((a, v));
+                            }
                         }
                     }
                 }

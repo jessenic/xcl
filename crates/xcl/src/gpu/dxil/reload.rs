@@ -199,15 +199,17 @@ pub fn analyze(cfg: &Cfg) -> Reloads {
             s.set(j, true);
         }
     };
-    // a block's instructions, its branch included (it writes nothing this follows, but is
-    // checked like the rest)
-    let insts = |b: usize| {
-        let blk = &cfg.blocks[b];
-        let branch = match blk.term {
-            Term::Cond(i, ..) => Some(i),
-            _ => None,
-        };
-        blk.insts.iter().copied().chain(branch)
+    // kill any cached load whose base/offset scalar reg is overwritten by `RestoreIfExecZ`
+    let kill_regs = |regs: &[u32], s: &mut Set| {
+        for (j, k) in by_slot.iter().enumerate() {
+            if regs.iter().any(|&r| r < 128 && reads(k, r as u64)) {
+                s.set(j, false);
+            }
+        }
+    };
+    let branch_of = |b: usize| match cfg.blocks[b].term {
+        Term::Cond(i, ..) => Some(i),
+        _ => None,
     };
     let reachable: Vec<bool> = {
         let mut r = vec![false; cfg.blocks.len()];
@@ -230,7 +232,14 @@ pub fn analyze(cfg: &Cfg) -> Reloads {
         let mut changed = false;
         for &b in &cfg.rpo {
             let mut s = at_entry(b, &outs);
-            for i in insts(b) {
+            for op in &cfg.blocks[b].ops {
+                match op {
+                    super::cfg::CfgOp::Inst(i) => step(*i, &mut s),
+                    super::cfg::CfgOp::SaveExecZ { .. } => {}
+                    super::cfg::CfgOp::RestoreIfExecZ { regs, .. } => kill_regs(regs, &mut s),
+                }
+            }
+            if let Some(i) = branch_of(b) {
                 step(i, &mut s);
             }
             if s != outs[b] {
@@ -244,7 +253,19 @@ pub fn analyze(cfg: &Cfg) -> Reloads {
     }
     for &b in &cfg.rpo {
         let mut s = at_entry(b, &outs);
-        for i in insts(b) {
+        for op in &cfg.blocks[b].ops {
+            match op {
+                super::cfg::CfgOp::Inst(i) => {
+                    if let Some(j) = keys[*i] {
+                        out.at.insert((b, *i), Reload { slot: j as u32, available: s.has(j) });
+                    }
+                    step(*i, &mut s);
+                }
+                super::cfg::CfgOp::SaveExecZ { .. } => {}
+                super::cfg::CfgOp::RestoreIfExecZ { regs, .. } => kill_regs(regs, &mut s),
+            }
+        }
+        if let Some(i) = branch_of(b) {
             if let Some(j) = keys[i] {
                 out.at.insert((b, i), Reload { slot: j as u32, available: s.has(j) });
             }

@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use super::cfg::{Cfg, Term};
+use super::cfg::{Cfg, CfgOp, Term};
 use super::container::Stage;
 use super::lower::{ComputeInit, Init, Lw, Partner, VAR_BUDGET, VAR_SCC, VAR_VGPR};
 use super::module::{Block, Pred, Value};
@@ -38,7 +38,7 @@ pub struct KernelOptions {
 /// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
 /// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 9;
+pub const TRANSLATOR_VERSION: u32 = 10;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -100,6 +100,13 @@ pub fn translate_full(code: &[u8], o: KernelOptions) -> Result<Kernel, String> {
 /// A mesh-mode (NGG) program: the first pass that writes one record per group into
 /// `res` (the recompiler's `Mode::Mesh`; the pass-through mesh shader draws them).
 pub fn translate_mesh(code: &[u8], o: KernelOptions, ms: &MsInterface) -> Result<Kernel, String> {
+    let hw_wave = if o.wave64 && !o.split { 64 } else { 32 };
+    if ms.threads > hw_wave
+        && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0")
+        && super::lower::has_non_uniform_barrier(code)
+    {
+        return Err("non-uniform s_barrier in multi-wave mesh shader".into());
+    }
     translate_entry(code, o, Entry::Mesh(ms.clone()), None, None)
 }
 
@@ -142,13 +149,33 @@ fn translate_entry(
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
 ) -> Result<Kernel, String> {
+    translate_entry_with(code, o, entry, compact, nest, Vec::new())
+}
+
+/// A program at `entry` with the constant data the console compiler put after it in the code
+/// region (`xbox::Fssm::rodata`, the recompiler's `Options::rodata`): `s_getpc_b64` plus the
+/// compiler's offset is its address, and dword loads at such an address read the table the
+/// module carries (`Lw::rodata_loads`).
+pub fn translate_entry_rodata(code: &[u8], o: KernelOptions, entry: Entry, rodata: &[(u32, Vec<u32>)]) -> Result<Kernel, String> {
+    let compact = if matches!(entry, Entry::Kernel | Entry::Compute(_)) { compact_mode() } else { None };
+    translate_entry_with(code, o, entry, compact, None, rodata.to_vec())
+}
+
+fn translate_entry_with(
+    code: &[u8],
+    o: KernelOptions,
+    entry: Entry,
+    compact: Option<bool>,
+    nest: Option<super::compact::Nest>,
+    rodata: Vec<(u32, Vec<u32>)>,
+) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest))
+        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, rodata))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -178,22 +205,36 @@ fn translate_on_this_thread(
     entry: Entry,
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
+    rodata: Vec<(u32, Vec<u32>)>,
 ) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
         _ => None,
     };
+    let kernel = matches!(entry, Entry::Kernel);
     let cfg = match &geo {
         Some(g) => Cfg::build_geometry(code, g.gs_start)?,
-        None => Cfg::build(code)?,
+        None => {
+            // Plan the compact form on the uncollapsed CFG first so giant programs with
+            // repeating blocks keep the compact switch table rather than collapsing first
+            // into distinct merged blocks that defeat class deduplication.
+            let flat = Cfg::build_with_threshold(code, o.wave64, kernel, usize::MAX)?;
+            let (no_samplers, no_live) = (Default::default(), Default::default());
+            let take_compact = (matches!(entry, Entry::Compute(_)) || kernel)
+                && compact.unwrap_or_else(|| {
+                    super::compact::large(&flat)
+                        && super::compact::plan_with(&flat, &no_samplers, &no_live)
+                            .is_some_and(|p| super::compact::wanted(&flat, &p))
+                });
+            if take_compact { flat } else { Cfg::build_for(code, o.wave64, kernel)? }
+        }
     };
-    let kernel = matches!(entry, Entry::Kernel);
     let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
-    let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
-    let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    let mut lw = Lw::new(&cfg.insts, &cfg.orig_leaders, o, &entry);
+    lw.rodata = rodata;
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
@@ -322,6 +363,7 @@ fn translate_on_this_thread(
             None => super::compact::emit(&mut lw, &cfg, p, h0, exit)?,
         }
     }
+    let mut saved_execz: HashMap<u32, (Value, Vec<(u32, Value)>)> = HashMap::new();
     for &b in cfg.rpo.iter().filter(|_| plan.is_none()) {
         let h = head(&mut lw, b);
         lw.s.m.set_block(h);
@@ -347,9 +389,34 @@ fn translate_on_this_thread(
             let l = lw.sub(left, one);
             lw.wr(VAR_BUDGET, l);
         }
-        for &i in &cfg.blocks[b].insts {
-            lw.reload = reloads.get(b, i);
-            lw.inst(&cfg.insts[i])?;
+        for op in &cfg.blocks[b].ops {
+            match op {
+                CfgOp::Inst(i) => {
+                    lw.reload = reloads.get(b, *i);
+                    lw.inst(&cfg.insts[*i])?;
+                }
+                CfgOp::SaveExecZ { id, regs } => {
+                    let lo = lw.sreg(126);
+                    let mask = if lw.wave64 {
+                        let hi = lw.sreg(127);
+                        lw.or(lo, hi)
+                    } else {
+                        lo
+                    };
+                    let was_zero = lw.cmpc(Pred::Eq, mask, 0);
+                    let snap: Vec<(u32, Value)> = regs.iter().map(|&r| (r, lw.rd(r))).collect();
+                    saved_execz.insert(*id, (was_zero, snap));
+                }
+                CfgOp::RestoreIfExecZ { id, regs } => {
+                    let (was_zero, snap) = saved_execz.remove(id).expect("paired SaveExecZ");
+                    debug_assert_eq!(snap.len(), regs.len());
+                    for (r, old) in snap {
+                        let cur = lw.rd(r);
+                        let v = lw.sel(was_zero, old, cur);
+                        lw.wr(r, v);
+                    }
+                }
+            }
         }
         lw.reload = None;
         match cfg.blocks[b].term {
@@ -496,6 +563,8 @@ impl Lw {
             heap_mem,
             res,
             fmt_table: None,
+            rodata: Vec::new(),
+            rodata_table: None,
             fmt_desc_cache: HashMap::new(),
             fmt_comp1_cache: HashMap::new(),
             reload: None,
