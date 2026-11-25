@@ -1,10 +1,10 @@
 //! The compact form: each distinct block of a program lowered once, in a loop over a table.
 
-use super::cfg::{Cfg, Term};
+use super::cfg::{Cfg, CfgOp, Term};
 use super::lower::{ext_encoding, LResult, Lw, VAR_BUDGET};
 use super::lower_mem::VAR_TMP;
 use super::module::{Block, Pred, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub struct Plan {
     /// the reachable blocks in address order: the loop's block numbers
@@ -37,7 +37,7 @@ impl Plan {
 
 /// Whether a program takes the form by itself: large, mostly repeated blocks, small tables.
 pub fn wanted(cfg: &Cfg, p: &Plan) -> bool {
-    let insts = |n: usize| cfg.blocks[p.order[n]].insts.len();
+    let insts = |n: usize| cfg.blocks[p.order[n]].ops.iter().filter(|op| matches!(op, CfgOp::Inst(_))).count();
     let all: usize = (0..p.order.len()).map(insts).sum();
     let once: usize = p.rep.iter().map(|&n| insts(n)).sum();
     large(cfg) && once * 10 < all * 3 && p.words() <= MAX_TABLE_WORDS
@@ -45,13 +45,23 @@ pub fn wanted(cfg: &Cfg, p: &Plan) -> bool {
 
 /// Whether a program is large enough for `wanted` to be asked.
 pub fn large(cfg: &Cfg) -> bool {
-    cfg.rpo.iter().map(|&b| cfg.blocks[b].insts.len()).sum::<usize>() >= 20_000
+    cfg.rpo
+        .iter()
+        .map(|&b| cfg.blocks[b].ops.iter().filter(|op| matches!(op, CfgOp::Inst(_))).count())
+        .sum::<usize>()
+        >= 20_000
 }
 
 pub const END: u32 = u32::MAX;
 
 /// Sorts the reachable blocks into classes the lowering would emit the same for.
 pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
+    plan_with(cfg, &lw.static_samplers, &lw.whole_live)
+}
+
+/// Like [`plan`], taking `static_samplers` and `whole_live` explicitly so callers
+/// can check compact eligibility before `Lw` construction or `s_cbranch_execz` collapsing.
+pub fn plan_with(cfg: &Cfg, static_samplers: &BTreeMap<u64, [u32; 4]>, whole_live: &BTreeMap<u64, u128>) -> Option<Plan> {
     let mut order = cfg.rpo.clone();
     order.sort_by_key(|&b| (cfg.blocks[b].pc, b));
     let mut number = vec![END; cfg.blocks.len()];
@@ -63,22 +73,39 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
     for (n, &b) in order.iter().enumerate() {
         let blk = &cfg.blocks[b];
         let mut key = vec![cfg.headers.contains(&b) as u64];
-        for &i in &blk.insts {
-            let d = &cfg.insts[i];
-            key.push(d.words.len() as u64);
-            key.extend(d.words.iter().map(|&w| w as u64));
-            key.push(d.literal.map_or(u64::MAX, |l| l as u64));
-            if let Some(s) = lw.static_samplers.get(&d.pc) {
-                key.extend(s.iter().map(|&w| w as u64));
-            }
-            // what `Lw::write_mask` asks of this address, for any register a mask can go to
-            if let Some(&l) = lw.whole_live.get(&d.pc) {
-                let sdwa = ext_encoding(d).and_then(|e| crate::gpu::rdna2::field_value(e, &d.words, "SDST"));
-                let to = crate::gpu::rdna2::sgpr_uses(d).1.into_iter().chain([106]).chain(sdwa);
-                key.extend(to.filter(|&r| r < 126).map(|r| (l >> r) as u64 & 3));
-            }
-            if d.inst.name == "S_GETPC_B64" {
-                key.push(d.pc);
+        for op in &blk.ops {
+            match op {
+                CfgOp::Inst(i) => {
+                    let d = &cfg.insts[*i];
+                    key.push(0);
+                    key.push(d.words.len() as u64);
+                    key.extend(d.words.iter().map(|&w| w as u64));
+                    key.push(d.literal.map_or(u64::MAX, |l| l as u64));
+                    if let Some(s) = static_samplers.get(&d.pc) {
+                        key.extend(s.iter().map(|&w| w as u64));
+                    }
+                    // what `Lw::write_mask` asks of this address, for any register a mask can go to
+                    if let Some(&l) = whole_live.get(&d.pc) {
+                        let sdwa = ext_encoding(d).and_then(|e| crate::gpu::rdna2::field_value(e, &d.words, "SDST"));
+                        let to = crate::gpu::rdna2::sgpr_uses(d).1.into_iter().chain([106]).chain(sdwa);
+                        key.extend(to.filter(|&r| r < 126).map(|r| (l >> r) as u64 & 3));
+                    }
+                    if d.inst.name == "S_GETPC_B64" {
+                        key.push(d.pc);
+                    }
+                }
+                CfgOp::SaveExecZ { id, regs } => {
+                    key.push(1);
+                    key.push(*id as u64);
+                    key.push(regs.len() as u64);
+                    key.extend(regs.iter().map(|&r| r as u64));
+                }
+                CfgOp::RestoreIfExecZ { id, regs } => {
+                    key.push(2);
+                    key.push(*id as u64);
+                    key.push(regs.len() as u64);
+                    key.extend(regs.iter().map(|&r| r as u64));
+                }
             }
         }
         let (end, to) = match blk.term {
@@ -282,8 +309,32 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
             let l = lw.sub(left, one);
             lw.s.m.store(budget, l, 4);
         }
-        for &i in &blk.insts {
-            lw.inst(&cfg.insts[i])?;
+        let mut saved_execz: HashMap<u32, (Value, Vec<(u32, Value)>)> = HashMap::new();
+        for op in &blk.ops {
+            match op {
+                CfgOp::Inst(i) => lw.inst(&cfg.insts[*i])?,
+                CfgOp::SaveExecZ { id, regs } => {
+                    let lo = lw.sreg(126);
+                    let mask = if lw.wave64 {
+                        let hi = lw.sreg(127);
+                        lw.or(lo, hi)
+                    } else {
+                        lo
+                    };
+                    let was_zero = lw.cmpc(Pred::Eq, mask, 0);
+                    let snap: Vec<(u32, Value)> = regs.iter().map(|&r| (r, lw.rd(r))).collect();
+                    saved_execz.insert(*id, (was_zero, snap));
+                }
+                CfgOp::RestoreIfExecZ { id, regs } => {
+                    let (was_zero, snap) = saved_execz.remove(id).expect("paired SaveExecZ");
+                    debug_assert_eq!(snap.len(), regs.len());
+                    for (r, old) in snap {
+                        let cur = lw.rd(r);
+                        let v = lw.sel(was_zero, old, cur);
+                        lw.wr(r, v);
+                    }
+                }
+            }
         }
         let next = match blk.term {
             Term::End => lw.c(END),

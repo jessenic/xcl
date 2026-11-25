@@ -117,7 +117,7 @@ fn a_mask_read_whole_after_one_copy_only_splits_the_class() {
     v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]));
     v.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
     let cfg = super::cfg::Cfg::build(&v).unwrap();
-    let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let leaders = cfg.orig_leaders.clone();
     let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
     let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
     let p = super::compact::plan(&cfg, &lw).unwrap();
@@ -189,7 +189,7 @@ fn nested_compact_ir_structure_bounds_switch_fanout_and_merge_fanin() {
     // 4 groups of sizes (4, 4, 4, 1), exercising full inner switches and a singleton tail group.
     let code = multi_class_program(11, 3);
     let cfg = super::cfg::Cfg::build(&code).unwrap();
-    let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let leaders = cfg.orig_leaders.clone();
     let o = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
 
     let inspect = |nest: Nest| -> (usize, usize, usize, usize) {

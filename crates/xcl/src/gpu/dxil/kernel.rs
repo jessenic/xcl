@@ -214,7 +214,20 @@ fn translate_on_this_thread(
     let kernel = matches!(entry, Entry::Kernel);
     let cfg = match &geo {
         Some(g) => Cfg::build_geometry(code, g.gs_start)?,
-        None => Cfg::build_for(code, o.wave64, kernel)?,
+        None => {
+            // Plan the compact form on the uncollapsed CFG first so giant programs with
+            // repeating blocks keep the compact switch table rather than collapsing first
+            // into distinct merged blocks that defeat class deduplication.
+            let flat = Cfg::build_with_threshold(code, o.wave64, kernel, usize::MAX)?;
+            let (no_samplers, no_live) = (Default::default(), Default::default());
+            let take_compact = (matches!(entry, Entry::Compute(_)) || kernel)
+                && compact.unwrap_or_else(|| {
+                    super::compact::large(&flat)
+                        && super::compact::plan_with(&flat, &no_samplers, &no_live)
+                            .is_some_and(|p| super::compact::wanted(&flat, &p))
+                });
+            if take_compact { flat } else { Cfg::build_for(code, o.wave64, kernel)? }
+        }
     };
     let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
