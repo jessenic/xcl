@@ -296,25 +296,43 @@ impl Lw {
                     return err(d, "movrels: the source is not a VGPR");
                 }
                 let base = src_code - 256;
-                let mut v = self.c(0);
-                for k in 0..=top.saturating_sub(base) {
-                    let r = self.vreg(base + k);
-                    let is = self.cmpc(Pred::Eq, idx, k as u32);
-                    v = self.sel(is, r, v);
+                if let Some(k) = self.s.m.const_u64(idx) {
+                    if base + k <= top {
+                        self.vreg(base + k)
+                    } else {
+                        self.c(0)
+                    }
+                } else {
+                    let lim = top.saturating_sub(base).min(self.value_upper_bound(idx) as u64);
+                    let mut v = self.c(0);
+                    for k in 0..=lim {
+                        let r = self.vreg(base + k);
+                        let is = self.cmpc(Pred::Eq, idx, k as u32);
+                        v = self.sel(is, r, v);
+                    }
+                    v
                 }
-                v
             }
             None => self.code32(src_code, d.literal, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?,
         };
         let a = self.act();
         match wr_idx {
             Some(idx) => {
-                for k in 0..=top.saturating_sub(vdst) {
-                    let is = self.cmpc(Pred::Eq, idx, k as u32);
-                    let c = self.land(a, is);
-                    let old = self.vreg(vdst + k);
-                    let v = self.sel(c, value, old);
-                    self.wr(VAR_VGPR + (vdst + k) as u32, v);
+                if let Some(k) = self.s.m.const_u64(idx) {
+                    if vdst + k <= top {
+                        let old = self.vreg(vdst + k);
+                        let v = self.sel(a, value, old);
+                        self.wr(VAR_VGPR + (vdst + k) as u32, v);
+                    }
+                } else {
+                    let lim = top.saturating_sub(vdst).min(self.value_upper_bound(idx) as u64);
+                    for k in 0..=lim {
+                        let is = self.cmpc(Pred::Eq, idx, k as u32);
+                        let c = self.land(a, is);
+                        let old = self.vreg(vdst + k);
+                        let v = self.sel(c, value, old);
+                        self.wr(VAR_VGPR + (vdst + k) as u32, v);
+                    }
                 }
             }
             None => {
@@ -341,15 +359,27 @@ impl Lw {
         let m0_lo = self.andc(m0, 0xFF);
         let a = self.act();
         let td = self.vreg(vdst);
+        if let Some(k) = self.s.m.const_u64(m0_lo) {
+            let ts = if base + k <= top { self.vreg(base + k) } else { self.c(0) };
+            let nv = self.sel(a, ts, td);
+            self.wr(VAR_VGPR + vdst as u32, nv);
+            if base + k <= top {
+                let old = self.vreg(base + k);
+                let v = self.sel(a, td, old);
+                self.wr(VAR_VGPR + (base + k) as u32, v);
+            }
+            return Ok(());
+        }
+        let lim = top.saturating_sub(base).min(self.value_upper_bound(m0_lo) as u64);
         let mut ts = self.c(0);
-        for k in 0..=top.saturating_sub(base) {
+        for k in 0..=lim {
             let r = self.vreg(base + k);
             let is = self.cmpc(Pred::Eq, m0_lo, k as u32);
             ts = self.sel(is, r, ts);
         }
         let nv = self.sel(a, ts, td);
         self.wr(VAR_VGPR + vdst as u32, nv);
-        for k in 0..=top.saturating_sub(base) {
+        for k in 0..=lim {
             let is = self.cmpc(Pred::Eq, m0_lo, k as u32);
             let c = self.land(a, is);
             let old = self.vreg(base + k);
