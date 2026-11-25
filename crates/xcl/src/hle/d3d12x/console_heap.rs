@@ -408,6 +408,11 @@ pub fn unregister(obj: usize) {
     }
 }
 
+/// Whether heap `obj` holds samplers, and the 32-bit console address of its slots.
+pub fn base(obj: usize) -> Option<(bool, u32)> {
+    HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| (h.sampler, h.shadow as u32))
+}
+
 /// Start of the console slots of heap `obj` (CPU handle = GPU handle on the console).
 pub fn start(obj: usize) -> Option<u64> {
     HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| h.shadow as u64)
@@ -531,6 +536,42 @@ pub fn note_resource(s: &Slot, res: usize) {
 /// The resource of the view slot at UMA address `at`.
 pub fn resource_at(at: usize) -> Option<usize> {
     RES.lock().unwrap().as_ref()?.get(&at).copied()
+}
+
+/// shared-heap SRV index → the texture on pages its view names (page budget, census). A T#
+/// keeps that index wherever the title copies it, so the slots holding it name the texture.
+static INDEX_RES: Mutex<Option<std::collections::HashMap<u32, usize>>> = Mutex::new(None);
+
+/// The SRV made for slot `s` names `res`, a texture on pages. False: the slot's heap is not
+/// in the shared heap, so its T# cannot be followed.
+pub fn note_index(s: &Slot, res: usize) -> bool {
+    if s.sampler || s.shared_srv == 0 {
+        return false;
+    }
+    INDEX_RES.lock().unwrap().get_or_insert_with(Default::default).insert(s.index, res);
+    true
+}
+
+/// The textures on pages whose T# is in a slot now: (in a shader-visible view heap, only in
+/// CPU-only ones).
+pub fn referenced() -> (Vec<usize>, Vec<usize>) {
+    let index = INDEX_RES.lock().unwrap();
+    let Some(index) = index.as_ref().filter(|m| !m.is_empty()) else { return (Vec::new(), Vec::new()) };
+    let heaps = HEAPS.lock().unwrap();
+    let (mut visible, mut cpu) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    for h in heaps.iter().filter(|h| !h.sampler) {
+        let set = if h.visible { &mut visible } else { &mut cpu };
+        for k in 0..h.n {
+            let w = unsafe { std::slice::from_raw_parts((h.shadow + (k * SLOT) as usize) as *const u32, 4) };
+            if w[3] >> 28 >= 8 {
+                if let Some(&r) = index.get(&w[0]) {
+                    set.insert(r);
+                }
+            }
+        }
+    }
+    let cpu = cpu.difference(&visible).copied().collect();
+    (visible.into_iter().collect(), cpu)
 }
 
 pub fn write(s: &Slot, words: &[u32]) {
@@ -910,6 +951,32 @@ mod tests {
         assert_eq!(seen.len(), base as usize);
         for (k, &(is_uav, r, at)) in seen.iter().enumerate() {
             assert_eq!((is_uav, r, at), (k % 2 == 1, 0, 0x1000 + 32 * k), "descriptor {k}");
+        }
+    }
+
+    #[test]
+    fn textures_are_referenced_by_the_heaps_their_t_is_in() {
+        let Some(_) = crate::gpu::uma::get() else { return };
+        let (a, b, c) = (0x7FFF_0001u32, 0x7FFF_0003, 0x7FFF_0005);
+        INDEX_RES.lock().unwrap().get_or_insert_with(Default::default).extend([(a, 0xAAA0), (b, 0xBBB0), (c, 0xCCC0)]);
+        assert!(register(0xC1, 4, 0x2000, 0x6000, 32, false, false, true));
+        assert!(register(0xC2, 4, 0x3000, 0, 32, false, false, false));
+        let (v, cpu) = (start(0xC1).unwrap(), start(0xC2).unwrap());
+        let image = |i: u32| [i, 0x0470_0000, 0, 9 << 28, 0, 0, 0, 0];
+        // a: in both kinds of heap; b: only in the CPU-only one; c: as a buffer V#'s word 0
+        write(&slot(v).unwrap(), &image(a));
+        write(&slot(v + 32).unwrap(), &[c, 0, 64, 0x3101_6FAC, 0, 0, 0, 0]);
+        write(&slot(cpu).unwrap(), &image(a));
+        write(&slot(cpu + 32).unwrap(), &image(b));
+        let (visible, cpu_only) = referenced();
+        assert!(visible.contains(&0xAAA0) && !visible.contains(&0xBBB0) && !visible.contains(&0xCCC0), "{visible:x?}");
+        assert!(cpu_only.contains(&0xBBB0) && !cpu_only.contains(&0xAAA0) && !cpu_only.contains(&0xCCC0), "{cpu_only:x?}");
+        unregister(0xC1);
+        unregister(0xC2);
+        if let Some(m) = INDEX_RES.lock().unwrap().as_mut() {
+            for i in [a, b, c] {
+                m.remove(&i);
+            }
         }
     }
 

@@ -2214,6 +2214,11 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
+    // `XCL_DUMP_TARGETS`: the depth buffer a DSV names, kept with the RTVs' resources (DSV
+    // and RTV handles are in different heaps)
+    if super::targets::enabled() {
+        super::present::note_rtv(cpu as usize, res);
+    }
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
 }
 
@@ -2352,6 +2357,12 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
+    if super::vram::tracking() && super::vram::is_placed_texture(res as usize) {
+        // a view the heaps cannot be followed to: never taken for unused
+        if !super::console_heap::note_index(&slot, res as usize) {
+            super::vram::pin(res as usize);
+        }
+    }
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 24 {

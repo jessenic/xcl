@@ -29,6 +29,8 @@ struct State {
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
     pso: usize,
+    /// 32-bit addresses of the view heap and the sampler heap set (0: none)
+    heaps: [u32; 2],
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
     uma: Vec<usize>,
@@ -104,6 +106,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.heaps = [0; 2];
         let mut res_bufs = std::mem::take(&mut s.res_retired);
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
@@ -124,6 +127,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.heaps = [0; 2];
     });
 }
 
@@ -131,8 +135,8 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
-    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
-        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, heaps) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso, s.heaps)
     });
     let (old, blocks) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
@@ -143,6 +147,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.args_gfx = args_gfx;
         s.rs_gfx = rs_gfx;
         s.pso = pso;
+        s.heaps = heaps;
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -180,6 +185,16 @@ pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>,
 #[cfg(test)]
 pub(crate) fn remove_state_for_test(list: *mut c_void) {
     STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+}
+
+/// SetDescriptorHeaps: the console addresses of `heaps`, for shaders that index them themselves
+/// (`Layout::heaps`).
+pub(super) fn set_heaps(list: *mut c_void, heaps: &[usize]) {
+    let mut bases = [0u32; 2];
+    for (sampler, base) in heaps.iter().filter_map(|&h| super::console_heap::base(h)) {
+        bases[sampler as usize] = base;
+    }
+    with(list, |s| s.heaps = bases);
 }
 
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
@@ -629,6 +644,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if super::pso_async::is_pending(with(this, |s| s.pso)) {
+            ei_work(this, sig, super::targets::STANDIN);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -656,6 +672,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
         // A native PC compute pipeline is not one of these and still goes to the PC call.
         if signature_dispatches(sig) && super::real::is_console_compute(pso) {
+            super::targets::note_dispatch();
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -668,9 +685,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
+        ei_work(this, sig, super::targets::PC);
         return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+        ei_work(this, sig, super::targets::SKIPPED);
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
@@ -683,6 +702,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
     let result = bind_abi(this, list, pso, gfx);
     if let Ok(()) = result {
+        ei_work(this, sig, super::targets::RAN);
         count(if gfx { DRAWS } else { DISPATCHES });
         // an indirect dispatch: its groups are in the argument buffer (`max` of them)
         let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
@@ -696,11 +716,24 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         b.finish(list);
     }
     if let Err(e) = result {
+        ei_work(this, sig, super::targets::SKIPPED);
         count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
         }
+    }
+}
+
+/// `XCL_DUMP_TARGETS`: an ExecuteIndirect with `outcome` (a dispatch signature's: a dispatch)
+unsafe fn ei_work(this: *mut c_void, sig: usize, outcome: usize) {
+    if !super::targets::enabled() {
+        return;
+    }
+    if signature_dispatches(sig) {
+        super::targets::note_dispatch();
+    } else {
+        super::targets::note_draw(this, outcome);
     }
 }
 
@@ -904,6 +937,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
         // (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(real) {
+            super::targets::note_draw(this, super::targets::SKIPPED);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -913,6 +947,9 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
                 );
             }
             return None;
+        }
+        if super::targets::enabled() {
+            super::targets::note_draw(this, if super::pso_async::is_pending(pso) { super::targets::STANDIN } else { super::targets::PC });
         }
         count(DRAWS_PC);
         if super::present::trace_frame() {
@@ -947,11 +984,13 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     }
     match bind_abi(this, &list, pso, true) {
         Ok(()) => {
+            super::targets::note_draw(this, super::targets::RAN);
             count(DRAWS);
             Some(list)
         }
         Err(e) => {
             super::list_x::note_dropped_draw(this);
+            super::targets::note_draw(this, super::targets::SKIPPED);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -1222,6 +1261,7 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    super::targets::note_dispatch();
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
@@ -1375,7 +1415,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     if first == 0 && u.shadowed() {
         return Err("window 0 of unified memory has no buffer on the GPU".into());
     }
-    let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
+    let (layout, args, heaps) = with(this, |s| {
+        let (layout, args) = if gfx { (&s.layout_gfx, &s.args_gfx) } else { (&s.layout, &s.args) };
+        (layout.clone(), args.clone(), s.heaps)
+    });
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
@@ -1389,8 +1432,8 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
     let table_at = copy(&args[inline..])?;
     let mut io = match layout.as_ref() {
-        Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
-        Some(l) => console_list::user_data_for(l, user_sgprs, &args, table_at as u64),
+        Some(l) if gfx => console_list::with_heaps(l, None, console_list::user_data_gfx(l, &args, table_at as u64), heaps),
+        Some(l) => console_list::with_heaps(l, user_sgprs, console_list::user_data_for(l, user_sgprs, &args, table_at as u64), heaps),
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
