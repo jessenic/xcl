@@ -776,10 +776,33 @@ static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
 /// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
 /// known only once it asks for it, and the window is committed when it is made: its size is
-/// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
-/// 512 MB, at most a window. `XCL_COHERENT_MB` chooses it.
+/// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`, or
+/// `<data>/cache/uma_coherent_lockhart.txt` on the Series S profile) and XCL's own 512 MB,
+/// at most a window. `XCL_COHERENT_MB` chooses it.
+fn coherent_file_for(data_dir: &std::path::Path, series_s: bool) -> std::path::PathBuf {
+    let name = if series_s { "uma_coherent_lockhart.txt" } else { "uma_coherent.txt" };
+    data_dir.join("cache").join(name)
+}
+
 fn coherent_file() -> std::path::PathBuf {
-    crate::state::data_dir().join("cache").join("uma_coherent.txt")
+    coherent_file_for(&crate::state::data_dir(), crate::state::config().is_series_s())
+}
+
+fn coherent_hint_from(path: &std::path::Path, free: usize, cap: usize) -> usize {
+    let title = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+    // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
+    // and textures (WDDM charges commit for each video-memory allocation too) and the window
+    // itself – a retail game took ~18 GB; with less free it runs without (its GPU heaps outside
+    // unified memory: no image) rather than taking the system's commit
+    if title > 0 && free < NEEDS_FOR_COHERENT_HEAPS {
+        crate::xlog_warn!(
+            "UMA: {} MB of commit free, under {} MB: the title's GPU heaps stay outside unified memory (a larger page file gives them the coherent window)",
+            free >> 20,
+            NEEDS_FOR_COHERENT_HEAPS >> 20
+        );
+        return RUNTIME_COMMITTED_CAP;
+    }
+    title.saturating_add(RUNTIME_COMMITTED_CAP).min(cap)
 }
 
 /// Bytes the coherent window(s) are made with for a runtime layout of `windows` windows.
@@ -788,20 +811,7 @@ pub fn coherent_hint_for(windows: usize) -> usize {
     if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         return (mb << 20).clamp(GRAIN, cap);
     }
-    let title = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
-    // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
-    // and textures (WDDM charges commit for each video-memory allocation too) and the window
-    // itself – a retail game took ~18 GB; with less free it runs without (its GPU heaps outside
-    // unified memory: no image) rather than taking the system's commit
-    if title > 0 && free_commit() < NEEDS_FOR_COHERENT_HEAPS {
-        crate::xlog_warn!(
-            "UMA: {} MB of commit free, under {} MB: the title's GPU heaps stay outside unified memory (a larger page file gives them the coherent window)",
-            free_commit() >> 20,
-            NEEDS_FOR_COHERENT_HEAPS >> 20
-        );
-        return RUNTIME_COMMITTED_CAP;
-    }
-    (title + RUNTIME_COMMITTED_CAP).min(cap)
+    coherent_hint_from(&coherent_file(), free_commit(), cap)
 }
 
 /// Bytes the coherent window is made with (legacy 4-window cap).
@@ -822,17 +832,23 @@ fn free_commit() -> usize {
     m.ullAvailPageFile as usize
 }
 
+fn record_coherent_need(path: &std::path::Path, bytes: usize) -> bool {
+    let before = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+    if bytes <= before {
+        return false;
+    }
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    std::fs::write(path, bytes.to_string()).is_ok()
+}
+
 /// The title has asked for `bytes` of graphics memory XCL places in the coherent window: the
 /// next run makes the window that large (this one has the size it was made with).
 pub fn note_coherent_need(bytes: usize) {
     static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let before = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
-    if bytes > before && NOTED.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed) < bytes {
-        let f = coherent_file();
-        if let Some(d) = f.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(&f, bytes.to_string());
+    let path = coherent_file();
+    if NOTED.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed) < bytes && record_coherent_need(&path, bytes) {
         let cap = max_coherent_bytes(configured_runtime_windows());
         crate::xlog_info!("UMA: the title's graphics memory for the coherent window: {} MB (up to {} MB from the next run)", bytes >> 20, (bytes + RUNTIME_COMMITTED_CAP).min(cap) >> 20);
     }
@@ -1187,5 +1203,39 @@ mod tests {
         assert_eq!(u.window_of(a), Some(0));
         assert_eq!(u.window_of(b), Some(1));
         assert!(u.free(a) && u.free(b));
+    }
+
+    #[test]
+    fn series_s_coherent_cache_is_separate_from_series_x() {
+        let dir = std::env::temp_dir().join(format!("xcl_uma_coherent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sx = coherent_file_for(&dir, false);
+        let ss = coherent_file_for(&dir, true);
+        assert_ne!(sx, ss);
+        assert!(sx.ends_with("uma_coherent.txt"));
+        assert!(ss.ends_with("uma_coherent_lockhart.txt"));
+        let cap = max_coherent_bytes(MAX_WINDOWS);
+
+        // Recording Series X's larger need fills a 4095 MiB window without inflating Series S.
+        assert!(record_coherent_need(&sx, 4_804_771_840));
+        assert!(!record_coherent_need(&sx, 4_000_000_000));
+        assert_eq!(coherent_hint_from(&sx, NEEDS_FOR_COHERENT_HEAPS, cap), MAX_SIZE);
+        assert_eq!(coherent_hint_from(&ss, NEEDS_FOR_COHERENT_HEAPS, cap), RUNTIME_COMMITTED_CAP);
+        // A multi-coherent layout's larger cap holds all of Series X's need.
+        let cap16 = max_coherent_bytes(MAX_HEAP_WINDOWS);
+        assert_eq!(coherent_hint_from(&sx, NEEDS_FOR_COHERENT_HEAPS, cap16), 4_804_771_840 + RUNTIME_COMMITTED_CAP);
+
+        // Series S records its own smaller working set independently.
+        let lockhart_need = 3_036_545_024;
+        assert!(record_coherent_need(&ss, lockhart_need));
+        assert_eq!(coherent_hint_from(&ss, NEEDS_FOR_COHERENT_HEAPS, cap), lockhart_need + RUNTIME_COMMITTED_CAP);
+        assert!(coherent_hint_from(&ss, NEEDS_FOR_COHERENT_HEAPS, cap) < MAX_SIZE);
+        assert_eq!(coherent_hint_from(&sx, NEEDS_FOR_COHERENT_HEAPS, cap), MAX_SIZE);
+
+        // Low free commit still falls back to RUNTIME_COMMITTED_CAP for either profile.
+        assert_eq!(coherent_hint_from(&ss, NEEDS_FOR_COHERENT_HEAPS - 1, cap), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_hint_from(&sx, NEEDS_FOR_COHERENT_HEAPS - 1, cap), RUNTIME_COMMITTED_CAP);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
