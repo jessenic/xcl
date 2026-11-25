@@ -1193,7 +1193,7 @@ mod pipeline_cap_tests {
 
         pipelines.max_dxil = dxil.len() - 1;
         let start = Instant::now();
-        pipelines.make_with_cache_path(&recomp::pso::Compiled { dxil: dxil.clone(), samplers: vec![] }, Some(path.clone()));
+        pipelines.make_with_cache_path(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] }, Some(path.clone()));
         let elapsed = start.elapsed();
         let capped = pipelines.capped.load(Ordering::Relaxed);
         let made = pipelines.made.load(Ordering::Relaxed);
@@ -1345,7 +1345,7 @@ fn precompiled_compute(blob: &[u8], mesh: bool, split: bool, windows: u32) -> Re
     }
     let tp = recomp::pso::console_mesh_in(blob, None, split, windows)?;
     let path = crate::hle::d3d12x::real::two_pass_compute_blob_path(&tp.cs);
-    Ok((recomp::pso::Compiled { dxil: tp.cs, samplers: tp.samplers }, path))
+    Ok((recomp::pso::Compiled { dispatch_chain: None, dxil: tp.cs, samplers: tp.samplers }, path))
 }
 
 fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {

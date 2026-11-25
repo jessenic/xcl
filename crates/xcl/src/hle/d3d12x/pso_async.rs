@@ -18,6 +18,8 @@ struct Pending {
     sent: std::sync::atomic::AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
+    /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
+    driver: AtomicUsize,
     done: Mutex<bool>,
     cv: Condvar,
     compute: bool,
@@ -142,10 +144,92 @@ static FAILED: AtomicUsize = AtomicUsize::new(0);
 /// binds waiting right now for a pipeline still being built (`title_held`)
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether a bind is waiting for a pipeline still being built: one of the title's threads is
-/// held where a console title never waits (`kernelx::Sleep` does not count that time).
+/// The PC calls of the title's threads (`pc_call`): the ones going on, and how long the ones
+/// that ended took since the last frame was shown.
+struct PcCalls {
+    /// (id, when it began)
+    now: Vec<(u64, std::time::Instant)>,
+    /// the frames shown when `spent` began to count
+    frame: u64,
+    /// the time of the PC calls that ended since then
+    spent: std::time::Duration,
+}
+
+impl PcCalls {
+    const fn new() -> Self {
+        Self { now: Vec::new(), frame: 0, spent: std::time::Duration::ZERO }
+    }
+
+    /// `frame` frames have been shown: the calls before the last of them are not this wait's.
+    fn at(&mut self, frame: u64) {
+        if frame != self.frame {
+            self.frame = frame;
+            self.spent = std::time::Duration::ZERO;
+        }
+    }
+
+    fn begin(&mut self, id: u64, now: std::time::Instant) {
+        self.now.push((id, now));
+    }
+
+    fn end(&mut self, id: u64, frame: u64, now: std::time::Instant) {
+        self.at(frame);
+        if let Some(i) = self.now.iter().position(|c| c.0 == id) {
+            let (_, since) = self.now.swap_remove(i);
+            self.spent += now.saturating_duration_since(since);
+        }
+    }
+
+    /// Whether a call going on holds the title: the PC calls since the last frame, it included,
+    /// have taken `PC_CALL_HOLDS_AFTER`.
+    fn holds(&mut self, frame: u64, now: std::time::Instant) -> bool {
+        self.at(frame);
+        let spent = self.spent;
+        self.now.iter().any(|(_, since)| spent + now.saturating_duration_since(*since) >= PC_CALL_HOLDS_AFTER)
+    }
+}
+
+static PC_CALLS: Mutex<PcCalls> = Mutex::new(PcCalls::new());
+/// From this much time in PC calls since the last frame on, a PC call holds the title: the
+/// console's calls return at once.
+const PC_CALL_HOLDS_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether one of the title's threads is held where a console title never waits: a bind is
+/// waiting for a pipeline still being built, or a PC call is going on after such calls have
+/// kept the title's threads for long (`pc_call`). `kernelx::Sleep` does not count that time.
 pub fn title_held() -> bool {
-    HELD.load(Ordering::Acquire) != 0
+    HELD.load(Ordering::Acquire) != 0 || held_by_pc_call()
+}
+
+fn held_by_pc_call() -> bool {
+    PC_CALLS.lock().unwrap().holds(super::present::presents(), std::time::Instant::now())
+}
+
+/// A call of the title into D3D12 that XCL or the PC's driver can keep for long where the
+/// console's takes no time: a submission (XCL's uploads and tile mappings before the lists, the
+/// driver's compiling in them), a texture's placement, a pipeline built in the call. While it
+/// lasts the title is held (`title_held`), once the PC calls since the last frame shown, this
+/// one included, have taken `PC_CALL_HOLDS_AFTER`: one long call, or many short ones in a row
+/// (a retail title placed 16 384 textures in 29 s without a frame, 1 - 50 ms each). A title
+/// that shows its frames is not held by its submissions.
+pub struct PcCall(u64);
+
+pub fn pc_call() -> PcCall {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    PC_CALLS.lock().unwrap().begin(id, std::time::Instant::now());
+    PcCall(id)
+}
+
+impl Drop for PcCall {
+    fn drop(&mut self) {
+        PC_CALLS.lock().unwrap().end(self.0, super::present::presents(), std::time::Instant::now());
+    }
+}
+
+/// Whether this thread is building a pipeline for `build` (a worker, not one of the title's).
+pub(super) fn building_here() -> bool {
+    BUILDING.with(|b| b.borrow().is_some())
 }
 
 /// A bind's wait for a pipeline still being built (`title_held`).
@@ -171,10 +255,12 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+type Work = Box<dyn FnOnce() + Send>;
+
+fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
+        let (tx, rx) = mpsc::channel::<Work>();
         let rx = Arc::new(Mutex::new(rx));
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
@@ -182,21 +268,54 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
-                // (released by the title meanwhile)
-                if p.orphan.load(Ordering::Acquire) {
-                    let _ = p.job.lock().unwrap().take();
-                    continue;
-                }
-                // (None: a bind took it and builds it itself)
-                let job = p.job.lock().unwrap().take();
-                if let Some(job) = job {
-                    build(&p, job, false);
-                }
+                let Ok(work) = next else { return };
+                work();
             });
         }
         Mutex::new(tx)
     })
+}
+
+fn enqueue(p: Arc<Pending>) {
+    let _ = queue().lock().unwrap().send(Box::new(move || {
+        // (released by the title meanwhile)
+        if p.orphan.load(Ordering::Acquire) {
+            let _ = p.job.lock().unwrap().take();
+            return;
+        }
+        // (None: a bind took it and builds it itself)
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            build(&p, job, false);
+        }
+    }));
+}
+
+/// The caller also drains its batch. Multiple workers can therefore build
+/// different chains without ever waiting for a free worker to start a piece.
+pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
+    let count = jobs.len();
+    let jobs = Arc::new(Mutex::new(jobs.into_iter().enumerate().collect::<Vec<_>>()));
+    let (send, recv) = mpsc::channel();
+    let drain = move || loop {
+        let job = jobs.lock().unwrap().pop();
+        let Some((i, job)) = job else { return };
+        let _ = send.send((i, job()));
+    };
+    // the helpers build for this worker's pipeline: the title waiting for it waits for them too
+    let parent = BUILDING.with(|b| b.borrow().clone());
+    for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
+        let (drain, parent) = (drain.clone(), parent.clone());
+        let _ = queue().lock().unwrap().send(Box::new(move || {
+            let before = BUILDING.with(|b| b.replace(parent));
+            drain();
+            BUILDING.with(|b| *b.borrow_mut() = before);
+        }));
+    }
+    drain();
+    let mut results = vec![0; count];
+    for (i, result) in recv.iter().take(count) { results[i] = result; }
+    results
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -232,6 +351,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
         real: AtomicUsize::new(0),
+        driver: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
@@ -248,7 +368,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue().lock().unwrap().send(p);
+        enqueue(p);
     } else if used::known(key) {
         if let Some(q) = preload() {
             q.list.lock().unwrap().push_back(p);
@@ -400,6 +520,43 @@ fn preload() -> Option<&'static Preload> {
 mod used_tests {
     use super::*;
 
+    /// A PC call that has kept one of the title's threads for long holds the title, a short one
+    /// does not, and the hold ends with the call.
+    #[test]
+    fn a_long_pc_call_holds_the_title() {
+        let mut calls = PcCalls::new();
+        let began = std::time::Instant::now();
+        calls.begin(1, began);
+        calls.begin(2, began + 2 * PC_CALL_HOLDS_AFTER);
+        assert!(!calls.holds(0, began), "a call that has just begun holds the title");
+        let later = began + 2 * PC_CALL_HOLDS_AFTER;
+        assert!(calls.holds(0, later), "a PC call has lasted {:?}, but the title is not held", 2 * PC_CALL_HOLDS_AFTER);
+        calls.end(1, 0, later);
+        calls.end(2, 0, later);
+        assert!(!calls.holds(0, later), "the calls are over, the title is still held");
+    }
+
+    /// Short PC calls add up between two frames: none of them is long, but after many in a row
+    /// the one going on holds the title. The title's own time between them is not held, and a
+    /// frame shown ends it.
+    #[test]
+    fn short_pc_calls_between_two_frames_hold_the_title() {
+        let mut calls = PcCalls::new();
+        let step = PC_CALL_HOLDS_AFTER / 10;
+        let mut now = std::time::Instant::now();
+        for id in 0..20 {
+            calls.begin(id, now);
+            assert!(id >= 9 || !calls.holds(7, now + step), "{id} short calls hold the title already");
+            now += step;
+            calls.end(id, 7, now);
+        }
+        assert!(!calls.holds(7, now), "no PC call is going on, the title is held");
+        calls.begin(20, now);
+        assert!(calls.holds(7, now), "twenty short PC calls since the last frame and one going on, but the title is not held");
+        assert!(!calls.holds(8, now), "a frame was shown, the calls before it still hold the title");
+        calls.end(20, 8, now);
+    }
+
     /// While a bind waits for a pipeline still being built, the title is held (`title_held`):
     /// `kernelx::Sleep` does not count that time.
     #[test]
@@ -423,6 +580,26 @@ mod used_tests {
         go.send(()).unwrap();
         assert_eq!(bind.join().unwrap(), 0x5252);
         let _ = released(standin);
+    }
+
+    /// A stand-in that is no driver object (`shared`) never reaches the driver: binds get the
+    /// driver pipeline shared with other stand-ins until the real one is built, and after a build
+    /// that failed.
+    #[test]
+    fn a_bind_of_a_shared_stand_in_gets_its_driver_pipeline() {
+        let (fails, builds, driver) = (0x7E57_B011usize, 0x7E57_B012usize, 0x7E57_B013usize);
+        submit_lazy(fails, false, Box::new(|| 0), 0);
+        submit_lazy(builds, false, Box::new(|| 0x1234), 0);
+        for s in [fails, builds] {
+            shared(s, driver);
+            assert_eq!(entry(s).unwrap().stand(s), driver);
+        }
+        assert_eq!(resolve_wait_for(fails, None), driver, "its build failed");
+        assert_eq!(resolve(fails), driver);
+        assert_eq!(resolve_wait_for(builds, None), 0x1234);
+        assert_eq!(resolve_for_bind(builds), 0x1234);
+        // (0x1234 is no pipeline: taken, not released)
+        assert_eq!((released(fails), released(builds)), (0, 0x1234));
     }
 
     /// A bind does not wait for a compute pipeline that writes only images: it gets the stand-in
@@ -637,17 +814,37 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
-/// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
+impl Pending {
+    /// What a bind of the stand-in `pso` gives the driver while the pipeline is not built.
+    fn stand(&self, pso: usize) -> usize {
+        match self.driver.load(Ordering::Acquire) {
+            0 => pso,
+            d => d,
+        }
+    }
+}
+
+/// Stand-in `standin` is no driver object (`standin::shell`): binds get `driver` in its place.
+/// Told before the title has the stand-in.
+pub fn shared(standin: usize, driver: usize) {
+    if let Some(p) = entry(standin) {
+        p.driver.store(driver, Ordering::Release);
+    }
+}
+
+/// The pipeline to use for `pso` now: the real one once built, else the stand-in's driver
+/// pipeline (`pso` itself when it is one).
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
+            let stand = p.stand(pso);
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                enqueue(p);
             }
-            pso
+            stand
         }
         r => r,
     }
@@ -681,7 +878,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         done = p.cv.wait(done).unwrap();
     }
     match p.real.load(Ordering::Acquire) {
-        0 => pso,
+        0 => p.stand(pso),
         r => r,
     }
 }
@@ -700,17 +897,17 @@ fn wait_budget() -> Option<std::time::Duration> {
 /// dispatches are skipped) until a worker has built it.
 fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
-        0 => pso,
+        0 => p.stand(pso),
         r => r,
     };
     if *p.done.lock().unwrap() {
         return built(p);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p.clone());
+        enqueue(p.clone());
     }
     if p.late.load(Ordering::Acquire) {
-        return pso;
+        return p.stand(pso);
     }
     p.want();
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
@@ -724,7 +921,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if n < 16 || n.is_power_of_two() {
         crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
     }
-    pso
+    p.stand(pso)
 }
 
 /// `XCL_PSO_IMAGE_SKIP=1`: a bind does not wait for a big compute program that writes nothing
@@ -755,7 +952,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p.clone());
+                enqueue(p.clone());
             }
             if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
                 static N: AtomicUsize = AtomicUsize::new(0);
@@ -764,7 +961,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
                     crate::xlog_info!("D3D12.X: a compute program that writes only images is still being built: its dispatches are left out until it is ({} so far)", n + 1);
                 }
             }
-            pso
+            p.stand(pso)
         }
         r => r,
     }

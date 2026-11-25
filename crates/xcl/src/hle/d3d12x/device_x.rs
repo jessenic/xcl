@@ -99,6 +99,10 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
         let hr = real::dev_create_command_list(this, node, ty, alloc, resolved_pso, riid, ppv);
         if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
             super::list_x::on_create(*ppv, alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
+            super::dred::reset(*ppv);
+            if pso != 0 {
+                super::dred::mark_pipeline(*ppv, pso, resolved_pso);
+            }
         }
         hr
     };
@@ -1061,6 +1065,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if desc.is_null() || ppv.is_null() || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return E_INVALIDARG;
     }
+    // the PC's reserved resource and tile mappings for it can take long where the console's
+    // placement takes no time (`pso_async::title_held`)
+    let _in_pc = super::pso_async::pc_call();
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc_for_device(this, &x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;

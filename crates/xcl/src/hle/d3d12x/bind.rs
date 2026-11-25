@@ -701,7 +701,20 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // list's compute bindings, which `bind_abi` sets again
     let bounded = super::indirect_clamp::bound(list, with(this, |s| s.allocator), sig, max, args, console_args_off, count_buf, console_count_off);
     let result = bind_abi(this, list, pso, gfx);
-    if let Ok(()) = result {
+    // a split compute program runs its whole pipeline for an indirect dispatch
+    let whole = match &result {
+        Ok(()) if compute => super::real::dispatch_chain::whole(pso),
+        _ => Ok(None),
+    };
+    if let Err(e) = &whole {
+        crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
+        ei_work(this, sig, super::targets::SKIPPED);
+        count(DISPATCHES_SKIPPED);
+    }
+    if let (Ok(()), Ok(whole)) = (&result, &whole) {
+        if let Some(whole) = whole {
+            list.SetPipelineState(whole);
+        }
         ei_work(this, sig, super::targets::RAN);
         count(if gfx { DRAWS } else { DISPATCHES });
         // an indirect dispatch: its groups are in the argument buffer (`max` of them)
@@ -1397,9 +1410,9 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     }
     bind_abi(this, list, pso, false)?;
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
-    list.Dispatch(x, y, z);
+    let result = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
     super::culprit::after_dispatch(list, mark);
-    Ok(())
+    result
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
