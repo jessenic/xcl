@@ -270,6 +270,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   (decoded 8-bit R+G+B > 30). The field is `null` until a frame is sampled; `non_dark_samples` is
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
+  `XCL_DUMP_TARGETS=<draws>[,<frames>]` logs, for the first frames with that many draws and dispatches,
+  each render target and the depth buffer drawn into (draws ran / stand-in / PC / skipped) and dumps
+  the eight drawn into most (`target<k>_<n>.bmp`); `XCL_DUMP_AFTER_S=<s>` waits `s` seconds first.
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the

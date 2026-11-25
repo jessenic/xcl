@@ -278,6 +278,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if super::pso_async::is_pending(with(this, |s| s.pso)) {
+            ei_work(this, sig, super::targets::STANDIN);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -305,6 +306,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
         // A native PC compute pipeline is not one of these and still goes to the PC call.
         if signature_dispatches(sig) && super::real::is_console_compute(pso) {
+            super::targets::note_dispatch();
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -317,9 +319,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
+        ei_work(this, sig, super::targets::PC);
         return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+        ei_work(this, sig, super::targets::SKIPPED);
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
@@ -329,6 +333,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
+            ei_work(this, sig, super::targets::RAN);
             count(if gfx { DRAWS } else { DISPATCHES });
             // an indirect dispatch: its groups are in the argument buffer (`max` of them)
             let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
@@ -336,12 +341,25 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             super::culprit::after_dispatch(list, mark)
         }
         Err(e) => {
+            ei_work(this, sig, super::targets::SKIPPED);
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
             }
         }
+    }
+}
+
+/// `XCL_DUMP_TARGETS`: an ExecuteIndirect with `outcome` (a dispatch signature's: a dispatch)
+unsafe fn ei_work(this: *mut c_void, sig: usize, outcome: usize) {
+    if !super::targets::enabled() {
+        return;
+    }
+    if signature_dispatches(sig) {
+        super::targets::note_dispatch();
+    } else {
+        super::targets::note_draw(this, outcome);
     }
 }
 
@@ -536,6 +554,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
         // (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(real) {
+            super::targets::note_draw(this, super::targets::SKIPPED);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -545,6 +564,9 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
                 );
             }
             return None;
+        }
+        if super::targets::enabled() {
+            super::targets::note_draw(this, if super::pso_async::is_pending(pso) { super::targets::STANDIN } else { super::targets::PC });
         }
         count(DRAWS_PC);
         if super::present::trace_frame() {
@@ -579,11 +601,13 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     }
     match bind_abi(this, &list, pso, true) {
         Ok(()) => {
+            super::targets::note_draw(this, super::targets::RAN);
             count(DRAWS);
             Some(list)
         }
         Err(e) => {
             super::list_x::note_dropped_draw(this);
+            super::targets::note_draw(this, super::targets::SKIPPED);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -854,6 +878,7 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    super::targets::note_dispatch();
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
