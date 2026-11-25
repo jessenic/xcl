@@ -3,6 +3,7 @@
 //! `recomp/emit.rs` `smem` / `mubuf` / `flat` / `ds` / `export` and
 //! `PRELUDE_MEM`). Accesses of disabled lanes are real branches.
 
+use super::group_barrier::{SBarrier, LDS_BAR_AT};
 use super::lower::{err, Dst, LResult, Lw, VAR_VGPR};
 use super::module::{BinOp, Pred, RmwOp, Value};
 use super::ops::AtomicOp;
@@ -2120,14 +2121,22 @@ impl Lw {
 
     // ------------------------------------------------------------ LDS / DS
 
-    /// LDS dword index of byte address `at` (`(at >> 2) & 8191`, below the exchange words
-    /// in the split form).
+    /// LDS dword index of byte address `at` (`(at >> 2) & 8191`), kept off the words the
+    /// translator uses itself. Split form: clamped below the exchange words (the safe
+    /// barrier's are above them). Otherwise, with the safe barrier, only its two words are
+    /// taken: an access to one of them goes to the word below, and every other word, 8191
+    /// included, stays the program's own.
     fn lds_index(&mut self, at: Value) -> Value {
         let i = self.lshrc(at, 2);
         let i = self.andc(i, 8191);
         if self.split {
             let k = self.c(self.lds_top);
             self.umin(i, k)
+        } else if self.sbar == SBarrier::Safe {
+            let past = self.addc(i, 0u32.wrapping_sub(LDS_BAR_AT));
+            let taken = self.cmpc(Pred::ULt, past, 2);
+            let below = self.c(LDS_BAR_AT - 1);
+            self.sel(taken, below, i)
         } else {
             i
         }

@@ -898,7 +898,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let used = args.iter().any(|a| a == "--used-only").then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
+        let sample = opt("--sample").unwrap_or(usize::MAX);
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), sample, windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
     }
     if args.iter().any(|a| a == "--direct") {
         return direct_sweep(&input, args, top, json, t0);
@@ -1116,8 +1117,11 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 /// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
 /// mesh pass-through, which the runtime builds for its pixel shader.
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
-/// ABI root signature with its static samplers). Save the driver's compiled blob in the same
-/// cache the runtime reads at startup. Nothing runs on the GPU.
+/// ABI root signature with its static samplers), and each MS's two-pass compute pass (`--only ms`
+/// for those alone; the pass-through mesh pipeline needs the title's PS and state and is left to
+/// the runtime). Save the driver's compiled blob in the same cache the runtime reads at startup.
+/// Nothing runs on the GPU. `--sample N`: only the first N programs `--only` lets through.
+/// `--used-only` passes the MSs over: a mesh pipeline's key has its PS too.
 /// Programs whose DXIL is over `XCL_PIPELINE_MAX_KB` (8 MiB by default; 0 turns the cap off)
 /// and that have no blob yet are counted as capped and left to the runtime: their driver
 /// compile takes tens of minutes and gigabytes, and stopped the pass on the biggest programs
@@ -1220,11 +1224,8 @@ impl Pipelines {
         }
     }
 
-    /// The compute pipeline of `c` (made and released).
-    fn make(&self, c: &recomp::pso::Compiled) {
-        self.make_with_cache_path(c, None);
-    }
-
+    /// The compute pipeline of `c` (made and released), its driver blob kept in `path_override`
+    /// (None: the runtime's file for a compute pipeline of that DXIL).
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
@@ -1326,7 +1327,28 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
     used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
+/// An MS the runtime builds as two-pass pipelines (`pso::console_mesh`): its first NGG variant
+/// (hardware stage 7) has a triangle interface (lines / points are not translated).
+fn two_pass_mesh(blob: &[u8], sh: &xbox::XboxShader) -> bool {
+    sh.stage == "MS"
+        && sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).is_some_and(|f| matches!(recomp::interface(blob, sh, f), Some(recomp::Mode::Mesh(_))))
+}
+
+/// The compute pipeline a title makes from a console program, as the runtime makes it, and the
+/// file the runtime looks for its driver blob in: a CS's own pipeline (`pso::console_to_dxil_in`;
+/// None: `Pipelines` keys it as the runtime keys compute pipelines), or, for an MS (`mesh`), the
+/// compute pass of its two-pass pipelines (`pso::console_mesh_in` with no pixel shader – the
+/// compute pass does not depend on it –, `real::two_pass_compute_blob_path`).
+fn precompiled_compute(blob: &[u8], mesh: bool, split: bool, windows: u32) -> Result<(recomp::pso::Compiled, Option<PathBuf>), String> {
+    if !mesh {
+        return recomp::pso::console_to_dxil_in(blob, recomp::pso::Stage::Compute, 0, split, windows).map(|c| (c, None));
+    }
+    let tp = recomp::pso::console_mesh_in(blob, None, split, windows)?;
+    let path = crate::hle::d3d12x::real::two_pass_compute_blob_path(&tp.cs);
+    Ok((recomp::pso::Compiled { dxil: tp.cs, samplers: tp.samplers }, path))
+}
+
+fn precompile(input: &Input, limit: usize, sample: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -1340,7 +1362,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     };
     let pipelines = pipelines.as_ref();
     let n = input.len().min(limit);
-    let next = AtomicUsize::new(0);
+    let (next, taken) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let unused = AtomicUsize::new(0);
@@ -1377,18 +1399,26 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                // `--sample N`: the first N programs `--only` lets through
+                if taken.fetch_add(1, Ordering::Relaxed) >= sample {
+                    break;
+                }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
-                // into the translation cache too, so the title does not translate it again
-                if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
-                    if used.is_some_and(|u| !used_compute(&blob, u)) {
+                // into the translation cache too, so the title does not translate it again; an MS
+                // as the compute pass of its two-pass pipelines (`pso::console_mesh_in`)
+                let compute = sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_))));
+                let mesh = !compute && two_pass_mesh(&blob, &sh);
+                if compute || mesh {
+                    // a mesh pipeline's key has its PS too: `--used-only` passes the MSs over
+                    if used.is_some_and(|u| mesh || !used_compute(&blob, u)) {
                         unused.fetch_add(1, Ordering::Relaxed);
                         done.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
-                        Ok(c) => {
+                    match precompiled_compute(&blob, mesh, split, windows) {
+                        Ok((c, path)) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
+                                p.make_with_cache_path(&c, path);
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
@@ -1826,6 +1856,81 @@ mod tests {
             compute[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
         }
         sample(5, &[compute])
+    }
+
+    /// A signature part (v1): (name, system value, register, mask) per element, floats.
+    fn signature(elements: &[(&str, u32, u32, u8)]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&(elements.len() as u32).to_le_bytes());
+        d.extend_from_slice(&8u32.to_le_bytes());
+        let mut names = Vec::new();
+        let base = 8 + 32 * elements.len() as u32;
+        for &(name, sv, reg, mask) in elements {
+            for v in [0, base + names.len() as u32, 0, sv, 3, reg] {
+                d.extend_from_slice(&v.to_le_bytes());
+            }
+            d.extend_from_slice(&[mask, mask, 0, 0, 0, 0, 0, 0]);
+            names.extend_from_slice(name.as_bytes());
+            names.push(0);
+        }
+        d.extend_from_slice(&names);
+        d
+    }
+
+    /// A console MS container as the retail title's: an NGG variant (hardware stage 7), triangles,
+    /// 128 threads, 64 vertices and primitives, a position and a texture coordinate out.
+    fn mesh_sample() -> Vec<u8> {
+        let mut r = vec![0u8; 48];
+        r[12..14].copy_from_slice(&64u16.to_le_bytes());
+        r[14..16].copy_from_slice(&64u16.to_le_bytes());
+        r[24] = 13; // mesh
+        r[27] = 2; // triangles
+        for (k, t) in [128u32, 1, 1].iter().enumerate() {
+            r[36 + 4 * k..40 + 4 * k].copy_from_slice(&t.to_le_bytes());
+        }
+        let mut psv = 48u32.to_le_bytes().to_vec();
+        psv.extend_from_slice(&r);
+        psv.extend_from_slice(&0u32.to_le_bytes());
+        let osg = signature(&[("SV_Position", 1, 0, 0xF), ("TEXCOORD", 0, 1, 0x3)]);
+        let dxil = crate::gpu::xbox::tests::dxil_part(13, &[fssm(&CODE, &[(7, 13)])]);
+        crate::gpu::xbox::tests::container(&[(b"SFI0", &[0; 8]), (b"OSG1", &osg), (b"PSV0", &psv), (b"HASH", &[0; 20]), (b"DXIL", &dxil), (b"PRIV", &[7; 16])])
+    }
+
+    /// `--precompile --only ms --pipelines` keeps the driver blob of an MS's two-pass compute pass
+    /// in the file the runtime reads it from (`finish_two_pass`): the same DXIL and static
+    /// samplers (so root signature) as the runtime's `console_mesh` with the title's PS, for the
+    /// split wave64 form and heap windows as without them.
+    #[test]
+    fn an_ms_compute_pass_is_precompiled_under_the_runtimes_key() {
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let blob = mesh_sample();
+        let sh = xbox::parse(&blob).expect("a console container");
+        assert_eq!(sh.stage, "MS");
+        assert!(two_pass_mesh(&blob, &sh));
+        let ps = crate::gpu::xbox::tests::container(&[(b"ISG1", &signature(&[("SV_Position", 1, 0, 0xF), ("TEXCOORD", 0, 1, 0x3)]))]);
+        for (split, windows) in [(false, 4), (true, 4), (true, 4 | recomp::HEAP_WINDOWS)] {
+            let (pre, path) = precompiled_compute(&blob, true, split, windows).expect("translated");
+            let run = recomp::pso::console_mesh_in(&blob, Some(&ps), split, windows).expect("translated at run time");
+            assert_eq!(pre.dxil, run.cs, "split {split}, windows {windows:#x}");
+            assert_eq!(pre.samplers, run.samplers);
+            assert!(path.is_some());
+            assert_eq!(path, crate::hle::d3d12x::real::two_pass_compute_blob_path(&run.cs));
+        }
+        // the runtime's `console_mesh` is `console_mesh_in` with the title's memory windows
+        let windows = recomp::pso::mem_windows();
+        assert_eq!(recomp::pso::console_mesh(&blob, Some(&ps), true).unwrap().cs, recomp::pso::console_mesh_in(&blob, None, true, windows).unwrap().cs);
+        // a CS is not an MS: its own pipeline, under the compute pipelines' file
+        let cs = compute_sample();
+        assert!(!two_pass_mesh(&cs, &xbox::parse(&cs).unwrap()));
+        if let Ok((_, path)) = precompiled_compute(&cs, false, false, 4) {
+            assert_eq!(path, None);
+        }
+        // nor is a PS
+        let ps_blob = sample(0, &[fssm(&CODE, &[(5, 1)])]);
+        assert!(!two_pass_mesh(&ps_blob, &xbox::parse(&ps_blob).unwrap()));
     }
 
     #[test]

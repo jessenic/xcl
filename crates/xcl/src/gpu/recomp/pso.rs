@@ -767,7 +767,7 @@ fn cached_shader(
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT"]
+    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT", "XCL_SAFE_BARRIER"]
         .iter()
         .any(|name| present(name))
         && (stage != Stage::Pixel
@@ -1047,7 +1047,13 @@ fn console_mesh_with(
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
-    let windows = mem_windows();
+    console_mesh_in(blob, ps, split_wave64, mem_windows())
+}
+
+/// `console_mesh` with the title's memory windows given (`xcl shaders --precompile` builds the
+/// compute passes without a title: the same DXIL, so the same driver blob keys, as at its run).
+/// The compute pass does not depend on `ps`; only the pass-through mesh shader does.
+pub fn console_mesh_in(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, windows: u32) -> Result<TwoPass, String> {
     let dir = dxc::cache_dir();
     console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, rodata, ms, wave64| {
         compile_console_mesh(blob, code, rodata, ms, wave64, windows, split_wave64)
@@ -1737,7 +1743,7 @@ mod shader_cache_tests {
 
     #[test]
     fn shader_cache_bypasses_debug_overrides() {
-        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT"] {
+        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT", "XCL_SAFE_BARRIER"] {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
             assert!(!cache_allowed(Stage::Vertex, |v| v == name));
             assert!(!cache_allowed(Stage::Pixel, |v| v == name));

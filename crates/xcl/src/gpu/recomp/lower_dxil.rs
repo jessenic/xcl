@@ -70,7 +70,8 @@ impl DxilIr {
                 leaders.extend(insts.get(i + 1).map(|n| n.pc));
             }
         }
-        let mut lw = Lw::new(insts, &leaders, o, entry);
+        // no safe `s_barrier` here: its entry and exit setup is the block walk's
+        let mut lw = Lw::new(insts, &leaders, o, entry, false);
         // the rounding modes the program sets, as `kernel::translate_on_this_thread` finds them:
         // #1426's `s_round_mode` / `s_setreg` refuse a mode they cannot honour from these
         let branchy = insts.iter().any(|d| crate::gpu::rdna2::branch_target(d).is_some());
