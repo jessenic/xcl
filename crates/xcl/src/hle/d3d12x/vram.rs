@@ -84,24 +84,24 @@ impl<H: Clone> Arenas<H> {
 
     /// Where a placement of `bytes` at `va` (alignment `align`) goes: the newest arena holding
     /// it at an offset `align` allows, else a new arena of its size, `make(size, align)`.
-    /// (heap, offset, arena id); None: no heap.
-    fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64)> {
+    /// (heap, offset, arena id, fresh); None: no heap.
+    fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64, bool)> {
         self.sweep(now);
         let fits = |a: &Arena<H>| a.align >= align && a.base <= va && va + bytes <= a.base + a.size && (va - a.base) % align == 0;
-        let i = match self.list.iter().rposition(fits) {
-            Some(i) => i,
+        let (i, fresh) = match self.list.iter().rposition(fits) {
+            Some(i) => (i, false),
             None => {
                 let size = bytes.div_ceil(align) * align;
                 let heap = make(size, align)?;
                 self.next_id += 1;
                 self.list.push(Arena { base: va, size, align, heap, users: 0, idle_since: None, id: self.next_id });
-                self.list.len() - 1
+                (self.list.len() - 1, true)
             }
         };
         let a = &mut self.list[i];
         a.users += 1;
         a.idle_since = None;
-        Some((a.heap.clone(), va - a.base, a.id))
+        Some((a.heap.clone(), va - a.base, a.id, fresh))
     }
 
     /// A resource in arena `id` released.
@@ -186,6 +186,44 @@ const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 /// a pool tile given back is not reused before this (the GPU may still be at work on what the
 /// title released)
 const COOL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Page budget (`XCL_PAGE_BUDGET_MB`): a texture the CPU fills is not evicted before this
+/// long after it was placed, remapped or used in a transition.
+const EVICT_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Page budget: textures smaller than this are never evicted (UI, fonts, small lookups).
+const EVICT_MIN_TILES: u32 = 4;
+/// Page budget: tiles freed per eviction round once the pools are at the budget.
+const EVICT_BATCH: usize = 512;
+/// Page budget: after a round that found nothing to evict, pools grow past the budget for this
+/// long instead of trying again for every tile.
+const EVICT_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Page budget: pool heaps the pages may take, from `XCL_PAGE_BUDGET_MB` (0: no limit).
+fn pool_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let mb: usize = std::env::var("XCL_PAGE_BUDGET_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        if mb == 0 {
+            return 0;
+        }
+        // evicting unmaps a texture from another thread: only safe while a texture's last
+        // Release reaches `forget` before the object goes (`late_release` holds it until then)
+        if !super::late_release::enabled() {
+            crate::xlog_warn!("D3D12.X: XCL_PAGE_BUDGET_MB needs late release (XCL_LATE_RELEASE=0 is set): no page budget");
+            return 0;
+        }
+        let pools = (mb << 20).div_ceil(POOL_PAGES as usize * PAGE).max(1);
+        crate::xlog_info!("D3D12.X: page budget {mb} MB ({pools} pools of 64 MB): CPU-filled textures are evicted least recently used first beyond it");
+        pools
+    })
+}
+
+/// Page budget: textures whose tiles were evicted; the next upload or transition maps
+/// them again and uploads them whole.
+static EVICTED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// the number of textures in `EVICTED` (callers skip the lookup while it is 0)
+static EVICTED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REMAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A pool tile: (pool heap, tile in it).
 type Tile = (u32, u32);
@@ -238,6 +276,10 @@ struct Target {
     mapped: bool,
     used: Vec<usize>,
     used_extra: Vec<(usize, usize)>,
+    /// a texture the CPU fills (its texels can be uploaded again from the title's memory)
+    evictable: bool,
+    /// placed, remapped or transitioned last
+    touched: std::time::Instant,
 }
 
 /// Per-heap free-tile allocator for `Pages`.
@@ -516,6 +558,10 @@ struct Pages {
     scratch_flags: Vec<D3D12_TILE_RANGE_FLAGS>,
     scratch_offsets: Vec<u32>,
     scratch_counts: Vec<u32>,
+    /// page budget: no eviction round before this (the last one found nothing to evict)
+    evict_idle_until: Option<std::time::Instant>,
+    /// page budget: pool heaps the pages may take (`pool_cap`; 0: no limit)
+    cap: usize,
 }
 
 // D3D12 objects are free-threaded
@@ -558,6 +604,8 @@ impl Pages {
             scratch_flags: Vec::new(),
             scratch_offsets: Vec::new(),
             scratch_counts: Vec::new(),
+            evict_idle_until: None,
+            cap: pool_cap(),
         })
     }
 
@@ -588,6 +636,39 @@ impl Pages {
             );
         }
         dropped
+    }
+
+    /// Page budget: room for `want` tiles of the next placement in the pool heaps the cap still
+    /// allows (what is still missing then comes from new pool heaps, past the budget). Tiles
+    /// not cooled yet are taken first; when there are none, one round gives back a batch of
+    /// tiles (to `cooling`), which the next tiles take first; a round that found nothing to
+    /// evict is not repeated for a second: each one walks every target.
+    unsafe fn budget_room(&mut self, want: usize, now: std::time::Instant) {
+        if self.cap == 0 {
+            return;
+        }
+        // the pool heaps still allowed take this many; only the rest needs free tiles
+        let want = want.saturating_sub(self.cap.saturating_sub(self.pools.len()) * POOL_PAGES as usize);
+        if want == 0 {
+            return;
+        }
+        self.pool.drain_cooling(now);
+        while self.pool.free_total < want {
+            if self.pool.cooling.is_empty() {
+                if self.evict_idle_until.is_some_and(|t| now < t) {
+                    return;
+                }
+                if self.evict_lru(EVICT_BATCH) == 0 {
+                    self.evict_idle_until = Some(now + EVICT_IDLE);
+                    return;
+                }
+            }
+            // at the budget a tile is reused before it cooled: a draw still in flight may read
+            // the newer texels there for a frame
+            let n = (want - self.pool.free_total).min(self.pool.cooling.len());
+            let tiles: Vec<Tile> = self.pool.cooling.drain(..n).map(|(t, _)| t).collect();
+            self.pool.return_tiles(&tiles);
+        }
     }
 
     /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
@@ -692,27 +773,90 @@ impl Pages {
         }
     }
 
+    /// Page budget: unmap CPU-filled textures, least recently touched first, until `want`
+    /// tiles came back (pages other mapped textures still share stay). Each goes to `EVICTED`.
+    unsafe fn evict_lru(&mut self, want: usize) -> usize {
+        let now = std::time::Instant::now();
+        let before = self.pool.free_total + self.pool.cooling.len();
+        let mut order: Vec<(std::time::Instant, usize)> = self
+            .targets
+            .iter()
+            .filter(|(_, t)| t.evictable && t.mapped && t.total >= EVICT_MIN_TILES && now.duration_since(t.touched) >= EVICT_MIN_AGE)
+            .map(|(&k, t)| (t.touched, k))
+            .collect();
+        order.sort_unstable();
+        let mut evicted = Vec::new();
+        for (_, key) in order {
+            if self.pool.free_total + self.pool.cooling.len() - before >= want {
+                break;
+            }
+            let Some(t) = self.targets.get_mut(&key) else { continue };
+            let total = t.total;
+            let used = std::mem::take(&mut t.used);
+            let used_extra = std::mem::take(&mut t.used_extra);
+            t.mapped = false;
+            let raw = key as *mut c_void;
+            if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
+                self.unmap(res, total);
+            }
+            self.release_tiles(used, used_extra, now, true);
+            evicted.push(key);
+        }
+        if !evicted.is_empty() {
+            let n = EVICTIONS.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed) + evicted.len() as u64;
+            let freed = self.pool.free_total + self.pool.cooling.len() - before;
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let step = LOGGED.load(std::sync::atomic::Ordering::Relaxed);
+            if n >= step {
+                LOGGED.store(n.max(1) * 2, std::sync::atomic::Ordering::Relaxed);
+                crate::xlog_info!("D3D12.X: page budget: {} textures evicted ({} MB back) this round, {n} so far", evicted.len(), (freed * PAGE) >> 20);
+            }
+            let mut g = EVICTED.lock().unwrap();
+            let s = g.get_or_insert_with(HashSet::new);
+            s.extend(evicted);
+            EVICTED_LEN.store(s.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        self.pool.free_total + self.pool.cooling.len() - before
+    }
+
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
-    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    /// The bool is true when every tile was newly taken rather than shared with an existing page.
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>, bool)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
 
-        let mut missing = 0usize;
-        let mut preferred: Option<u32> = None;
-        for i in 0..total as usize {
-            let existing = if i < own {
-                self.pages.get(&(first + i * PAGE)).map(|p| p.tile.0)
-            } else {
-                self.extra_pages.get(&(va, i)).map(|p| p.tile.0)
-            };
-            match existing {
-                Some(h) if preferred.is_none() => preferred = Some(h),
-                Some(_) => {}
-                None => missing += 1,
+        let count = |pages: &std::collections::HashMap<usize, Page>, extra_pages: &std::collections::HashMap<(usize, usize), Page>| {
+            let mut missing = 0usize;
+            let mut preferred: Option<u32> = None;
+            for i in 0..total as usize {
+                let existing = if i < own {
+                    pages.get(&(first + i * PAGE)).map(|p| p.tile.0)
+                } else {
+                    extra_pages.get(&(va, i)).map(|p| p.tile.0)
+                };
+                match existing {
+                    Some(h) if preferred.is_none() => preferred = Some(h),
+                    Some(_) => {}
+                    None => missing += 1,
+                }
+            }
+            (missing, preferred)
+        };
+        let (mut missing, mut preferred) = count(&self.pages, &self.extra_pages);
+        if self.cap != 0 {
+            // an eviction can take back pages this placement shares (an older placement at the
+            // same addresses): count again until what is missing has room
+            loop {
+                self.budget_room(missing, now);
+                let (m, p) = count(&self.pages, &self.extra_pages);
+                let more = m > missing;
+                (missing, preferred) = (m, p);
+                if !more {
+                    break;
+                }
             }
         }
-
         let pools = &mut self.pools;
         let pool = &mut self.pool;
         let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
@@ -724,6 +868,7 @@ impl Pages {
         let mut tiles = Vec::with_capacity(total as usize);
         let mut used = Vec::with_capacity(own);
         let mut used_extra = Vec::new();
+        let mut reused = false;
         for i in 0..total as usize {
             let tile = if i < own {
                 let a = first + i * PAGE;
@@ -731,6 +876,7 @@ impl Pages {
                     Some(p) => {
                         p.users += 1;
                         p.idle_since = None;
+                        reused = true;
                         p.tile
                     }
                     None => {
@@ -747,6 +893,7 @@ impl Pages {
                     Some(p) => {
                         p.users += 1;
                         p.idle_since = None;
+                        reused = true;
                         p.tile
                     }
                     None => {
@@ -761,7 +908,7 @@ impl Pages {
             tiles.push(tile);
         }
         self.map(res, &tiles);
-        Some((used, used_extra))
+        Some((used, used_extra, !reused))
     }
 }
 
@@ -849,6 +996,56 @@ fn canonical_va(va: usize) -> usize {
     if mapped { va } else { src }
 }
 
+struct DiscardQueue { queue: ID3D12CommandQueue, alloc: ID3D12CommandAllocator, list: ID3D12GraphicsCommandList, fence: ID3D12Fence, value: u64 }
+unsafe impl Send for DiscardQueue {}
+static DISCARD: Mutex<std::collections::BTreeMap<usize, Option<DiscardQueue>>> = Mutex::new(std::collections::BTreeMap::new());
+static DISCARDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+fn discards() -> u64 { DISCARDS.load(std::sync::atomic::Ordering::Relaxed) }
+
+impl DiscardQueue {
+    unsafe fn new(dev: &ID3D12Device) -> Option<DiscardQueue> {
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
+        list.Close().ok()?;
+        Some(DiscardQueue { queue, alloc, list, fence: dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?, value: 0 })
+    }
+}
+
+/// State in which a newly backed RT or DS placement is discarded (#940: debug error 1422).
+fn discard_target_state(flags: D3D12_RESOURCE_FLAGS, fresh: bool) -> Option<D3D12_RESOURCE_STATES> {
+    if !fresh { None }
+    else if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 { Some(D3D12_RESOURCE_STATE_DEPTH_WRITE) }
+    else if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0 { Some(D3D12_RESOURCE_STATE_RENDER_TARGET) }
+    else { None }
+}
+
+/// Discard a newly backed RT or DS placement before any queue touches it (#940: debug error 1422),
+/// leaving its subresources in `initial` and waiting for completion (`after_map`: tile mapping fence).
+unsafe fn discard_fresh(dev: &ID3D12Device, res: &ID3D12Resource, initial: D3D12_RESOURCE_STATES, target: D3D12_RESOURCE_STATES, after_map: Option<(ID3D12Fence, u64)>) {
+    super::title_textures::own_work(|| {
+        let mut g = DISCARD.lock().unwrap();
+        let Some(dq) = g.entry(dev.as_raw() as usize).or_insert_with(|| DiscardQueue::new(dev)).as_mut() else { return };
+        if let Some((f, v)) = after_map { let _ = dq.queue.Wait(&f, v); }
+        if dq.alloc.Reset().is_err() || dq.list.Reset(&dq.alloc, None).is_err() { return; }
+        let transition = |from: D3D12_RESOURCE_STATES, to: D3D12_RESOURCE_STATES| {
+            let t = D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(res), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: from, StateAfter: to };
+            D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(t) }, ..Default::default() }
+        };
+        if initial != target { dq.list.ResourceBarrier(&[transition(initial, target)]); }
+        dq.list.DiscardResource(res, None);
+        if initial != target { dq.list.ResourceBarrier(&[transition(target, initial)]); }
+        let (Ok(()), Ok(cmd)) = (dq.list.Close(), dq.list.cast()) else { return };
+        dq.queue.ExecuteCommandLists(&[Some(cmd)]);
+        dq.value += 1;
+        if dq.queue.Signal(&dq.fence, dq.value).is_ok() {
+            let _ = dq.fence.SetEventOnCompletion(dq.value, windows::Win32::Foundation::HANDLE::default());
+        }
+        DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 /// A texture at `va` as a reserved resource on the title's shared 64 KiB pages
 /// (`console_bytes`: its size on the console; tiles past the owned page boundaries are shared by
 /// `(va, tile_index)` so repeated placements at the same address do not leak). None: it cannot be.
@@ -904,22 +1101,26 @@ unsafe fn place_on_pages(
     let bound = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
-            if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra });
-                true
+            if let Some((used, used_extra, fresh)) = pages.bind(dev, res, va, console_bytes, total) {
+                let after_map = fresh.then(|| (pages.fence.clone(), pages.value));
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, touched: std::time::Instant::now() });
+                Some((fresh, after_map))
             } else {
-                false
+                None
             }
         } else {
-            false
+            None
         }
     };
-    if !bound {
+    let Some((fresh, after_map)) = bound else {
         drop(windows::core::IUnknown::from_raw(raw));
         *ppv = std::ptr::null_mut();
         return None;
-    }
+    };
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+    if let Some(target) = discard_target_state(desc.Flags, fresh) {
+        discard_fresh(dev, res, D3D12_RESOURCE_STATES(state as i32), target, after_map);
+    }
     Some(hr)
 }
 
@@ -960,15 +1161,92 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     if mapped {
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
+    let Some((used, used_extra, _)) = pages.bind(&dev, res, va, console_bytes, total) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
         t.used = used;
         t.used_extra = used_extra;
         t.mapped = true;
+        t.touched = std::time::Instant::now();
     }
     true
+}
+
+/// Page budget: `res` was evicted by the page budget.
+pub(super) fn is_evicted(res: usize) -> bool {
+    any_evicted() && EVICTED.lock().unwrap().as_ref().is_some_and(|s| s.contains(&res))
+}
+
+/// Page budget: map `res` again if the page budget evicted it. True when it was evicted and is
+/// mapped again (the caller uploads it whole); a failed remap leaves it evicted, to be tried
+/// again at its next write, transition or copy.
+pub(super) unsafe fn revive(res: &ID3D12Resource) -> bool {
+    let key = res.as_raw() as usize;
+    if !is_evicted(key) || !remap_if_unmapped(res) {
+        return false;
+    }
+    let mut g = EVICTED.lock().unwrap();
+    let Some(s) = g.as_mut() else { return false };
+    if !s.remove(&key) {
+        return false;
+    }
+    EVICTED_LEN.store(s.len(), std::sync::atomic::Ordering::Relaxed);
+    REMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Page budget: whether any texture is evicted (callers skip the lookup otherwise).
+pub(super) fn any_evicted() -> bool {
+    EVICTED_LEN.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Page budget: the textures `res` were used (a transition the title submitted, a CPU write
+/// uploaded): later to be evicted.
+pub(super) fn touch(res: impl IntoIterator<Item = usize>) {
+    if pool_cap() == 0 {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut g = PAGES.lock().unwrap();
+    for r in res {
+        for pages in g.values_mut().flatten() {
+            if let Some(t) = pages.targets.get_mut(&r) {
+                t.touched = now;
+                break;
+            }
+        }
+    }
+}
+
+/// Page budget: `res` is a texture `title_textures` keeps in step with the title's memory, so
+/// its texels can be uploaded again after an eviction.
+pub(super) fn set_evictable(res: usize) {
+    set_evictable_to(res, true);
+}
+
+/// Page budget: the GPU wrote `res`; its texels are not in the title's memory, so it is
+/// never evicted.
+pub(super) fn pin(res: usize) {
+    set_evictable_to(res, false);
+}
+
+fn set_evictable_to(res: usize, on: bool) {
+    if pool_cap() == 0 {
+        return;
+    }
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        if let Some(t) = pages.targets.get_mut(&res) {
+            t.evictable = on;
+            return;
+        }
+    }
+}
+
+/// Page budget: (textures evicted, textures mapped again) so far.
+pub fn eviction_counts() -> (u64, u64) {
+    (EVICTIONS.load(std::sync::atomic::Ordering::Relaxed), REMAPS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// A resource released: its pages are no longer its.
@@ -979,6 +1257,11 @@ fn forget_pages(resource: usize) {
         let Some(t) = pages.targets.remove(&resource) else { continue };
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
+        }
+        drop(g);
+        if let Some(s) = EVICTED.lock().unwrap().as_mut() {
+            s.remove(&resource);
+            EVICTED_LEN.store(s.len(), std::sync::atomic::Ordering::Relaxed);
         }
         return;
     }
@@ -1071,6 +1354,22 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
 #[cfg(test)]
 pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Page budget, for tests: evict `res` now (as the least recently touched texture the CPU
+/// fills); whether it was.
+#[cfg(test)]
+pub(super) unsafe fn evict_for_test(res: usize) -> bool {
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        if let Some(t) = pages.targets.get_mut(&res) {
+            t.evictable = true;
+            t.touched = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(600)).unwrap();
+            pages.evict_lru(1);
+            return pages.targets.get(&res).is_some_and(|t| !t.mapped);
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let g = PAGES.lock().unwrap();
@@ -1157,14 +1456,18 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     let align = (info.Alignment as usize).max(PAGE);
     let now = std::time::Instant::now();
-    let (heap, offset, id) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
+    let (heap, offset, id, fresh) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
     let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         ARENAS.lock().unwrap().release(id, now);
         return None;
     }
-    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
-    ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, id);
+    let raw = *ppv;
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+    ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(raw as usize, id);
+    if let (Some(target), Some(res)) = (discard_target_state(desc.Flags, fresh), ID3D12Resource::from_raw_borrowed(&raw)) {
+        discard_fresh(dev, res, D3D12_RESOURCE_STATES(state as i32), target, None);
+    }
     Some(hr)
 }
 
@@ -1346,8 +1649,8 @@ mod tests {
     fn arenas_sweep_dropped_returns_expired_heaps() {
         let t0 = Instant::now();
         let mut arenas: Arenas<u32> = Arenas::new();
-        let (_, _, id1) = arenas.take(0x10_0000, 0x1_0000, PAGE, t0, |_, _| Some(101)).unwrap();
-        let (_, _, id2) = arenas.take(0x20_0000, 0x1_0000, PAGE, t0, |_, _| Some(202)).unwrap();
+        let (_, _, id1, _) = arenas.take(0x10_0000, 0x1_0000, PAGE, t0, |_, _| Some(101)).unwrap();
+        let (_, _, id2, _) = arenas.take(0x20_0000, 0x1_0000, PAGE, t0, |_, _| Some(202)).unwrap();
         arenas.release(id1, t0);
         arenas.release(id2, t0 + Duration::from_secs(1));
         assert!(arenas.sweep_dropped(t0 + Duration::from_millis(1900)).is_empty());
@@ -1361,13 +1664,13 @@ mod tests {
     fn arenas_sweep_dropped_preserves_newest_fitting_order() {
         let t0 = Instant::now();
         let mut arenas: Arenas<u32> = Arenas::new();
-        let (_, _, id1) = arenas.take(0x10_0000, PAGE, PAGE, t0, |_, _| Some(101)).unwrap();
-        let (_, _, id2) = arenas.take(0x20_0000, PAGE, PAGE, t0, |_, _| Some(202)).unwrap();
-        let (_, _, id3) = arenas.take(0x20_0000, 2 * PAGE, PAGE, t0, |_, _| Some(303)).unwrap();
+        let (_, _, id1, _) = arenas.take(0x10_0000, PAGE, PAGE, t0, |_, _| Some(101)).unwrap();
+        let (_, _, id2, _) = arenas.take(0x20_0000, PAGE, PAGE, t0, |_, _| Some(202)).unwrap();
+        let (_, _, id3, _) = arenas.take(0x20_0000, 2 * PAGE, PAGE, t0, |_, _| Some(303)).unwrap();
         arenas.release(id1, t0);
         let t1 = t0 + IDLE + Duration::from_millis(10);
         assert_eq!(arenas.sweep_dropped(t1), vec![101]);
-        let (heap, off, picked_id) = arenas.take(0x20_0000, PAGE, PAGE, t1, |_, _| panic!("must reuse existing arena")).unwrap();
+        let (heap, off, picked_id, _) = arenas.take(0x20_0000, PAGE, PAGE, t1, |_, _| panic!("must reuse existing arena")).unwrap();
         assert_eq!((heap, off, picked_id), (303, 0, id3), "sweep must preserve insertion order so rposition selects the newest fitting arena");
         assert_ne!(picked_id, id2);
     }
@@ -1813,6 +2116,425 @@ mod tests {
                 "AFTER  ({TEX_COUNT} x 2MiB textures, {new_calls} UpdateTileMappings + {TEX_COUNT} Signals): submit={new_submit:?} gpu_done={new_total:?}"
             );
             assert!(new_calls < old_calls);
+        }
+    }
+
+    /// Page budget: the least recently touched CPU-filled texture gives its
+    /// pages back first, a GPU-written one never does, and an evicted one maps again.
+    #[test]
+    fn page_budget_evicts_the_least_recently_touched_cpu_filled_texture() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(1 << 20), riid, &mut p);
+                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                    return None;
+                }
+                Some(ID3D12Resource::from_raw(p))
+            };
+            let (Some(old), Some(newer), Some(written)) = (place_at(0x60_0000_0000), place_at(0x60_1000_0000), place_at(0x60_2000_0000)) else {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            };
+            let key = |r: &ID3D12Resource| r.as_raw() as usize;
+            let dev_key = dev.as_raw() as usize;
+            let now = Instant::now();
+            {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                // (`set_evictable` / `pin` do nothing without XCL_PAGE_BUDGET_MB)
+                for (r, age, evictable) in [(&old, 30, true), (&newer, 20, true), (&written, 40, false)] {
+                    let t = pages.targets.get_mut(&key(r)).unwrap();
+                    t.touched = now - Duration::from_secs(age);
+                    t.evictable = evictable;
+                }
+                let used_before = pages.pages.len();
+                assert!(pages.evict_lru(1) > 0, "tiles came back");
+                assert!(!pages.targets[&key(&old)].mapped, "the oldest CPU-filled texture is evicted");
+                assert!(pages.targets[&key(&newer)].mapped, "one is enough for one tile");
+                assert!(pages.targets[&key(&written)].mapped, "a GPU-written texture is never evicted");
+                assert!(pages.pages.len() < used_before, "its pages went back");
+                // nothing left to evict: the round says so (take_tile then waits before the next)
+                pages.targets.get_mut(&key(&newer)).unwrap().evictable = false;
+                assert_eq!(pages.evict_lru(1), 0, "nothing evictable");
+            }
+            assert!(is_evicted(key(&old)) && !is_evicted(key(&newer)));
+            assert!(revive(&old), "mapped again");
+            assert!(!is_evicted(key(&old)) && !revive(&old), "once");
+            assert!(PAGES.lock().unwrap().get(&dev_key).unwrap().as_ref().unwrap().targets[&key(&old)].mapped, "mapped again");
+            drop((old, newer, written));
+        }
+    }
+
+    /// Page budget: at the cap, one texture placed evicts one batch, and its other tiles come
+    /// from that batch – not one more round per tile (#640 review: one placement evicted every
+    /// eligible texture).
+    #[test]
+    fn page_budget_one_placement_at_the_cap_evicts_one_batch() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            // 512 x 512 RGBA8: 16 tiles each
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(1 << 20), riid, &mut p);
+                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                    return None;
+                }
+                Some(ID3D12Resource::from_raw(p))
+            };
+            // 40 x 16 = 640 tiles: more than one batch of 512
+            let old: Vec<ID3D12Resource> = (0..40).filter_map(|i| place_at(0x61_0000_0000 + i * 0x10_0000)).collect();
+            if old.len() != 40 {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            }
+            let key = |r: &ID3D12Resource| r.as_raw() as usize;
+            let dev_key = dev.as_raw() as usize;
+            let now = Instant::now();
+            let (saved_free, saved_cooling) = {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                for (i, r) in old.iter().enumerate() {
+                    let t = pages.targets.get_mut(&key(r)).unwrap();
+                    t.touched = now - Duration::from_secs(100 - i as u64);
+                    t.evictable = true;
+                }
+                // at the cap with no spare tile: the next tile has to come from an eviction
+                pages.cap = pages.pools.len();
+                pages.evict_idle_until = None;
+                let free: Vec<Vec<u32>> = pages.pool.free_by_heap.iter_mut().map(std::mem::take).collect();
+                pages.pool.free_total = 0;
+                (free, std::mem::take(&mut pages.pool.cooling))
+            };
+            let new = place_at(0x61_8000_0000);
+            let mapped: Vec<bool> = {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                let mapped = old.iter().map(|r| pages.targets[&key(r)].mapped).collect();
+                pages.cap = 0;
+                for (h, free) in saved_free.into_iter().enumerate() {
+                    pages.pool.free_total += free.len();
+                    pages.pool.free_by_heap[h].extend(free);
+                    pages.pool.dirty_sort[h] = true;
+                }
+                pages.pool.cooling.extend(saved_cooling);
+                mapped
+            };
+            assert!(new.is_some(), "placed from the evicted tiles");
+            let evicted = mapped.iter().filter(|m| !**m).count();
+            assert_eq!(evicted, 32, "one batch of 512 tiles: the 32 least recently touched");
+            assert!(mapped[..32].iter().all(|m| !m) && mapped[32..].iter().all(|m| *m), "oldest first");
+            for r in &old {
+                let _ = revive(r);
+            }
+            drop((old, new));
+        }
+    }
+
+    /// Page budget: a placement whose eviction takes back pages it shares with the evicted
+    /// texture (an older placement over the same addresses) counts them again and takes them
+    /// from the evicted tiles, within the cap (the port of #640 counted once and panicked).
+    #[test]
+    fn page_budget_eviction_of_a_shared_page_counts_it_again() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            // 512 x 512 RGBA8: 16 tiles, all on the title's pages
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(1 << 20), riid, &mut p);
+                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                    return None;
+                }
+                Some(ID3D12Resource::from_raw(p))
+            };
+            let Some(old) = place_at(0x62_0000_0000) else {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            };
+            let dev_key = dev.as_raw() as usize;
+            let (saved_free, saved_cooling, cap) = {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                let t = pages.targets.get_mut(&(old.as_raw() as usize)).unwrap();
+                t.touched = Instant::now() - Duration::from_secs(100);
+                t.evictable = true;
+                // at the cap with no spare tile
+                pages.cap = pages.pools.len();
+                pages.evict_idle_until = None;
+                let free: Vec<Vec<u32>> = pages.pool.free_by_heap.iter_mut().map(std::mem::take).collect();
+                pages.pool.free_total = 0;
+                (free, std::mem::take(&mut pages.pool.cooling), pages.cap)
+            };
+            // its second half is on the old texture's last 8 pages, which the eviction takes back
+            let new = place_at(0x62_0000_0000 + 8 * PAGE);
+            let (old_mapped, pools) = {
+                let mut g = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                let out = (pages.targets[&(old.as_raw() as usize)].mapped, pages.pools.len());
+                pages.cap = 0;
+                for (h, free) in saved_free.into_iter().enumerate() {
+                    pages.pool.free_total += free.len();
+                    pages.pool.free_by_heap[h].extend(free);
+                    pages.pool.dirty_sort[h] = true;
+                }
+                pages.pool.cooling.extend(saved_cooling);
+                out
+            };
+            assert!(new.is_some(), "placed");
+            assert!(!old_mapped, "the older placement was evicted");
+            assert_eq!(pools, cap, "its tiles came from the eviction, not a new pool heap");
+            let _ = revive(&old);
+            drop((old, new));
+        }
+    }
+
+    /// Page budget: below the cap, a placement that needs more than the pool heaps the cap still
+    /// allows makes only those and evicts for the rest.
+    #[test]
+    fn page_budget_new_pool_heaps_stop_at_the_cap() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize, width: u64, height: u32| {
+                let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: width, Height: height, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(1 << 20), riid, &mut p);
+                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                    return None;
+                }
+                Some(ID3D12Resource::from_raw(p))
+            };
+            // two of 16 tiles to evict
+            let (Some(a), Some(b)) = (place_at(0x63_0000_0000, 512, 512), place_at(0x63_1000_0000, 512, 512)) else {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            };
+            let dev_key = dev.as_raw() as usize;
+            let (saved_free, saved_cooling, cap) = {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                for r in [&a, &b] {
+                    let t = pages.targets.get_mut(&(r.as_raw() as usize)).unwrap();
+                    t.touched = Instant::now() - Duration::from_secs(100);
+                    t.evictable = true;
+                }
+                // one more pool heap allowed, no spare tile
+                pages.cap = pages.pools.len() + 1;
+                pages.evict_idle_until = None;
+                let free: Vec<Vec<u32>> = pages.pool.free_by_heap.iter_mut().map(std::mem::take).collect();
+                pages.pool.free_total = 0;
+                (free, std::mem::take(&mut pages.pool.cooling), pages.cap)
+            };
+            // 4096 x 4224 RGBA8: 32 x 33 = 1056 tiles, 32 more than one pool heap
+            let big = place_at(0x63_2000_0000, 4096, 4224);
+            let (mapped, pools) = {
+                let mut g = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                let out = ([&a, &b].map(|r| pages.targets[&(r.as_raw() as usize)].mapped), pages.pools.len());
+                pages.cap = 0;
+                for (h, free) in saved_free.into_iter().enumerate() {
+                    pages.pool.free_total += free.len();
+                    pages.pool.free_by_heap[h].extend(free);
+                    pages.pool.dirty_sort[h] = true;
+                }
+                pages.pool.cooling.extend(saved_cooling);
+                out
+            };
+            assert!(big.is_some(), "placed");
+            assert_eq!(pools, cap, "one new pool heap, up to the cap");
+            assert_eq!(mapped, [false, false], "the other 32 tiles came from evictions");
+            let _ = (revive(&a), revive(&b));
+            drop((a, b, big));
+        }
+    }
+
+    #[test]
+    fn fresh_targets_need_discard_once_and_aliased_arenas_do_not() {
+        let (t, a0, mut a) = (Instant::now(), 0x2_0000_0000, Arenas::new());
+        let take_f = |a: &mut Arenas<u32>, va: usize, bytes: usize, now: Instant| {
+            let n = a.list.len() as u32;
+            let (_, _, id, fresh) = a.take(va, bytes, PAGE, now, |_, _| Some(n)).unwrap();
+            (id, fresh)
+        };
+        let (id, f0) = take_f(&mut a, a0, 8 * MIB, t);
+        assert!(f0 && take_f(&mut a, a0, 8 * MIB, t) == (id, false) && take_f(&mut a, a0 + MIB, 2 * MIB, t) == (id, false));
+        for _ in 0..3 { a.release(id, t); }
+        assert_eq!(take_f(&mut a, a0, 8 * MIB, t + Duration::from_secs(1)), (id, false));
+        a.release(id, t + Duration::from_secs(1));
+        let (id2, f1) = take_f(&mut a, a0, 8 * MIB, t + Duration::from_secs(4));
+        assert!(f1 && id2 != id);
+        for (flags, fresh, want) in [
+            (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, true, Some(D3D12_RESOURCE_STATE_RENDER_TARGET)),
+            (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, true, Some(D3D12_RESOURCE_STATE_DEPTH_WRITE)),
+            (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, true, None),
+            (D3D12_RESOURCE_FLAG_NONE, true, None),
+            (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, false, None),
+            (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, false, None),
+        ] {
+            assert_eq!(discard_target_state(flags, fresh), want);
+        }
+    }
+
+    /// Newly backed placed and reserved RT/DS targets run `DiscardResource` once while keeping
+    /// their initial state; aliased placements at the same address do not discard earlier writes.
+    #[test]
+    fn fresh_placed_and_reserved_targets_discard_without_wiping_aliases() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::{Common::*, *};
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return crate::gpu::recomp::runner::skip_test("software adapter");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return crate::gpu::recomp::runner::skip_test("no tier-2 heap GPU") };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let (riid, sample) = (&ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID, DXGI_SAMPLE_DESC { Count: 1, Quality: 0 });
+            let barrier = |r: &ID3D12Resource, from: D3D12_RESOURCE_STATES, to: D3D12_RESOURCE_STATES| {
+                let t = D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: from, StateAfter: to };
+                D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(t) }, ..Default::default() }
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.Close().unwrap();
+            let (fence, fval): (ID3D12Fence, std::cell::Cell<u64>) = (dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap(), std::cell::Cell::new(0));
+            let run = |rec: &dyn Fn(&ID3D12GraphicsCommandList)| {
+                before_execute(&queue);
+                alloc.Reset().unwrap();
+                list.Reset(&alloc, None).unwrap();
+                rec(&list);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                fval.set(fval.get() + 1);
+                queue.Signal(&fence, fval.get()).unwrap();
+                fence.SetEventOnCompletion(fval.get(), windows::Win32::Foundation::HANDLE::default()).unwrap();
+            };
+            let place_one = |va: usize, d: &D3D12_RESOURCE_DESC, st: D3D12_RESOURCE_STATES, cv: *const c_void, cb: Option<u64>| {
+                let mut p = std::ptr::null_mut();
+                assert!(place(dev.as_raw(), va, d, st.0 as u32, cv, cb, riid, &mut p).is_some_and(|hr| hr >= 0) && !p.is_null());
+                ID3D12Resource::from_raw(p)
+            };
+            let read_back = |r: &ID3D12Resource, d: &D3D12_RESOURCE_DESC, fp: &mut [D3D12_PLACED_SUBRESOURCE_FOOTPRINT]| -> Vec<u8> {
+                let (mut bytes, mut rb) = (0u64, None::<ID3D12Resource>);
+                dev.GetCopyableFootprints(d, 0, fp.len() as u32, 0, Some(fp.as_mut_ptr()), None, None, Some(&mut bytes));
+                let bd = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: sample, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+                let rb = rb.unwrap();
+                run(&|l| for (plane, f) in fp.iter().enumerate() {
+                    let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *f } };
+                    let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: plane as u32 } };
+                    l.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                });
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).unwrap();
+                let out = std::slice::from_raw_parts(p as *const u8, bytes as usize).to_vec();
+                rb.Unmap(0, None);
+                out
+            };
+
+            let ds_desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R32G8X24_TYPELESS, SampleDesc: sample, Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..Default::default() };
+            let ds_cv = D3D12_CLEAR_VALUE { Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT, Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 1.0, Stencil: 0 } } };
+            let (d0, ds0) = (discards(), place_one(0x6A_0000_0000, &ds_desc, D3D12_RESOURCE_STATE_DEPTH_READ, &ds_cv as *const _ as *const c_void, None));
+            assert_eq!(discards(), d0 + 1, "fresh arena depth target must discard");
+            let dsv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, ..Default::default() }).unwrap();
+            let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+            dev.CreateDepthStencilView(&ds0, Some(&D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default() }), dsv);
+            run(&|l| {
+                l.ResourceBarrier(&[barrier(&ds0, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE)]);
+                l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.375, 0x3C, None);
+            });
+            let ds1 = place_one(0x6A_0000_0000, &ds_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &ds_cv as *const _ as *const c_void, None);
+            assert_eq!(discards(), d0 + 1, "aliased arena depth target must not discard");
+            run(&|l| l.ResourceBarrier(&[barrier(&ds1, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE)]));
+            let mut ds_fp = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+            let s = read_back(&ds1, &ds_desc, &mut ds_fp);
+            assert_eq!((f32::from_le_bytes(s[ds_fp[0].Offset as usize..ds_fp[0].Offset as usize + 4].try_into().unwrap()), s[ds_fp[1].Offset as usize]), (0.375, 0x3C));
+
+            let mut opt = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opt as *mut _ as *mut c_void, std::mem::size_of_val(&opt) as u32).is_ok() && opt.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0 {
+                let rt_desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: sample, Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..Default::default() };
+                let rgba = [0.2f32, 0.4, 0.6, 1.0];
+                let rt_cv = D3D12_CLEAR_VALUE { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Anonymous: D3D12_CLEAR_VALUE_0 { Color: rgba } };
+                let (d1, rt0) = (discards(), place_one(0x6B_0000_0000, &rt_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &rt_cv as *const _ as *const c_void, Some(PAGE as u64)));
+                assert_eq!(discards(), d1 + 1, "fresh tiled render target must discard");
+                let rtv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).unwrap();
+                let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+                dev.CreateRenderTargetView(&rt0, None, rtv);
+                run(&|l| {
+                    l.ResourceBarrier(&[barrier(&rt0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                    l.ClearRenderTargetView(rtv, &rgba, None);
+                });
+                let rt1 = place_one(0x6B_0000_0000, &rt_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, &rt_cv as *const _ as *const c_void, Some(PAGE as u64));
+                assert_eq!(discards(), d1 + 1, "aliased tiled render target must not discard");
+                let mut rt_fp = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 1];
+                let s = read_back(&rt1, &rt_desc, &mut rt_fp);
+                assert_eq!(&s[rt_fp[0].Offset as usize..rt_fp[0].Offset as usize + 4], &[51, 102, 153, 255]);
+                drop((rt0, rt1));
+            }
+            drop((ds0, ds1));
         }
     }
 }
