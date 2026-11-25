@@ -157,6 +157,8 @@ A gamepad is recommended ([Controls](#controls)). The game folder is never modif
 
 Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
 An entry partway through it keeps the jump indirect and subject to the recompiler's existing indirect-branch limits.
+The shader recompiler preserves branches when several loop exits share a destination or a
+branch jumps directly into an else block ([#701](https://github.com/ivall/xcl/issues/701)).
 
 </details>
 
@@ -195,6 +197,7 @@ KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Ag
 (`D3D12Core.dll`, plus `d3d12SDKLayers.dll` if using `XCL_D3D12_DEBUG=1`) in a `D3D12\` folder
 next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
 (for `cargo test`, use `%LOCALAPPDATA%\XCL\D3D12\` or `%XCL_D3D12_DIR%`).
+`XCL_DRED=1` enables device-removal diagnostics and can be combined with `XCL_D3D12_DEBUG=1`.
 
 - **DXC:** 1.8 or newer is recommended, from the
   [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases): unpack one

@@ -216,6 +216,123 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
     let _ = Mode::Kernel;
 }
 
+// Synthetic programs from #701: each add records a visit in its destination SGPR.
+fn two_breaks_program() -> Vec<u8> {
+    prog(&[
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None), // 00: loop
+        ("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 9)], None),                       // 08: -> out
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None),
+        ("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 11), ("SSRC1", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 6)], None),                       // 14: -> out
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 129)], None),
+        ("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 12), ("SSRC1", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),                       // 20: -> latch
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)], None),
+        ("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 131)], None),           // 28: latch
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF4)], None),                  // 2c: -> loop
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 129)], None), // 30: out
+    ])
+}
+
+fn jump_into_else_program() -> Vec<u8> {
+    prog(&[
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 5)], None),                       // 08: -> else
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None),
+        ("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 11), ("SSRC1", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)], None),                       // 14: -> else
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 129)], None),
+        ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)], None),                             // 1c: -> join
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 129)], None), // 20: else
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)], None), // 24: join
+    ])
+}
+
+#[test]
+fn structured_repeated_loop_exit_rechecks_guard() {
+    let code = two_breaks_program();
+    for structured in [true, false] {
+        let t = translate(&code, &Options { structured, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let (_, after_exit) = t.hlsl.split_once("// 0014:").unwrap();
+        let (before_next, _) = after_exit.split_once("// 0018:").unwrap();
+        assert!(before_next.split_once("xcl_skip_30 = true;").is_some_and(|(_, tail)| tail.contains("if (!(xcl_skip_30)) {")),
+            "structured={structured}: the second exit must guard the next block\n{}", t.hlsl);
+    }
+}
+
+#[test]
+fn structured_jump_into_else_preserves_target() {
+    let code = jump_into_else_program();
+    for structured in [true, false] {
+        let t = translate(&code, &Options { structured, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        // Only the explicit jump over the else block should guard it, not HLSL's `else`.
+        let (_, after_jump) = t.hlsl.split_once("// 001c:").unwrap();
+        let (before_else, _) = after_jump.split_once("// 0020:").unwrap();
+        assert!(before_else.split_once("xcl_skip_24 = true;").is_some_and(|(_, tail)| tail.contains("if (!(xcl_skip_24)) {")),
+            "structured={structured}: the else block must run unless the jump over it was taken\n{}", t.hlsl);
+    }
+}
+
+#[test]
+fn gpu_structured_branch_targets_match_rdna2() {
+    if !gpu_ready() {
+        return;
+    }
+    // Take the second branch (the two regressions), the first branch, or neither.
+    let inputs = [(0, 2), (2, 0), (0, 0)];
+    for (name, code, expected) in [
+        ("two breaks", two_breaks_program(), [[1, 1, 0, 1, 0], [1, 0, 0, 1, 0], [3, 3, 3, 1, 3]]),
+        ("jump into else", jump_into_else_program(), [[1, 1, 0, 1, 1], [1, 0, 0, 1, 1], [1, 1, 1, 0, 1]]),
+    ] {
+        for structured in [true, false] {
+            let t = translate(&code, &Options { structured, ..runner::options(Mode::Kernel) }).unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+            for ((s10, s11), want) in inputs.into_iter().zip(expected) {
+                let mut st = KernelState::default();
+                st.sgpr[10] = s10;
+                st.sgpr[11] = s11;
+                let r = runner::run(&dxil, &st, &[]).unwrap();
+                assert_eq!(&r.sgpr[..5], &want, "{name}, structured={structured}, s10={s10}, s11={s11}");
+            }
+        }
+    }
+}
+
+#[test]
+fn compute_shared_else_target_stores_the_taken_arms_value() {
+    if !gpu_ready() { return; }
+    // Both conditional branches land at v2 = 13. Only falling through both
+    // sets v2 = 11 and jumps past that assignment.
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 255)], Some(9)),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 5)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 3)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 255)], Some(11)),
+        ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 2)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 255)], Some(13)),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 4), ("SRSRC", 0), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+    ]);
+    let cs = super::CsInterface { threads: [32, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let tr = translate(&code, &Options { mode: Mode::Compute(cs), wave64: false, ..Default::default() }).unwrap();
+    assert!(tr.complete(), "{:?}", tr.unsupported_why);
+    let shader = super::dxc::compile(&tr.hlsl, "main", "cs_6_6", &[]).unwrap();
+    for (s0, s1, expected) in [(0u32, 0u32, 13u32), (4, 0, 13), (4, 1 << 16, 11)] {
+        let first = s0 as usize / 4;
+        let out = runner::dispatch(&shader, [1, 1, 1], &[s0, s1, 256, 0], &[0; 33]).unwrap();
+        assert_eq!(&out[first..first + 32], &[expected; 32], "s0={s0}, s1={s1}");
+    }
+}
+
 #[test]
 fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
     let code = prog(&[
@@ -4252,6 +4369,9 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 
         // Submit 1: reads slot 0 -> in_a (sparse VRAM) + arg_table constant 77 (Window 3)
         record_and_run(1, true);
+        // the copy back of what the shader stored lands asynchronously: before a CPU read the
+        // title's lists are done for, XCL settles it (as in Map and the CPU memory waits)
+        crate::hle::d3d12x::sparse::settle_readbacks();
         for l in 0..64usize {
             let got = *((out_buf + 4 * l) as *const u32);
             assert_eq!(got, 1000 + l as u32 + 77, "submit 1 lane {l} mismatch");
@@ -4262,6 +4382,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         *((in_b + 4 * 3) as *mut u32) = 9999;
         crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_b));
         record_and_run(2, false);
+        crate::hle::d3d12x::sparse::settle_readbacks();
         for l in 0..64usize {
             let expected = if l == 3 { 9999 + 13 } else { 5000 + 2 * l as u32 + 13 };
             let got = *((out_buf + 4 * l) as *const u32);
