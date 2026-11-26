@@ -290,6 +290,372 @@ struct Target {
     gpu_owned: bool,
     /// where the last look at the view heaps found its T# (`seen`)
     seen: Seen,
+    /// LOCAL (#1514): its owned pages in graphics reservations (`Pages::follow`)
+    follows: Vec<usize>,
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=3`): its subresource groups (None: followed whole, or not
+    /// mode 3). Tile i of a group keeps the bookkeeping key it has in every mode: `pages` at
+    /// `first + i * PAGE` (i < own), else `extra_pages` at `(va, i)` – only an identifier of
+    /// tile i there (its texels are not console page i's), never looked up as a title page
+    groups: Option<std::sync::Arc<Vec<FollowGroup>>>,
+}
+
+/// LOCAL (#1514): a tile of no heap: the page it stands for is left unmapped (`Pages::map`).
+const NO_TILE: Tile = (u32::MAX, 0);
+
+/// LOCAL (#1514): `XCL_TEXTURE_FOLLOW=1`: the pages of sampled textures placed in the title's
+/// graphics reservations get video memory only where the title has memory (`Follow`). Read once.
+pub fn following() -> bool {
+    follow_mode() != 0
+}
+
+/// LOCAL: `XCL_TEXTURE_FOLLOW`: 0 off, 1 per page (`follows_by_page` textures only), 2 whole
+/// textures (any shape: all tiles mapped while any followed page has the title's memory, else
+/// all NULL). Read once.
+fn follow_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        // (first asked inside the title's VirtualAlloc: its last error stays as it was)
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        let e = unsafe { GetLastError() };
+        let mut mode = parse_follow_mode(std::env::var("XCL_TEXTURE_FOLLOW").ok().as_deref());
+        // (textures are mapped again from the submitting thread, as an eviction does)
+        if mode != 0 && !super::late_release::enabled() {
+            crate::xlog_warn!("D3D12.X: XCL_TEXTURE_FOLLOW needs late release (XCL_LATE_RELEASE=0 is set): textures do not follow");
+            mode = 0;
+        } else if mode == 1 {
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_FOLLOW=1: texture pages in graphics reservations follow the title's memory");
+        } else if mode == 2 {
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_FOLLOW=2: textures in graphics reservations follow the title's memory whole (mapped while any of their pages has memory)");
+        } else if mode == 3 {
+            // LOCAL
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_FOLLOW=3: textures in graphics reservations follow the title's memory per subresource (a mip level's tiles mapped while any page of its console bytes has memory; packed mips together)");
+        }
+        unsafe { SetLastError(e) };
+        mode
+    })
+}
+
+/// LOCAL: the value of `XCL_TEXTURE_FOLLOW` → `follow_mode` (anything else: off).
+fn parse_follow_mode(v: Option<&str>) -> u8 {
+    match v.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        Some("3") => 3, // LOCAL
+        _ => 0,
+    }
+}
+
+/// LOCAL: whole-texture following (`XCL_TEXTURE_FOLLOW=2`).
+fn follow_whole() -> bool {
+    follow_mode() == 2
+}
+
+/// LOCAL (`XCL_TEXTURE_FOLLOW=2`): whether a texture followed whole is backed: any of its
+/// followed pages' `Follow::mapped`. None: no followed page (the texture does not follow).
+fn whole_backed(page_mapped: impl IntoIterator<Item = bool>) -> Option<bool> {
+    let mut any_page = false;
+    for m in page_mapped {
+        if m {
+            return Some(true);
+        }
+        any_page = true;
+    }
+    any_page.then_some(false)
+}
+
+/// LOCAL (`XCL_TEXTURE_FOLLOW=2`): what a texture followed whole changes to: Some(true) map all
+/// its tiles, Some(false) NULL them all, None nothing. `holds_tiles`: it holds pages now.
+fn whole_transition(backed: Option<bool>, holds_tiles: bool) -> Option<bool> {
+    match backed {
+        Some(b) if b != holds_tiles => Some(b),
+        _ => None,
+    }
+}
+
+/// LOCAL (`XCL_TEXTURE_FOLLOW=3`): a group of a followed texture's PC tiles – one PC subresource
+/// with tiles of its own, or all its packed mips (of every slice) – and the title's 64 KiB pages
+/// over the console bytes of the same subresource(s). Its tiles are mapped together while any of
+/// those pages has the title's memory (`group_backed`). A texture whose groups cannot be made
+/// (`follow_groups_of`) is one group over all its tiles and its followed pages (`whole_group`):
+/// `XCL_TEXTURE_FOLLOW=2`'s rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FollowGroup {
+    /// (first overall tile, count), within the resource's tiles
+    tiles: Vec<(u32, u32)>,
+    /// the title's page addresses overlapping the console bytes, ascending
+    pages: Vec<usize>,
+}
+
+/// LOCAL (`XCL_TEXTURE_FOLLOW=3`): a group of PC tiles: its subresources (D3D12 order: mip +
+/// slice × mips) and their tiles ((first overall tile, count)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TileGroup {
+    subs: Vec<usize>,
+    tiles: Vec<(u32, u32)>,
+}
+
+/// LOCAL (`XCL_TEXTURE_FOLLOW=3`): the PC's tile groups of a texture from GetResourceTiling:
+/// `subs[k]` the tiles of subresource k (Some((StartTileIndexInOverallResource, Width × Height
+/// × DepthInTiles)), None: packed), `mips` × `array` subresources, `standard` / `packed` the
+/// D3D12_PACKED_MIP_INFO mips, `packed_tiles` its NumTilesForPackedMips, `total` the
+/// resource's tiles. One group per standard subresource; the packed group takes the tiles no
+/// standard subresource has (each slice's packed tiles follow its standard mips), which must
+/// be `packed_tiles` per slice (or in all). None: the tiling does not partition `[0, total)` so.
+fn pc_tile_groups(subs: &[Option<(u32, u32)>], mips: usize, array: usize, standard: usize, packed: usize, packed_tiles: u32, total: u32) -> Option<Vec<TileGroup>> {
+    if mips == 0 || array == 0 || subs.len() != mips * array || standard + packed != mips {
+        return None;
+    }
+    let mut covered = vec![false; total as usize];
+    let mut out = Vec::new();
+    let mut packed_subs = Vec::new();
+    for s in 0..array {
+        for m in 0..mips {
+            let k = m + s * mips;
+            match (m < standard, subs[k]) {
+                (true, Some((start, count))) if count > 0 => {
+                    let end = start.checked_add(count).filter(|&e| e <= total)?;
+                    for c in &mut covered[start as usize..end as usize] {
+                        if std::mem::replace(c, true) {
+                            return None;
+                        }
+                    }
+                    out.push(TileGroup { subs: vec![k], tiles: vec![(start, count)] });
+                }
+                (false, None) => packed_subs.push(k),
+                _ => return None,
+            }
+        }
+    }
+    let mut rest: Vec<(u32, u32)> = Vec::new();
+    for (i, _) in covered.iter().enumerate().filter(|(_, c)| !**c) {
+        match rest.last_mut() {
+            Some(r) if r.0 + r.1 == i as u32 => r.1 += 1,
+            _ => rest.push((i as u32, 1)),
+        }
+    }
+    let n: u64 = rest.iter().map(|r| r.1 as u64).sum();
+    let ok = if packed == 0 { n == 0 } else { n == packed_tiles as u64 * array as u64 || n == packed_tiles as u64 };
+    if !ok {
+        return None;
+    }
+    if n > 0 {
+        out.push(TileGroup { subs: packed_subs, tiles: rest });
+    }
+    Some(out)
+}
+
+/// LOCAL (`XCL_TEXTURE_FOLLOW=3`): the console bytes of each subresource (D3D12 order) of a 2D
+/// surface `s` of a texture, from the texture's start (`at`: the surface's plane offset), as
+/// `gpu::tiling::Chain` lays a slice out: the mip tail block first (`[0, block_bytes)`, shared by
+/// every level in the tail), then the other levels from the smallest to mip 0 (level i up to the
+/// start of level i − 1, mip 0 up to `slice_bytes`); slices `slice_bytes` apart.
+fn console_sub_ranges(s: &crate::hle::xg::Surface, at: u64) -> Vec<(u64, u64)> {
+    let c = &s.chain;
+    let mips = c.levels.len();
+    let level = |i: usize| -> (u64, u64) {
+        if i >= s.first_tail {
+            (0, c.layout.block_bytes.min(c.slice_bytes) as u64)
+        } else {
+            let end = if i == 0 { c.slice_bytes } else { c.levels[i - 1].offset };
+            (c.levels[i].offset as u64, end as u64)
+        }
+    };
+    let mut out = Vec::with_capacity(mips * s.array as usize);
+    for slice in 0..s.array as u64 {
+        let base = at + slice * c.slice_bytes as u64;
+        for i in 0..mips {
+            let (lo, hi) = level(i);
+            out.push((base + lo, base + hi));
+        }
+    }
+    out
+}
+
+/// LOCAL (`XCL_TEXTURE_FOLLOW=3`): the tile groups of a texture at `va` with the title's pages
+/// over their subresources' console bytes (`ranges`, from `console_sub_ranges`). None: a
+/// subresource with no console range.
+fn follow_groups(tiles: Vec<TileGroup>, ranges: &[(u64, u64)], va: usize) -> Option<Vec<FollowGroup>> {
+    tiles
+        .into_iter()
+        .map(|g| {
+            let mut pages = Vec::new();
+            for &k in &g.subs {
+                let &(lo, hi) = ranges.get(k)?;
+                let (lo, hi) = (va.checked_add(usize::try_from(lo).ok()?)?, va.checked_add(usize::try_from(hi).ok()?)?);
+                let mut p = lo & !(PAGE - 1);
+                while p < hi {
+                    pages.push(p);
+                    p += PAGE;
+                }
+            }
+            pages.sort_unstable();
+            pages.dedup();
+            Some(FollowGroup { tiles: g.tiles, pages })
+        })
+        .collect()
+}
+
+/// LOCAL (`XCL_TEXTURE_FOLLOW=3`): whether a group is backed: any of its pages is (a page the
+/// texture does not follow counts as backed: nothing tells of its changes). No page: backed.
+fn group_backed(page_backed: impl IntoIterator<Item = bool>) -> bool {
+    let mut any_page = false;
+    for b in page_backed {
+        if b {
+            return true;
+        }
+        any_page = true;
+    }
+    !any_page
+}
+
+/// LOCAL (`XCL_TEXTURE_FOLLOW=3`): the group of a texture without subresource groups: all its
+/// `total` tiles, at its followed pages (mapped while any of them is backed, as mode 2).
+fn whole_group(total: u32, follows: &[usize]) -> FollowGroup {
+    FollowGroup { tiles: if total > 0 { vec![(0, total)] } else { Vec::new() }, pages: follows.to_vec() }
+}
+
+/// LOCAL (`XCL_TEXTURE_FOLLOW=3`): the subresource groups of the reserved texture `res` (`total`
+/// tiles) placed at `va` for the console texture `console` (its D3D12_RESOURCE_DESC as the
+/// console's, `console_bytes` its size there). None (followed whole instead): not a single-plane
+/// 2D texture whose console mips and slices are the PC's, or a tiling `pc_tile_groups` refuses.
+unsafe fn follow_groups_of(dev: &ID3D12Device, res: &ID3D12Resource, console: &[u8; 0x38], va: usize, console_bytes: Option<u64>, total: u32) -> Option<Vec<FollowGroup>> {
+    let tex = crate::hle::xg::Texture::new(console).ok()?;
+    if tex.planes.len() != 1 {
+        return None;
+    }
+    let (s, at) = tex.plane_surface(tex.main as u32)?;
+    let d = res.GetDesc();
+    let (mips, array) = (d.MipLevels as usize, d.DepthOrArraySize as usize);
+    if s.depth != 0 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || mips != s.chain.levels.len() || array != s.array as usize || total == 0 {
+        return None;
+    }
+    let ranges = console_sub_ranges(s, at);
+    let bytes = console_bytes?;
+    if ranges.iter().any(|r| r.0 >= r.1 || r.1 > bytes) {
+        return None;
+    }
+    let mut n = (mips * array) as u32;
+    let mut all = 0u32;
+    let mut packed = D3D12_PACKED_MIP_INFO::default();
+    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); n as usize];
+    dev.GetResourceTiling(res, Some(&mut all), Some(&mut packed), None, Some(&mut n), 0, tilings.as_mut_ptr());
+    if all != total || n as usize != mips * array {
+        return None;
+    }
+    let subs: Vec<Option<(u32, u32)>> = tilings
+        .iter()
+        .map(|t| (t.StartTileIndexInOverallResource != D3D12_PACKED_TILE).then(|| (t.StartTileIndexInOverallResource, t.WidthInTiles * t.HeightInTiles as u32 * t.DepthInTiles as u32)))
+        .collect();
+    let groups = pc_tile_groups(&subs, mips, array, packed.NumStandardMips as usize, packed.NumPackedMips as usize, packed.NumTilesForPackedMips, total)?;
+    follow_groups(groups, &ranges, va)
+}
+
+/// LOCAL (#1514): an owned page of placed textures in a graphics reservation: mapped only while
+/// the title has memory there (committed, a physical page, or one mapped but not yet touched).
+struct Follow {
+    /// (texture, its tile at this page: the tile's index in the whole resource)
+    users: Vec<(usize, u32)>,
+    /// whether the textures' tiles there are on a page of video memory
+    mapped: bool,
+}
+
+/// LOCAL (#1514): ranges of title memory a graphics reservation gained or lost memory in since
+/// the last submit (`title_memory_changed`): the pages there are mapped or unmapped before the
+/// next one.
+static BACKING: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+/// LOCAL (#1514 port review): textures a page was mapped for again by `apply_backing`. The
+/// tile may be recycled (another texture's texels) and the title may not write the page, so
+/// `title_textures` uploads each whole at this submit (`take_reupload`).
+static REUPLOAD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static TITLE_SUBMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// LOCAL: `before_execute` for the title's own submit (`title_textures::refresh_once`): only it
+/// applies what the title changed of its memory to followed textures, as it then uploads the
+/// textures whose tiles turned on (`take_reupload`) before the title's lists run.
+pub(super) unsafe fn before_title_execute(queue: &ID3D12CommandQueue) {
+    TITLE_SUBMIT.with(|c| c.set(true));
+    before_execute(queue);
+    TITLE_SUBMIT.with(|c| c.set(false));
+}
+
+pub(super) fn take_reupload() -> Vec<usize> {
+    std::mem::take(&mut *REUPLOAD.lock().unwrap())
+}
+
+/// LOCAL: only textures whose PC tile i covers the bytes of console page i follow: one level,
+/// one slice (the console keeps the mip tail first, the PC last – veyn-sudo on #1514).
+unsafe fn follows_by_page(res: &ID3D12Resource) -> bool {
+    let d = res.GetDesc();
+    d.MipLevels == 1 && d.DepthOrArraySize == 1 && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+}
+/// LOCAL (#1514): counts for the log: tiles left unmapped by `bind`, and tiles mapped and
+/// unmapped by `apply_backing`
+static FOLLOW_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// LOCAL (#1514): the title committed, mapped, decommitted or unmapped `[a, a + n)` of a graphics
+/// reservation: the texture pages there follow it before the title's next submit
+/// (`before_execute`). Nothing without `XCL_TEXTURE_FOLLOW=1`.
+pub fn title_memory_changed(a: usize, n: usize) {
+    if following() {
+        note_changed(a, n);
+    }
+}
+
+/// LOCAL (#1514): `title_memory_changed` past the switch. A CPU view's change is its GPU view's
+/// too, and a GPU view's the CPU view's (a texture placed in a GPU view with nothing mapped there
+/// is at the CPU view's address, `canonical_va`). (from 3L1A5-1's d656862a)
+fn note_changed(a: usize, n: usize) {
+    if n == 0 {
+        return;
+    }
+    // (the views are asked before `BACKING` is taken: `map_pages` calls this with `AWAY` held)
+    let gpu = crate::hle::kernelx::mirrors::gpu_views_of(a);
+    let cpu = crate::hle::kernelx::mirrors::source(a);
+    let mut b = BACKING.lock().unwrap();
+    b.push((a, n));
+    b.extend(gpu.into_iter().chain(cpu).map(|x| (x, n)));
+}
+
+/// LOCAL (#1514): whether the title has memory at the 64 KiB page `a`: committed, a physical page
+/// mapped there, or one mapped and not touched yet (`lazy`). A GPU view of the title's CPU memory
+/// (`kernelx::mirrors`) shows what the queue's page-mapping method put under it, else a physical
+/// page mapped there, else the memory of the CPU view behind it; an address of a CPU view (where
+/// a texture of its GPU view is placed while nothing is mapped there, `canonical_va`) is backed
+/// also when a GPU view of it shows memory. (3L1A5-1's d656862a form)
+fn title_backed(a: usize) -> bool {
+    use crate::hle::kernelx::{lazy, mirrors, physical_page_at};
+    // what a GPU-view address shows (None: nothing says; the CPU view then)
+    let shown = |g: usize| match mirrors::mapped_source(g) {
+        Some(m) => Some(m.is_some()),
+        None => physical_page_at(g).then_some(true),
+    };
+    if let Some(b) = shown(a) {
+        return b;
+    }
+    let src = mirrors::source(a).unwrap_or(a);
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let committed = unsafe { VirtualQuery(src as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
+    committed || lazy::is_lazy(src) || physical_page_at(src) || (src == a && mirrors::gpu_views_of(a).into_iter().any(|g| shown(g) == Some(true)))
+}
+
+/// LOCAL (#1514): the ranges of one UpdateTileMappings call over all `total` tiles of a resource:
+/// `sel(i)` is the heap offset of tile i when this call sets it (Some), else it is skipped.
+/// `flag` for the set runs (NONE: onto a heap; NULL: unmapped).
+fn update_ranges(total: u32, flag: D3D12_TILE_RANGE_FLAGS, sel: impl Fn(u32) -> Option<u32>) -> Vec<(D3D12_TILE_RANGE_FLAGS, u32, u32)> {
+    let mut out: Vec<(D3D12_TILE_RANGE_FLAGS, u32, u32)> = Vec::new();
+    for i in 0..total {
+        match (sel(i), out.last_mut()) {
+            (Some(o), Some(r)) if r.0 == flag && (flag == D3D12_TILE_RANGE_FLAG_NULL || r.1 + r.2 == o) => r.2 += 1,
+            (Some(o), _) => out.push((flag, if flag == D3D12_TILE_RANGE_FLAG_NULL { 0 } else { o }, 1)),
+            (None, Some(r)) if r.0 == D3D12_TILE_RANGE_FLAG_SKIP => r.2 += 1,
+            (None, _) => out.push((D3D12_TILE_RANGE_FLAG_SKIP, 0, 1)),
+        }
+    }
+    out
 }
 
 /// Where a texture's T# was at the last look at the console view heaps.
@@ -575,6 +941,8 @@ struct Pages {
     evict_idle_until: Option<std::time::Instant>,
     /// page budget: pool heaps the pages may take (`pool_cap`; 0: no limit)
     cap: usize,
+    /// LOCAL (#1514): owned pages of textures in graphics reservations → their textures (`Follow`)
+    follow: std::collections::HashMap<usize, Follow>,
 }
 
 // D3D12 objects are free-threaded
@@ -615,6 +983,7 @@ impl Pages {
             scratch_counts: Vec::new(),
             evict_idle_until: None,
             cap: pool_cap(),
+            follow: std::collections::HashMap::new(),
         })
     }
 
@@ -680,13 +1049,15 @@ impl Pages {
         }
     }
 
-    /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
+    /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap. LOCAL
+    /// (#1514): a tile `NO_TILE` is skipped (stays unmapped).
     unsafe fn map(&mut self, res: &ID3D12Resource, tiles: &[Tile]) {
+        super::real::crumb(false, || format!("vram map {:p} x{}", res.as_raw(), tiles.len())); // LOCAL
         if tiles.is_empty() {
             return;
         }
         self.scratch_heaps.clear();
-        self.scratch_heaps.extend(tiles.iter().map(|t| t.0));
+        self.scratch_heaps.extend(tiles.iter().map(|t| t.0).filter(|&h| h != NO_TILE.0));
         self.scratch_heaps.sort_unstable();
         self.scratch_heaps.dedup();
         for i in 0..self.scratch_heaps.len() {
@@ -727,6 +1098,7 @@ impl Pages {
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
     /// to the pool even while the title keeps the COM object alive.
     unsafe fn unmap(&mut self, res: &ID3D12Resource, total: u32) {
+        super::real::crumb(false, || format!("vram unmap {:p} x{total}", res.as_raw())); // LOCAL
         if total == 0 {
             return;
         }
@@ -823,12 +1195,14 @@ impl Pages {
             let total = t.total;
             let used = std::mem::take(&mut t.used);
             let used_extra = std::mem::take(&mut t.used_extra);
+            let follows = std::mem::take(&mut t.follows); // LOCAL (#1514)
             t.mapped = false;
             let raw = key as *mut c_void;
             if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
                 self.unmap(res, total);
             }
             self.release_tiles(used, used_extra, now, true);
+            self.unfollow(key, &follows); // LOCAL (#1514)
             evicted.push(key);
         }
         let freed = self.pool.free_total + self.pool.cooling.len() - before;
@@ -854,15 +1228,95 @@ impl Pages {
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue
     /// (`phys[i]`: the title's physical page at owned page i, if any – see `page_key`).
     /// The bool is true when every tile was newly taken rather than shared with an existing page.
-    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, phys: &[Option<usize>]) -> Option<(Vec<usize>, Vec<(usize, usize)>, bool)> {
+    /// LOCAL (#1514): with `follow` (`XCL_TEXTURE_FOLLOW=1`, a sampled texture `key`), an owned
+    /// page in a graphics reservation the title has no memory at yet is left unmapped (tier 2:
+    /// reads zero) and mapped when the title puts memory there (`apply_backing`); the pages
+    /// followed so are returned last.
+    #[allow(clippy::too_many_arguments)]
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=3`): with `follow`, the tiles of each group in `groups` (None:
+    /// one group of all tiles, `whole_group`) are left unmapped while the group is not backed.
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, key: usize, va: usize, console_bytes: Option<u64>, total: u32, phys: &[Option<usize>], follow: bool, groups: Option<&[FollowGroup]>) -> Option<(Vec<usize>, Vec<(usize, usize)>, bool, Vec<usize>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
+
+        // LOCAL (#1514): the owned pages in graphics reservations are followed; those whose
+        // `Follow` is not mapped are left unmapped: no video memory taken for them. A new
+        // `Follow` starts as the title's memory and other textures there are now; a texture
+        // placed at a page already followed takes its state, so a backing change queued for the
+        // next submit reaches all of them together (Filip722's 9c553339)
+        let mut follows = Vec::new();
+        let mut unbacked = Vec::new();
+        if follow {
+            unbacked = vec![false; total as usize];
+            for (i, u) in unbacked.iter_mut().enumerate().take(own) {
+                let a = first + i * PAGE;
+                if !crate::hle::kernelx::in_graphics_reservation(a) {
+                    continue;
+                }
+                follows.push(a);
+                // (LOCAL, mode 3: the tile keyed at `a` holds no texels of page `a`: not a sign
+                // the title has memory there)
+                let shared = self.pages.get(&a).is_some_and(|p| p.users > 0) && follow_mode() != 3;
+                let f = self.follow.entry(a).or_insert_with(|| Follow { users: Vec::new(), mapped: shared || title_backed(a) });
+                f.users.push((key, i as u32));
+                *u = !f.mapped;
+            }
+            // LOCAL (`XCL_TEXTURE_FOLLOW=2`): the whole texture is mapped while any followed page
+            // is backed, else every tile (extra ones too) is NULL
+            if follow_whole() {
+                if let Some(backed) = whole_backed(follows.iter().map(|a| self.follow.get(a).is_some_and(|f| f.mapped))) {
+                    unbacked.fill(!backed);
+                }
+            } else if follow_mode() == 3 {
+                // LOCAL (`XCL_TEXTURE_FOLLOW=3`): per group, not per page
+                unbacked.fill(false);
+                // a group's pages in graphics reservations past the owned ones (the unaligned
+                // head page; pages past `total` tiles, where the console keeps mip 0) are
+                // followed too: counted as backed unfollowed, they pinned their groups mapped
+                if let Some(gs) = groups {
+                    let mut more: Vec<usize> = gs.iter().flat_map(|g| g.pages.iter().copied()).filter(|a| follows.binary_search(a).is_err()).collect();
+                    more.sort_unstable();
+                    more.dedup();
+                    for a in more {
+                        if !crate::hle::kernelx::in_graphics_reservation(a) {
+                            continue;
+                        }
+                        let f = self.follow.entry(a).or_insert_with(|| Follow { users: Vec::new(), mapped: title_backed(a) });
+                        // (no tile of its own: mode 3 does not read it)
+                        f.users.push((key, u32::MAX));
+                        follows.push(a);
+                    }
+                    follows.sort_unstable();
+                }
+                let whole;
+                let gs: &[FollowGroup] = match groups {
+                    Some(g) => g,
+                    None => {
+                        whole = [whole_group(total, &follows)];
+                        &whole
+                    }
+                };
+                for g in gs {
+                    if !self.group_backed_now(g, &follows) {
+                        for &(s, c) in &g.tiles {
+                            if let Some(u) = unbacked.get_mut(s as usize..(s as usize + c as usize)) {
+                                u.fill(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let unbacked_at = |i: usize| unbacked.get(i).copied().unwrap_or(false);
 
         let count = |pages: &std::collections::HashMap<usize, Page>, extra_pages: &std::collections::HashMap<(usize, usize), Page>| {
             let mut missing = 0usize;
             let mut preferred: Option<u32> = None;
             for i in 0..total as usize {
+                if unbacked_at(i) {
+                    continue;
+                }
                 let existing = if i < own {
                     pages.get(&page_key(first + i * PAGE, phys.get(i).copied().flatten())).map(|p| p.tile.0)
                 } else {
@@ -892,17 +1346,27 @@ impl Pages {
         }
         let pools = &mut self.pools;
         let pool = &mut self.pool;
-        let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
+        let Some(fresh) = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
             let heap = alloc_pool_heap(dev)?;
             Some(pools.push_heap(heap))
-        })?;
+        }) else {
+            self.unfollow(key, &follows); // LOCAL (#1514)
+            return None;
+        };
         let mut fresh_iter = fresh.into_iter();
 
         let mut tiles = Vec::with_capacity(total as usize);
         let mut used = Vec::with_capacity(own);
         let mut used_extra = Vec::new();
         let mut reused = false;
+        let mut left = 0u64;
         for i in 0..total as usize {
+            // LOCAL (#1514): a followed page the title has no memory at
+            if unbacked_at(i) {
+                tiles.push(NO_TILE);
+                left += 1;
+                continue;
+            }
             let tile = if i < own {
                 let a = page_key(first + i * PAGE, phys.get(i).copied().flatten());
                 let t = match self.pages.get_mut(&a) {
@@ -941,7 +1405,428 @@ impl Pages {
             tiles.push(tile);
         }
         self.map(res, &tiles);
-        Some((used, used_extra, !reused))
+        if left > 0 {
+            FOLLOW_STATS[0].fetch_add(left, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some((used, used_extra, !reused, follows))
+    }
+
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=3`): whether group `g` of a texture following the pages
+    /// `follows` (ascending) is backed now: any of its pages followed and `Follow::mapped`, or
+    /// not followed.
+    fn group_backed_now(&self, g: &FollowGroup, follows: &[usize]) -> bool {
+        group_backed(g.pages.iter().map(|a| follows.binary_search(a).is_err() || self.follow.get(a).is_some_and(|f| f.mapped)))
+    }
+
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=3`): the groups of mapped texture `k` whose backing differs
+    /// from what it holds (a group's tiles are held all or none: its first tile tells), each with
+    /// whether it is to be mapped.
+    fn group_flips(&self, k: usize) -> Vec<(FollowGroup, bool)> {
+        let Some(t) = self.targets.get(&k).filter(|t| t.mapped && !t.follows.is_empty()) else { return Vec::new() };
+        let Some((first, own)) = owned_pages(t.va, t.console_bytes, t.total as usize) else { return Vec::new() };
+        let whole;
+        let gs: &[FollowGroup] = match &t.groups {
+            Some(g) => g,
+            None => {
+                whole = [whole_group(t.total, &t.follows)];
+                &whole
+            }
+        };
+        let used: HashSet<usize> = t.used.iter().copied().collect();
+        let used_extra: HashSet<(usize, usize)> = t.used_extra.iter().copied().collect();
+        gs.iter()
+            .filter_map(|g| {
+                let j = g.tiles.first()?.0 as usize;
+                let holds = if j < own { used.contains(&(first + j * PAGE)) } else { used_extra.contains(&(t.va, j)) };
+                let backed = self.group_backed_now(g, &t.follows);
+                (backed != holds).then(|| (g.clone(), backed))
+            })
+            .collect()
+    }
+
+    /// LOCAL (#1514): texture `key` no longer at its followed pages `addrs`.
+    fn unfollow(&mut self, key: usize, addrs: &[usize]) {
+        for a in addrs {
+            if let Some(f) = self.follow.get_mut(a) {
+                f.users.retain(|u| u.0 != key);
+                if f.users.is_empty() {
+                    self.follow.remove(a);
+                }
+            }
+        }
+    }
+
+    /// LOCAL (#1514): the followed pages in `ranges` mapped where the title has memory now and
+    /// unmapped where it has none (their video memory idle, reused if the title maps there again
+    /// within `IDLE`): one UpdateTileMappings per texture and heap, then the fence signalled.
+    /// The page budget makes room for the new tiles once, before any texture is changed (an
+    /// eviction changes the textures and pages looked at here).
+    unsafe fn apply_backing(&mut self, dev: &ID3D12Device, ranges: &[(usize, usize)]) {
+        let mut addrs: Vec<usize> = Vec::new();
+        for &(a, n) in ranges {
+            let mut p = a & !(PAGE - 1);
+            while p < a.saturating_add(n) {
+                if self.follow.contains_key(&p) {
+                    addrs.push(p);
+                }
+                p += PAGE;
+            }
+        }
+        if addrs.is_empty() {
+            return;
+        }
+        addrs.sort_unstable();
+        addrs.dedup();
+        if follow_whole() {
+            self.apply_backing_whole(dev, &addrs); // LOCAL
+            return;
+        }
+        if follow_mode() == 3 {
+            self.apply_backing_groups(dev, &addrs); // LOCAL
+            return;
+        }
+        // (page, whether the title has memory there now) where that differs from the mapping
+        let flips: Vec<(usize, bool)> = addrs.into_iter().filter_map(|a| {
+            let mapped = self.follow.get(&a)?.mapped;
+            let backed = title_backed(a);
+            (backed != mapped).then_some((a, backed))
+        }).collect();
+        if flips.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let need = flips.iter().filter(|&&(a, backed)| backed && !self.pages.contains_key(&a)).count();
+        if need > 0 {
+            self.budget_room(need, now);
+        }
+        let (mut on, mut off) = (0u64, 0u64);
+        let mut retry: Vec<(usize, usize)> = Vec::new();
+        // texture → (tile, its new page or None: unmapped)
+        let mut changes: std::collections::HashMap<usize, Vec<(u32, Option<Tile>)>> = std::collections::HashMap::new();
+        for (a, backed) in flips {
+            // (an eviction above may have taken some of them, or all)
+            let Some(f) = self.follow.get(&a) else { continue };
+            // the textures that are mapped now (an unmapped one is bound again by `bind`)
+            let users: Vec<(usize, u32)> = f.users.iter().copied().filter(|u| self.targets.get(&u.0).is_some_and(|t| t.mapped)).collect();
+            if backed && !users.is_empty() {
+                let tile = match self.pages.get_mut(&a) {
+                    Some(p) => {
+                        p.idle_since = None;
+                        p.tile
+                    }
+                    None => {
+                        let pools = &mut self.pools;
+                        let taken = self.pool.take_batch(1, None, now, POOL_PAGES, || {
+                            let heap = alloc_pool_heap(dev)?;
+                            Some(pools.push_heap(heap))
+                        });
+                        // (none: tried again at the next submit – LOCAL, review)
+                        let Some(t) = taken.and_then(|v| v.first().copied()) else {
+                            retry.push((a, PAGE));
+                            continue;
+                        };
+                        self.pages.insert(a, Page { tile: t, users: 0, idle_since: None });
+                        t
+                    }
+                };
+                for &(k, i) in &users {
+                    if let Some(t) = self.targets.get_mut(&k) {
+                        t.used.push(a);
+                        if let Some(p) = self.pages.get_mut(&a) {
+                            p.users += 1;
+                        }
+                        changes.entry(k).or_default().push((i, Some(tile)));
+                        REUPLOAD.lock().unwrap().push(k);
+                        on += 1;
+                    }
+                }
+            } else if !backed {
+                for &(k, i) in &users {
+                    if let Some(t) = self.targets.get_mut(&k) {
+                        if let Some(at) = t.used.iter().position(|&u| u == a) {
+                            t.used.swap_remove(at);
+                            self.release_tiles(vec![a], Vec::new(), now, false);
+                        }
+                        changes.entry(k).or_default().push((i, None));
+                        off += 1;
+                    }
+                }
+            }
+            if let Some(f) = self.follow.get_mut(&a) {
+                f.mapped = backed;
+            }
+        }
+        if !retry.is_empty() {
+            BACKING.lock().unwrap().extend(retry);
+        }
+        FOLLOW_STATS[1].fetch_add(on, std::sync::atomic::Ordering::Relaxed);
+        FOLLOW_STATS[2].fetch_add(off, std::sync::atomic::Ordering::Relaxed);
+        if changes.is_empty() {
+            return;
+        }
+        self.update_tiles(changes); // LOCAL: shared with `apply_backing_groups`
+    }
+
+    /// LOCAL (#1514): for each texture in `changes` its tiles (tile, its new page or None:
+    /// unmapped): one UpdateTileMappings per texture and heap (and one for the NULL ones), then
+    /// the fence signalled.
+    unsafe fn update_tiles(&mut self, changes: std::collections::HashMap<usize, Vec<(u32, Option<Tile>)>>) {
+        for (k, tiles) in changes {
+            let Some(total) = self.targets.get(&k).filter(|t| t.mapped).map(|t| t.total) else { continue };
+            let raw = k as *mut c_void;
+            let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
+            let at: std::collections::HashMap<u32, Option<Tile>> = tiles.into_iter().collect();
+            let mut heaps: Vec<u32> = at.values().flatten().map(|t| t.0).collect();
+            heaps.sort_unstable();
+            heaps.dedup();
+            let mut calls: Vec<(Option<u32>, Vec<(D3D12_TILE_RANGE_FLAGS, u32, u32)>)> = heaps
+                .into_iter()
+                .map(|h| (Some(h), update_ranges(total, D3D12_TILE_RANGE_FLAG_NONE, |i| at.get(&i).copied().flatten().filter(|t| t.0 == h).map(|t| t.1))))
+                .collect();
+            if at.values().any(|t| t.is_none()) {
+                calls.push((None, update_ranges(total, D3D12_TILE_RANGE_FLAG_NULL, |i| at.get(&i).filter(|t| t.is_none()).map(|_| 0))));
+            }
+            for (h, mut ranges) in calls {
+                // (only up to the last tile set, as `heap_ranges_trimmed`)
+                while ranges.last().is_some_and(|r| r.0 == D3D12_TILE_RANGE_FLAG_SKIP) {
+                    ranges.pop();
+                }
+                let num: u32 = ranges.iter().map(|r| r.2).sum();
+                if num == 0 {
+                    continue;
+                }
+                let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+                let region = D3D12_TILE_REGION_SIZE { NumTiles: num, UseBox: false.into(), ..Default::default() };
+                let flags: Vec<D3D12_TILE_RANGE_FLAGS> = ranges.iter().map(|r| r.0).collect();
+                let offsets: Vec<u32> = ranges.iter().map(|r| r.1).collect();
+                let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
+                self.queue.UpdateTileMappings(
+                    res,
+                    1,
+                    Some(&coord),
+                    Some(&region),
+                    h.map(|h| &self.pools[h as usize]),
+                    ranges.len() as u32,
+                    Some(flags.as_ptr()),
+                    Some(offsets.as_ptr()),
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+        }
+        self.value += 1;
+        let _ = self.queue.Signal(&self.fence, self.value);
+    }
+
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=2`): `apply_backing` for textures followed whole. Each
+    /// followed page in `addrs` takes the title's memory state; each mapped texture there is
+    /// then mapped whole while any of its followed pages is backed (`bind` without following,
+    /// and uploaded whole: `REUPLOAD`), and NULLed whole otherwise (its pages idle, as the
+    /// per-page path's). What it is now is what it holds (no `used`/`used_extra`: NULL), so
+    /// every texture at a page in `addrs` is looked at, not only those at pages that flipped:
+    /// one whose tiles could not be taken is tried again at the next submit (`BACKING`).
+    unsafe fn apply_backing_whole(&mut self, dev: &ID3D12Device, addrs: &[usize]) {
+        let mut keys: Vec<usize> = Vec::new();
+        for &a in addrs {
+            let backed = title_backed(a);
+            if let Some(f) = self.follow.get_mut(&a) {
+                f.mapped = backed;
+                keys.extend(f.users.iter().map(|u| u.0));
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let now = std::time::Instant::now();
+        let (mut on, mut off) = (0u64, 0u64);
+        let mut retry: Vec<(usize, usize)> = Vec::new();
+        let mut reupload: Vec<usize> = Vec::new();
+        for k in keys {
+            // (looked up again for each: a `bind` below may evict textures for room)
+            let Some(t) = self.targets.get(&k).filter(|t| t.mapped && !t.follows.is_empty()) else { continue };
+            let holds = !t.used.is_empty() || !t.used_extra.is_empty();
+            let backed = whole_backed(t.follows.iter().map(|a| self.follow.get(a).is_some_and(|f| f.mapped)));
+            let Some(to) = whole_transition(backed, holds) else { continue };
+            let (va, console_bytes, total) = (t.va, t.console_bytes, t.total);
+            let raw = k as *mut c_void;
+            let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
+            if to {
+                // (takes the pages still there, makes budget room for the rest, maps every tile)
+                match self.bind(dev, res, k, va, console_bytes, total, &[], false, None) {
+                    Some((used, used_extra, _, _)) => {
+                        if let Some(t) = self.targets.get_mut(&k) {
+                            t.used = used;
+                            t.used_extra = used_extra;
+                        }
+                        reupload.push(k);
+                        on += total as u64;
+                    }
+                    None => {
+                        if let Some(t) = self.targets.get(&k) {
+                            retry.extend(t.follows.iter().map(|&a| (a, PAGE)));
+                        }
+                    }
+                }
+            } else {
+                let Some(t) = self.targets.get_mut(&k) else { continue };
+                let used = std::mem::take(&mut t.used);
+                let used_extra = std::mem::take(&mut t.used_extra);
+                self.unmap(res, total);
+                self.release_tiles(used, used_extra, now, false);
+                off += total as u64;
+            }
+        }
+        if !retry.is_empty() {
+            BACKING.lock().unwrap().extend(retry);
+        }
+        if !reupload.is_empty() {
+            REUPLOAD.lock().unwrap().extend(reupload);
+        }
+        FOLLOW_STATS[1].fetch_add(on, std::sync::atomic::Ordering::Relaxed);
+        FOLLOW_STATS[2].fetch_add(off, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=3`): `apply_backing` per subresource group. Each followed page
+    /// in `addrs` takes the title's memory state; each mapped texture there then has every group
+    /// whose backing differs from what it holds (`group_flips`) changed: a group backed now takes
+    /// its tiles (the pages still there under their keys, fresh tiles for the rest; the texture
+    /// uploaded whole: `REUPLOAD`), one not backed has them NULLed and released (idle, as the
+    /// per-page path's). A group whose tiles could not be taken is tried again at the next submit
+    /// (`BACKING`). The page budget makes room once, before any texture is changed.
+    unsafe fn apply_backing_groups(&mut self, dev: &ID3D12Device, addrs: &[usize]) {
+        let mut keys: Vec<usize> = Vec::new();
+        for &a in addrs {
+            let backed = title_backed(a);
+            if let Some(f) = self.follow.get_mut(&a) {
+                f.mapped = backed;
+                keys.extend(f.users.iter().map(|u| u.0));
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let now = std::time::Instant::now();
+        let tiles_of = |g: &FollowGroup| -> Vec<usize> { g.tiles.iter().flat_map(|&(s, c)| s as usize..s as usize + c as usize).collect() };
+        // the tiles to take: those of groups turning on that are not still there under their keys
+        // (deduplicated: aliased textures share keys) – LOCAL, review: counting every tile made
+        // the page budget evict far more than needed
+        let need: usize = {
+            let mut want: std::collections::HashSet<Result<usize, (usize, usize)>> = std::collections::HashSet::new();
+            for &k in &keys {
+                let Some(t) = self.targets.get(&k) else { continue };
+                let Some((first, own)) = owned_pages(t.va, t.console_bytes, t.total as usize) else { continue };
+                let va = t.va;
+                for (g, to) in self.group_flips(k) {
+                    if !to {
+                        continue;
+                    }
+                    for j in tiles_of(&g) {
+                        let key = if j < own { Ok(first + j * PAGE) } else { Err((va, j)) };
+                        let there = match key {
+                            Ok(a) => self.pages.contains_key(&a),
+                            Err(e) => self.extra_pages.contains_key(&e),
+                        };
+                        if !there {
+                            want.insert(key);
+                        }
+                    }
+                }
+            }
+            want.len()
+        };
+        if need > 0 {
+            self.budget_room(need, now);
+        }
+        let (mut on, mut off) = (0u64, 0u64);
+        let mut retry: Vec<(usize, usize)> = Vec::new();
+        let mut reupload: Vec<usize> = Vec::new();
+        let mut changes: std::collections::HashMap<usize, Vec<(u32, Option<Tile>)>> = std::collections::HashMap::new();
+        for k in keys {
+            // (looked at again: an eviction above may have unmapped it)
+            let flips = self.group_flips(k);
+            let Some(t) = self.targets.get(&k).filter(|_| !flips.is_empty()) else { continue };
+            let (va, follows) = (t.va, t.follows.clone());
+            let Some((first, own)) = owned_pages(t.va, t.console_bytes, t.total as usize) else { continue };
+            // tile j's bookkeeping key (`Target::groups`)
+            let key_of = |j: usize| if j < own { Ok(first + j * PAGE) } else { Err((va, j)) };
+            for (g, to) in flips {
+                let js = tiles_of(&g);
+                if to {
+                    let missing = js
+                        .iter()
+                        .filter(|&&j| match key_of(j) {
+                            Ok(a) => !self.pages.contains_key(&a),
+                            Err(e) => !self.extra_pages.contains_key(&e),
+                        })
+                        .count();
+                    let pools = &mut self.pools;
+                    let taken = self.pool.take_batch(missing, None, now, POOL_PAGES, || {
+                        let heap = alloc_pool_heap(dev)?;
+                        Some(pools.push_heap(heap))
+                    });
+                    let Some(fresh) = taken else {
+                        retry.extend(g.pages.iter().filter(|a| follows.binary_search(a).is_ok()).map(|&a| (a, PAGE)));
+                        continue;
+                    };
+                    let mut fresh = fresh.into_iter();
+                    let (mut used, mut used_extra) = (Vec::new(), Vec::new());
+                    let set = changes.entry(k).or_default();
+                    for &j in &js {
+                        let p = match key_of(j) {
+                            Ok(a) => {
+                                used.push(a);
+                                self.pages.entry(a).or_insert_with(|| Page { tile: fresh.next().unwrap(), users: 0, idle_since: None })
+                            }
+                            Err(e) => {
+                                used_extra.push(e);
+                                self.extra_pages.entry(e).or_insert_with(|| Page { tile: fresh.next().unwrap(), users: 0, idle_since: None })
+                            }
+                        };
+                        p.users += 1;
+                        p.idle_since = None;
+                        set.push((j as u32, Some(p.tile)));
+                    }
+                    if let Some(t) = self.targets.get_mut(&k) {
+                        t.used.extend(used);
+                        t.used_extra.extend(used_extra);
+                    }
+                    reupload.push(k);
+                    on += js.len() as u64;
+                } else {
+                    let (mut gone, mut gone_extra) = (HashSet::new(), HashSet::new());
+                    for &j in &js {
+                        match key_of(j) {
+                            Ok(a) => gone.insert(a),
+                            Err(e) => gone_extra.insert(e),
+                        };
+                    }
+                    let Some(t) = self.targets.get_mut(&k) else { continue };
+                    let (mut rel, mut rel_extra) = (Vec::new(), Vec::new());
+                    t.used.retain(|a| !gone.contains(a) || {
+                        rel.push(*a);
+                        false
+                    });
+                    t.used_extra.retain(|e| !gone_extra.contains(e) || {
+                        rel_extra.push(*e);
+                        false
+                    });
+                    self.release_tiles(rel, rel_extra, now, false);
+                    changes.entry(k).or_default().extend(js.iter().map(|&j| (j as u32, None)));
+                    off += js.len() as u64;
+                }
+            }
+        }
+        if !retry.is_empty() {
+            BACKING.lock().unwrap().extend(retry);
+        }
+        reupload.dedup();
+        if !reupload.is_empty() {
+            REUPLOAD.lock().unwrap().extend(reupload);
+        }
+        FOLLOW_STATS[1].fetch_add(on, std::sync::atomic::Ordering::Relaxed);
+        FOLLOW_STATS[2].fetch_add(off, std::sync::atomic::Ordering::Relaxed);
+        changes.retain(|_, v| !v.is_empty());
+        if !changes.is_empty() {
+            self.update_tiles(changes);
+        }
     }
 }
 
@@ -1116,6 +2001,7 @@ unsafe fn place_on_pages(
     clear: *const c_void,
     console_bytes: Option<u64>,
     require_aligned: bool,
+    console: Option<&[u8; 0x38]>, // LOCAL (`XCL_TEXTURE_FOLLOW=3`): the console's desc
     riid: *const windows_sys::core::GUID,
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
@@ -1156,12 +2042,20 @@ unsafe fn place_on_pages(
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
     dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+    // LOCAL (`XCL_TEXTURE_FOLLOW=3`): the subresource groups (outside `PAGES` too); None: whole
+    let groups = if follow_mode() == 3 && !require_aligned {
+        console.and_then(|c| follow_groups_of(dev, res, c, va, console_bytes, total)).map(std::sync::Arc::new)
+    } else {
+        None
+    };
     let bound = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
-            if let Some((used, used_extra, fresh)) = pages.bind(dev, res, va, console_bytes, total, &phys) {
+            // LOCAL (#1514): only sampled textures follow the title's memory
+            let follow = following() && !require_aligned && (follow_whole() || follow_mode() == 3 || follows_by_page(res)); // LOCAL: any shape whole / per group
+            if let Some((used, used_extra, fresh, follows)) = pages.bind(dev, res, raw as usize, va, console_bytes, total, &phys, follow, groups.as_deref().map(|g| g.as_slice())) {
                 let after_map = fresh.then(|| (pages.fence.clone(), pages.value));
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, touched: std::time::Instant::now(), gpu_owned: require_aligned, seen: Seen::None });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, touched: std::time::Instant::now(), gpu_owned: require_aligned, seen: Seen::None, follows, groups });
                 Some((fresh, after_map))
             } else {
                 None
@@ -1196,9 +2090,11 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
         let total = t.total;
         let used = std::mem::take(&mut t.used);
         let used_extra = std::mem::take(&mut t.used_extra);
+        let follows = std::mem::take(&mut t.follows); // LOCAL (#1514)
         t.mapped = false;
         pages.unmap(res, total);
         pages.release_tiles(used, used_extra, now, true);
+        pages.unfollow(key, &follows); // LOCAL (#1514)
         return;
     }
 }
@@ -1222,17 +2118,20 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     }
     let phys = physical_pages_under(va, console_bytes, gpu_owned);
     let mut g = PAGES.lock().unwrap();
-    let Some((va, console_bytes, total, mapped, _)) = target(&mut g) else { return false };
+    let Some((va, console_bytes, total, mapped, gpu_owned)) = target(&mut g) else { return false };
     if mapped {
         return true;
     }
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
-    let Some((used, used_extra, _)) = pages.bind(&dev, res, va, console_bytes, total, &phys) else {
+    let follow = following() && !gpu_owned && (follow_whole() || follow_mode() == 3 || follows_by_page(res)); // LOCAL (#1514; any shape whole / per group)
+    let groups = pages.targets.get(&key).and_then(|t| t.groups.clone()); // LOCAL (`XCL_TEXTURE_FOLLOW=3`)
+    let Some((used, used_extra, _, follows)) = pages.bind(&dev, res, key, va, console_bytes, total, &phys, follow, groups.as_deref().map(|g| g.as_slice())) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
         t.used = used;
         t.used_extra = used_extra;
+        t.follows = follows; // LOCAL (#1514)
         t.mapped = true;
         t.touched = std::time::Instant::now();
     }
@@ -1362,6 +2261,7 @@ fn forget_pages(resource: usize) {
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
         }
+        pages.unfollow(resource, &t.follows); // LOCAL (#1514)
         drop(g);
         if let Some(s) = EVICTED.lock().unwrap().as_mut() {
             s.remove(&resource);
@@ -1468,9 +2368,22 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut newly_reclaimed = Vec::new();
     let mut do_reclaim = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
+    // LOCAL (#1514 port review): taken even when this device has no pages yet, so it never grows
+    // (only before the title's own submit, `before_title_execute`: that path uploads the textures
+    // whose tiles turn on in the same submit – LOCAL, review)
+    let mut changed_all = if following() && TITLE_SUBMIT.with(|c| c.get()) { std::mem::take(&mut *BACKING.lock().unwrap()) } else { Vec::new() };
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
+            // LOCAL (#1514, XCL_TEXTURE_FOLLOW): the followed texture pages follow what the
+            // title changed since the last submit (before this queue waits for the mappings)
+            if following() {
+                let changed = std::mem::take(&mut changed_all);
+                if !changed.is_empty() && !pages.follow.is_empty() {
+                    pages.apply_backing(&dev, &changed);
+                }
+                log_follow(pages, now);
+            }
             let key = queue.as_raw() as usize;
             if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
                 let _ = queue.Wait(&pages.fence, pages.value);
@@ -1492,6 +2405,58 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     }
     if do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0 {
         retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
+    }
+}
+
+/// LOCAL (#1514): every 5 s while `XCL_TEXTURE_FOLLOW=1`: textures following the title's
+/// memory, their pages left without video memory now, and the tiles mapped and unmapped so far.
+fn log_follow(pages: &Pages, now: std::time::Instant) {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        if last.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(5)) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let textures = pages.targets.values().filter(|t| t.mapped && !t.follows.is_empty()).count();
+    let unbacked = pages.follow.values().filter(|f| !f.mapped).count();
+    // LOCAL: per texture: those holding no tile at all, and the tiles followed textures hold NULL
+    let (mut off, mut null_tiles) = (0usize, 0usize);
+    for t in pages.targets.values().filter(|t| t.mapped && !t.follows.is_empty()) {
+        let held = t.used.len() + t.used_extra.len();
+        off += usize::from(held == 0);
+        null_tiles += (t.total as usize).saturating_sub(held);
+    }
+    let s = |i: usize| FOLLOW_STATS[i].load(std::sync::atomic::Ordering::Relaxed);
+    crate::xlog_info!(
+        "D3D12.X: texture follow (mode {}): {textures} textures on {} followed pages, {unbacked} pages ({} MB) without video memory now; {off} of the textures wholly unbacked, {} MB of the textures' tiles NULL; so far {} tiles left unmapped at placement, {} mapped and {} unmapped as the title's memory changed",
+        follow_mode(),
+        pages.follow.len(),
+        (unbacked * PAGE) >> 20,
+        (null_tiles * PAGE) >> 20,
+        s(0),
+        s(1),
+        s(2)
+    );
+    // LOCAL (`XCL_TEXTURE_FOLLOW=3`): the textures followed per subresource group, and those
+    // followed whole for want of groups
+    if follow_mode() == 3 {
+        let (mut by_group, mut whole, mut groups, mut groups_off) = (0usize, 0usize, 0usize, 0usize);
+        for t in pages.targets.values().filter(|t| t.mapped && !t.follows.is_empty()) {
+            match &t.groups {
+                Some(gs) => {
+                    by_group += 1;
+                    groups += gs.len();
+                    groups_off += gs.iter().filter(|g| !pages.group_backed_now(g, &t.follows)).count();
+                }
+                None => whole += 1,
+            }
+        }
+        crate::xlog_info!(
+            "D3D12.X: texture follow (mode 3): {by_group} textures followed per subresource, {groups} groups, {groups_off} of them without the title's memory now; {} MB of followed textures' tiles NULL; {whole} textures followed whole (no subresource groups)",
+            (null_tiles * PAGE) >> 20
+        );
     }
 }
 
@@ -1558,6 +2523,23 @@ pub unsafe fn place_pages(
     riid: *const windows_sys::core::GUID,
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
+    place_pages_console(this, va, desc, state, clear, console_bytes, None, riid, ppv) // LOCAL
+}
+
+/// LOCAL: `place_pages` with the console's D3D12_RESOURCE_DESC of the texture (`console`), for
+/// its subresource groups (`XCL_TEXTURE_FOLLOW=3`; without it the texture is followed whole).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn place_pages_console(
+    this: *mut c_void,
+    va: usize,
+    desc: &D3D12_RESOURCE_DESC,
+    state: u32,
+    clear: *const c_void,
+    console_bytes: Option<u64>,
+    console: Option<&[u8; 0x38]>,
+    riid: *const windows_sys::core::GUID,
+    ppv: *mut *mut c_void,
+) -> Option<HRESULT> {
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     if !tier2(dev) || std::env::var_os("XCL_VRAM_ARENAS").is_some() {
         return None;
@@ -1568,7 +2550,7 @@ pub unsafe fn place_pages(
     if let Some(hr) = place_small(dev, this, va, desc, state, clear, console_bytes, riid, ppv) {
         return Some(hr);
     }
-    place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
+    place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, console, riid, ppv)
 }
 
 /// XG and the PC driver pack volume mip tails differently. Keep these textures on the
@@ -1749,7 +2731,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
         return None;
     }
     if std::env::var_os("XCL_VRAM_ARENAS").is_none() {
-        if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, true, riid, ppv) {
+        if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, true, None, riid, ppv) {
             return Some(hr);
         }
     }
@@ -2169,8 +3151,220 @@ mod tests {
         assert_eq!(pages.len(), 199_998);
     }
 
+    /// LOCAL (#1514): a followed page's tiles change alone: the rest of the resource is skipped,
+    /// consecutive heap tiles merge into one range, unmapped ones into a NULL range.
+    #[test]
+    fn update_ranges_set_only_the_changed_tiles() {
+        let (none, null, skip) = (D3D12_TILE_RANGE_FLAG_NONE, D3D12_TILE_RANGE_FLAG_NULL, D3D12_TILE_RANGE_FLAG_SKIP);
+        // tiles 2 and 3 onto heap tiles 7 and 8, tile 5 onto 1
+        let map = |i: u32| match i {
+            2 => Some(7),
+            3 => Some(8),
+            5 => Some(1),
+            _ => None,
+        };
+        assert_eq!(update_ranges(7, none, map), [(skip, 0, 2), (none, 7, 2), (skip, 0, 1), (none, 1, 1), (skip, 0, 1)]);
+        // tiles 0, 1 and 4 unmapped
+        assert_eq!(update_ranges(5, null, |i| [0, 1, 4].contains(&i).then_some(0)), [(null, 0, 2), (skip, 0, 2), (null, 0, 1)]);
+    }
+
+    /// LOCAL (#1514): a tile left out (`NO_TILE`) is skipped in every pool heap's call, so the
+    /// page stays unmapped.
+    #[test]
+    fn no_tile_is_skipped_by_every_heap() {
+        let tiles = [(0, 4), NO_TILE, (0, 5), (1, 0), NO_TILE];
+        assert_eq!(heap_ranges_trimmed(0, &tiles), [(true, 4, 1), (false, 0, 1), (true, 5, 1)]);
+        assert_eq!(heap_ranges_trimmed(1, &tiles), [(false, 0, 3), (true, 0, 1)]);
+    }
+
+    /// LOCAL (#1514, from 3L1A5-1's d656862a): what a page of a GPU view shows (`title_backed`):
+    /// the pool page the queue's page-mapping method put there, nothing where it unmapped it (or
+    /// never mapped anything), and the CPU view's address of that page (where a texture of the
+    /// GPU view is placed while nothing is mapped there) follows what its GPU view shows.
+    #[test]
+    fn a_page_the_page_mapping_method_mapped_in_a_gpu_view_is_backed() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::hle::kernelx::mirrors;
+        #[repr(C)]
+        struct Batch {
+            dest: u64,
+            ranges_n: u32,
+            _pad: u32,
+            ranges: usize,
+        }
+        // (addresses far above anything Windows hands out, and a size no other test uses)
+        let (cpu, gpu, size) = (0x7190_0000_0000usize, 0x7196_0000_0000usize, 0x129 * PAGE);
+        mirrors::reserved(cpu, size, 0x2040_2000, 0x04);
+        mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+        let pool: Vec<u8> = vec![0; 4 * PAGE];
+        let p = pool.as_ptr() as usize;
+        let call = |at: usize, r: &[[u32; 3]]| unsafe {
+            let b = Batch { dest: at as u64, ranges_n: r.len() as u32, _pad: 0, ranges: r.as_ptr() as usize };
+            assert!(mirrors::apply_batches(1, &b as *const Batch as usize, p, 4).is_some());
+        };
+        let (g, c) = (gpu + 2 * PAGE, cpu + 2 * PAGE);
+        assert!(!title_backed(g) && !title_backed(c), "nothing mapped in either view");
+        call(g, &[[1, 1, 1]]);
+        assert!(title_backed(g), "a pool page mapped by the method");
+        assert!(title_backed(c), "the CPU view's page of a GPU-view page that shows memory");
+        assert!(!title_backed(gpu + 3 * PAGE) && !title_backed(cpu + 3 * PAGE), "the next page is not");
+        call(g, &[[2, 0, 1]]);
+        assert!(!title_backed(g) && !title_backed(c), "unmapped by the method");
+        // the CPU view's change and the GPU view's both reach the pages of either (other tests
+        // may note their own ranges here too: only these are looked for)
+        note_changed(g, PAGE);
+        assert!(BACKING.lock().unwrap().contains(&(c, PAGE)), "a GPU view's change is its CPU view's");
+        note_changed(c, PAGE);
+        assert!(BACKING.lock().unwrap().contains(&(g, PAGE)), "a CPU view's change is its GPU view's");
+        BACKING.lock().unwrap().retain(|&(a, _)| a != g && a != c);
+        mirrors::released(gpu);
+        mirrors::released(cpu);
+    }
+
     /// Any 64 KiB page boundary inside `[va, va + bytes)` belongs to that range alone, so
     /// non-overlapping ranges never share an owned page even when only 4 KiB aligned.
+    /// LOCAL: `XCL_TEXTURE_FOLLOW` values → mode
+    #[test]
+    fn follow_mode_parses_one_and_two() {
+        assert_eq!(parse_follow_mode(None), 0);
+        assert_eq!(parse_follow_mode(Some("0")), 0);
+        assert_eq!(parse_follow_mode(Some("1")), 1);
+        assert_eq!(parse_follow_mode(Some(" 2 ")), 2);
+        assert_eq!(parse_follow_mode(Some("3")), 3); // LOCAL: per subresource
+        assert_eq!(parse_follow_mode(Some("4")), 0);
+        assert_eq!(parse_follow_mode(Some("yes")), 0);
+    }
+
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=3`): one group per standard subresource, all packed mips of
+    /// every slice in one group with the tiles no standard subresource has
+    #[test]
+    fn pc_tile_groups_from_a_synthetic_tiling() {
+        // 4 mips × 2 slices: mips 0–1 standard (4 + 1 tiles), mips 2–3 packed (1 tile a slice)
+        let subs = [Some((0, 4)), Some((4, 1)), None, None, Some((6, 4)), Some((10, 1)), None, None];
+        let g = pc_tile_groups(&subs, 4, 2, 2, 2, 1, 12).unwrap();
+        assert_eq!(
+            g,
+            vec![
+                TileGroup { subs: vec![0], tiles: vec![(0, 4)] },
+                TileGroup { subs: vec![1], tiles: vec![(4, 1)] },
+                TileGroup { subs: vec![4], tiles: vec![(6, 4)] },
+                TileGroup { subs: vec![5], tiles: vec![(10, 1)] },
+                TileGroup { subs: vec![2, 3, 6, 7], tiles: vec![(5, 1), (11, 1)] },
+            ]
+        );
+        // one slice, no packed mips: no packed group
+        let g = pc_tile_groups(&[Some((0, 2)), Some((2, 1))], 2, 1, 2, 0, 0, 3).unwrap();
+        assert_eq!(g.len(), 2);
+        // all packed: one group of every tile
+        let g = pc_tile_groups(&[None, None, None], 3, 1, 0, 3, 2, 2).unwrap();
+        assert_eq!(g, vec![TileGroup { subs: vec![0, 1, 2], tiles: vec![(0, 2)] }]);
+        // refused: overlapping tiles, past the end, a tile of no one, the wrong packed count,
+        // a standard mip without tiles, mip counts that do not add up
+        assert_eq!(pc_tile_groups(&[Some((0, 2)), Some((1, 1))], 2, 1, 2, 0, 0, 3), None);
+        assert_eq!(pc_tile_groups(&[Some((0, 2)), Some((2, 2))], 2, 1, 2, 0, 0, 3), None);
+        assert_eq!(pc_tile_groups(&[Some((0, 2)), Some((2, 1))], 2, 1, 2, 0, 0, 4), None);
+        assert_eq!(pc_tile_groups(&[Some((0, 2)), None], 2, 1, 1, 1, 2, 3), None);
+        assert_eq!(pc_tile_groups(&[None, None], 2, 1, 1, 1, 1, 1), None);
+        assert_eq!(pc_tile_groups(&[Some((0, 2)), None], 2, 1, 2, 1, 1, 3), None);
+    }
+
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=3`): a subresource's console range holds every element of it
+    /// (`xg::Texture::element_offset`), and only the tail levels share bytes
+    #[test]
+    fn console_sub_ranges_hold_their_elements() {
+        fn console_desc(w: u64, h: u32, array: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
+            let mut d = [0u8; 0x38];
+            d[0..4].copy_from_slice(&3u32.to_le_bytes());
+            d[0x10..0x18].copy_from_slice(&w.to_le_bytes());
+            d[0x18..0x1C].copy_from_slice(&h.to_le_bytes());
+            d[0x1C..0x1E].copy_from_slice(&array.to_le_bytes());
+            d[0x1E..0x20].copy_from_slice(&mips.to_le_bytes());
+            d[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+            d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            d[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
+            d
+        }
+        // (RGBA8 and BC1 in the 64 KiB modes, an array; R8 in a 4 KiB one)
+        for (w, h, array, mips, format, layout) in [(512u64, 256u32, 1u16, 10u16, 28u32, 0x119u32), (1024, 1024, 2, 11, 71, 0x11B), (256, 256, 1, 9, 61, 0x105), (300, 200, 3, 5, 28, 0x119)] {
+            let tex = crate::hle::xg::Texture::new(&console_desc(w, h, array, mips, format, layout)).unwrap();
+            let (s, at) = tex.plane_surface(tex.main as u32).unwrap();
+            let r = console_sub_ranges(s, at);
+            let n = s.chain.levels.len();
+            assert_eq!(r.len(), n * array as usize);
+            for slice in 0..array as usize {
+                for (i, l) in s.chain.levels.iter().enumerate() {
+                    let (lo, hi) = r[i + slice * n];
+                    assert!(lo < hi && hi <= tex.size(), "{w}x{h} mip {i} slice {slice}: {lo:#x}..{hi:#x} of {:#x}", tex.size());
+                    let e = s.bpe as u64;
+                    for y in 0..l.height {
+                        for x in 0..l.width {
+                            let o = tex.element_offset(i, x, y, slice);
+                            assert!(o >= lo && o + e <= hi, "{w}x{h} mip {i} slice {slice} ({x}, {y}): {o:#x} not in {lo:#x}..{hi:#x}");
+                        }
+                    }
+                }
+            }
+            // levels outside the tail have bytes of their own
+            for a in 0..r.len() {
+                for b in 0..a {
+                    let tail = |k: usize| k % n >= s.first_tail;
+                    if !(tail(a) && tail(b) && a / n == b / n) {
+                        assert!(r[a].1 <= r[b].0 || r[b].1 <= r[a].0, "{w}x{h}: subresources {a} and {b} overlap");
+                    }
+                }
+            }
+        }
+    }
+
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=3`): a group's pages are every 64 KiB page its subresources'
+    /// console bytes overlap; it is backed when any of them is (none: backed)
+    #[test]
+    fn follow_groups_take_the_pages_of_their_console_bytes() {
+        let va = 0x7000_0000usize;
+        let tiles = vec![
+            TileGroup { subs: vec![0], tiles: vec![(0, 3)] },
+            TileGroup { subs: vec![1, 2], tiles: vec![(3, 1)] },
+        ];
+        // mip 0 over pages 1–3 (ending inside page 3), mips 1 and 2 in page 0
+        let ranges = [(PAGE as u64, 3 * PAGE as u64 + 0x100), (0x8000, 0x9000), (0, 0x100)];
+        let g = follow_groups(tiles, &ranges, va).unwrap();
+        assert_eq!(g[0].pages, vec![va + PAGE, va + 2 * PAGE, va + 3 * PAGE]);
+        assert_eq!(g[1].pages, vec![va]);
+        assert_eq!(g[0].tiles, vec![(0, 3)]);
+        // a subresource with no range
+        assert_eq!(follow_groups(vec![TileGroup { subs: vec![5], tiles: vec![(0, 1)] }], &ranges, va), None);
+
+        assert!(group_backed([]), "no page: backed");
+        assert!(!group_backed([false, false]));
+        assert!(group_backed([false, true, false]), "any page backed");
+        assert!(group_backed([true]));
+        assert_eq!(whole_group(5, &[va, va + PAGE]), FollowGroup { tiles: vec![(0, 5)], pages: vec![va, va + PAGE] });
+        assert!(whole_group(0, &[]).tiles.is_empty());
+    }
+
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=2`): a texture is backed when any followed page is; with no
+    /// followed page it does not follow (never NULLed for good)
+    #[test]
+    fn whole_texture_backed_by_any_page() {
+        assert_eq!(whole_backed([]), None);
+        assert_eq!(whole_backed([false]), Some(false));
+        assert_eq!(whole_backed([false, false, false]), Some(false));
+        assert_eq!(whole_backed([false, true, false]), Some(true));
+        assert_eq!(whole_backed([true, true]), Some(true));
+    }
+
+    /// LOCAL (`XCL_TEXTURE_FOLLOW=2`): only a change of state maps or NULLs the whole texture;
+    /// a texture holding no tile while backed (its tiles not taken last time) is mapped again
+    #[test]
+    fn whole_texture_transitions() {
+        assert_eq!(whole_transition(Some(true), false), Some(true), "off → on");
+        assert_eq!(whole_transition(Some(false), true), Some(false), "on → off");
+        assert_eq!(whole_transition(Some(true), true), None);
+        assert_eq!(whole_transition(Some(false), false), None);
+        assert_eq!(whole_transition(None, true), None, "not followed");
+        assert_eq!(whole_transition(None, false), None, "not followed");
+    }
+
     #[test]
     fn owned_pages_never_alias_disjoint_ranges() {
         assert_eq!(owned_pages(0x1_0000, Some(0x1_0000), 4), Some((0x1_0000, 1)));

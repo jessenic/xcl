@@ -156,17 +156,28 @@ struct Scratch {
 }
 
 static SCRATCH: Mutex<Option<Scratch>> = Mutex::new(None);
-/// free buffers kept for reuse (the rest are released)
-const FREE_KEPT: usize = 64;
+/// Bytes of free buffers kept for reuse (the rest are released). A frame takes one buffer per
+/// bounded call, often hundreds; keeping too few made and released them again every frame, each
+/// make waiting on the device's paging queue and each release on XCL's late release. LOCAL
+fn free_kept_bytes() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_INDIRECT_SCRATCH_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256u64) << 20)
+}
+static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MADE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A buffer of at least `bytes` in UNORDERED_ACCESS, held for `allocator` until its reset.
 unsafe fn scratch(dev: &ID3D12Device, allocator: usize, bytes: u64) -> Option<ID3D12Resource> {
     let key = dev.as_raw() as usize;
-    let mut g = SCRATCH.lock().unwrap();
-    let s = g.get_or_insert_with(Default::default);
-    let reuse = s.free.iter().enumerate().filter(|(_, (d, n, _))| *d == key && *n >= bytes).min_by_key(|(_, (_, n, _))| *n).map(|(i, _)| i);
-    let entry = match reuse {
-        Some(i) => s.free.swap_remove(i),
+    let reused = {
+        let mut g = SCRATCH.lock().unwrap();
+        let s = g.get_or_insert_with(Default::default);
+        let reuse = s.free.iter().enumerate().filter(|(_, (d, n, _))| *d == key && *n >= bytes).min_by_key(|(_, (_, n, _))| *n).map(|(i, _)| i);
+        reuse.map(|i| s.free.swap_remove(i))
+    };
+    // made outside the lock: CreateCommittedResource can wait on the paging queue for seconds
+    let entry = match reused {
+        Some(e) => e,
         None => {
             let size = bytes.next_power_of_two().max(64 << 10);
             let mut out: Option<ID3D12Resource> = None;
@@ -189,26 +200,43 @@ unsafe fn scratch(dev: &ID3D12Device, allocator: usize, bytes: u64) -> Option<ID
                 &mut out,
             )
             .ok()?;
+            let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let b = MADE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
+            if n.is_power_of_two() || n.is_multiple_of(1024) {
+                crate::xlog_info!("D3D12.X: ExecuteIndirect bounding: {n} scratch buffers made ({} MB in all)", b >> 20);
+            }
             (key, size, out?)
         }
     };
     let r = entry.2.clone();
-    s.held.entry(allocator).or_default().push(entry);
+    SCRATCH.lock().unwrap().get_or_insert_with(Default::default).held.entry(allocator).or_default().push(entry);
     Some(r)
 }
 
 /// The GPU is done with what lists recorded from `allocator` (reset or released): its copies
 /// can be reused.
 pub(super) fn allocator_reset(allocator: usize) {
-    let mut g = SCRATCH.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    if let Some(done) = s.held.remove(&allocator) {
+    let dropped = {
+        let mut g = SCRATCH.lock().unwrap();
+        let Some(s) = g.as_mut() else { return };
+        let Some(done) = s.held.remove(&allocator) else { return };
         s.free.extend(done);
-        if s.free.len() > FREE_KEPT {
-            s.free.sort_by_key(|e| std::cmp::Reverse(e.1));
-            s.free.truncate(FREE_KEPT);
+        let mut total: u64 = s.free.iter().map(|e| e.1).sum();
+        let kept = free_kept_bytes();
+        let mut dropped = Vec::new();
+        if total > kept {
+            // the largest go first; small ones are the common case
+            s.free.sort_by_key(|e| e.1);
+            while total > kept {
+                let Some(e) = s.free.pop() else { break };
+                total -= e.1;
+                dropped.push(e);
+            }
         }
-    }
+        dropped
+    };
+    // released outside the lock: a release runs XCL's late release, which can wait on fences
+    drop(dropped);
 }
 
 /// Where `bytes` at console offset `offset` of console buffer `res` are on the GPU: the GPU

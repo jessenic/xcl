@@ -15,11 +15,14 @@
 //! indirect arguments) and must not be overwritten with the CPU's stale view of it.
 //! Buffers the title places there get reserved resources over the same tiles, so PC-side
 //! copies, views and barriers see the same memory.
+//! With `XCL_SPARSE_DIRECT=1` the windows are whole-committed CPU memory imported as heaps
+//! (`gpu::uma::sparse_direct`): the GPU reads the title's pages at those addresses, so nothing
+//! is mapped, uploaded or read back and there is no `State`.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use windows::core::Interface;
@@ -469,6 +472,18 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
+/// The imported heaps of the whole-committed sparse windows: `(window base, heap)` (`init`).
+/// With them there is no `State`: the windows are the title's own pages, so nothing is mapped,
+/// uploaded or read back.
+static DIRECT: Mutex<Vec<(usize, ID3D12Heap)>> = Mutex::new(Vec::new());
+
+/// Set once the sparse windows are the title's own pages: no tiles, no upload, no `State`.
+static DIRECT_ON: AtomicBool = AtomicBool::new(false);
+
+fn direct() -> bool {
+    DIRECT_ON.load(Ordering::Relaxed)
+}
+
 /// One copy back at a time (`readback_released`): the readback buffer and its list are in use
 /// until the copy is done, and that is waited for with `STATE` released. Taken before `STATE`,
 /// never under it.
@@ -661,23 +676,30 @@ fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
     }
 }
 
+/// `XCL_SPARSE_COPY_QUEUE=1`: the sparse queues (uploads, copies back, tile mappings) are copy
+/// queues, on the copy engine beside the title's work, not direct ones time-sliced with it. LOCAL
+fn sparse_list_type() -> D3D12_COMMAND_LIST_TYPE {
+    static COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *COPY.get_or_init(|| std::env::var("XCL_SPARSE_COPY_QUEUE").is_ok_and(|v| v.trim() == "1")) { D3D12_COMMAND_LIST_TYPE_COPY } else { D3D12_COMMAND_LIST_TYPE_DIRECT }
+}
+
 unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -> windows::core::Result<State> {
-    let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
+    let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: sparse_list_type(), ..Default::default() })?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
     let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
     let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
     let rb_lanes: Vec<RbLane> = (0..RB_LANES).map_while(|_| rb_lane_new(dev).ok()).collect();
     let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
     for _ in 0..UPLOAD_SLOTS {
-        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(sparse_list_type())?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, sparse_list_type(), &alloc, None)?;
         list.Close()?;
         let _ = list.SetName(windows::core::w!("xcl sparse upload list"));
         let _ = alloc.SetName(windows::core::w!("xcl sparse upload allocator"));
         slots.push(UploadSlot { alloc, list, fence_val: 0 });
     }
-    let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-    let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
+    let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(sparse_list_type())?;
+    let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, sparse_list_type(), &rb_alloc, None)?;
     rb_list.Close()?;
     let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
     let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
@@ -753,10 +775,65 @@ pub unsafe fn shadow_window(dev: &ID3D12Device, base: usize, size: usize, buf: &
     true
 }
 
+/// The whole-committed sparse windows (`gpu::uma::sparse_direct`) imported as heaps, one placed
+/// buffer over each at identity offset: the buffer IS the title's memory there, so nothing is
+/// mapped, uploaded or read back and there is no `State`. Empty: the driver will not import them
+/// (or they are gone), and `init` tiles them as today.
+unsafe fn direct_windows(dev: &ID3D12Device, u: &crate::gpu::uma::Uma) -> Vec<(usize, usize, u64)> {
+    let dev3: ID3D12Device3 = match dev.cast() {
+        Ok(d) => d,
+        Err(e) => {
+            crate::xlog_warn!("sparse windows: ID3D12Device3: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    let mut heaps = Vec::new();
+    for k in 0..u.shader_windows() {
+        if !u.is_sparse_window(k) {
+            continue;
+        }
+        let (base, size) = u.window(k);
+        let heap: ID3D12Heap = match dev3.OpenExistingHeapFromAddress(base as *const c_void) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::xlog_warn!("sparse window {k}: OpenExistingHeapFromAddress: {e} – tiled instead");
+                return Vec::new();
+            }
+        };
+        let mut d = buffer_desc(size as u64);
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        let mut r: Option<ID3D12Resource> = None;
+        if let Err(e) = dev.CreatePlacedResource(&heap, 0, &d, D3D12_RESOURCE_STATE_COMMON, None, &mut r) {
+            crate::xlog_warn!("sparse window {k}: CreatePlacedResource: {e} – tiled instead");
+            return Vec::new();
+        }
+        let Some(r) = r else { return Vec::new() };
+        let va = r.GetGPUVirtualAddress();
+        out.push((k, r.into_raw() as usize, va));
+        heaps.push((base, heap));
+    }
+    if out.is_empty() {
+        return out;
+    }
+    crate::xlog_info!("D3D12.X: {} sparse window(s) hold the title's own pages: no tiles, no upload", out.len());
+    *DIRECT.lock().unwrap() = heaps;
+    DIRECT_ON.store(true, Ordering::Relaxed);
+    *QUEUE.lock().unwrap() = None;
+    *STATE.lock().unwrap() = None;
+    out
+}
+
 /// The sparse windows' buffers on `dev`: `(window_index, buffer_raw, gpu_va)` for each
 /// sparse window in `gpu::uma` (empty: no sparse windows).
 pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
+    if u.sparse_direct() {
+        let d = direct_windows(dev, u);
+        if !d.is_empty() {
+            return d;
+        }
+    }
     let mut out = Vec::new();
     let mut windows = Vec::new();
     for k in 0..u.shader_windows() {
@@ -882,6 +959,7 @@ impl State {
     /// Map `tiles` (tile addresses) of `res` (starting at `res_base`) onto pool tiles,
     /// batched per pool heap with contiguous runs merged into single regions.
     unsafe fn map_tiles(&self, res: &ID3D12Resource, res_base: usize, tiles: &[(usize, (u32, u32))]) {
+        super::real::crumb(false, || format!("sparse map {res_base:#x} x{}", tiles.len())); // LOCAL
         if tiles.is_empty() {
             return;
         }
@@ -931,6 +1009,7 @@ impl State {
     }
 
     unsafe fn unmap_tiles(&self, res: &ID3D12Resource, res_base: usize, tiles: &[usize]) {
+        super::real::crumb(false, || format!("sparse unmap {res_base:#x} x{}", tiles.len())); // LOCAL
         if tiles.is_empty() {
             return;
         }
@@ -1105,7 +1184,7 @@ impl State {
             self.reclaim_ring();
         }
         let slot = &self.slots[idx];
-        let _ = slot.alloc.Reset();
+        let _ = super::real::own_allocator_reset(&slot.alloc);
         let _ = slot.list.Reset(&slot.alloc, None);
         idx
     }
@@ -1114,6 +1193,9 @@ impl State {
     /// via `queue.Wait(&self.fence, self.value)`).
     unsafe fn submit_slot(&mut self, idx: usize) {
         let closed = self.slots[idx].list.Close().is_ok();
+        // LOCAL: the removal tripwire sees XCL's own upload submissions too
+        let (copies, bytes) = (SLOT_COPIES.swap(0, Ordering::Relaxed), SLOT_BYTES.swap(0, Ordering::Relaxed));
+        super::real::crumb(false, || format!("sparse upload slot {idx}: {copies} copies, {bytes} B, closed {closed}"));
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
                 super::title_textures::own_work(|| {
@@ -1121,6 +1203,7 @@ impl State {
                 });
             }
         }
+        super::real::crumb(true, || format!("sparse upload slot {idx} submitted"));
         self.signal();
         self.slots[idx].fence_val = self.value;
         if self.ring_write > self.ring_submitted {
@@ -1280,8 +1363,8 @@ impl State {
             return Some(self.rb_pool.swap_remove(i));
         }
         let cap = need.max(64 << 10).next_power_of_two().min(READBACK_STAGING);
-        let alloc: ID3D12CommandAllocator = self.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
-        let list: ID3D12GraphicsCommandList = self.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
+        let alloc: ID3D12CommandAllocator = self.dev.CreateCommandAllocator(sparse_list_type()).ok()?;
+        let list: ID3D12GraphicsCommandList = self.dev.CreateCommandList(0, sparse_list_type(), &alloc, None).ok()?;
         list.Close().ok()?;
         let _ = list.SetName(windows::core::w!("xcl sparse readback list"));
         let mut d = buffer_desc(cap as u64);
@@ -1399,7 +1482,7 @@ impl State {
                 crate::xlog_warn!("sparse: no readback buffer for a copy back of {need} bytes – left out");
                 return;
             };
-            let _ = job.alloc.Reset();
+            let _ = super::real::own_allocator_reset(&job.alloc);
             let _ = job.list.Reset(&job.alloc, None);
             let mut off = 0usize;
             for (wi, cur, chunk) in batch {
@@ -1458,7 +1541,7 @@ impl State {
             let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
             let chunk = (end - cur).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
             if parts.is_empty() {
-                let _ = self.rb_alloc.Reset();
+                let _ = super::real::own_allocator_reset(&self.rb_alloc);
                 let _ = self.rb_list.Reset(&self.rb_alloc, None);
             }
             self.rb_list.CopyBufferRegion(rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
@@ -1566,6 +1649,8 @@ impl State {
                 std::ptr::copy_nonoverlapping(cur as *const u8, p.add(dst_off), chunk);
                 let staging_res = &self.staging.as_ref().unwrap().0;
                 self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
+                SLOT_COPIES.fetch_add(1, Ordering::Relaxed);
+                SLOT_BYTES.fetch_add(chunk as u64, Ordering::Relaxed);
                 self.ring_write = aligned + chunk as u64;
                 done += chunk;
             }
@@ -1612,6 +1697,11 @@ pub unsafe fn free(p: usize) -> bool {
     // decommitted before the address goes back: once released, another thread may get it,
     // commit it and write there
     let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
+    if direct() {
+        // the pages back the imported heap and do not come back zeroed on their own
+        std::ptr::write_bytes(p as *mut u8, 0, len);
+        return u.sparse_release(p).is_some();
+    }
     decommitted(start, len);
     VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
     u.sparse_release(p).is_some()
@@ -1684,7 +1774,7 @@ pub unsafe fn settle_readbacks_try() {
 
 /// A copy-back lane's queue and fences
 unsafe fn rb_lane_new(dev: &ID3D12Device) -> windows::core::Result<RbLane> {
-    let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
+    let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: sparse_list_type(), ..Default::default() })?;
     let _ = q.SetName(windows::core::w!("xcl sparse readback queue"));
     let src: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
     let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
@@ -1760,8 +1850,43 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let _one = READBACK.lock().unwrap();
+    // LOCAL: calls, bytes and time of the CPU reads that wait for the GPU
+    struct Timed(std::time::Instant, usize);
+    impl Drop for Timed {
+        fn drop(&mut self) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            static US: AtomicU64 = AtomicU64::new(0);
+            static BYTES: AtomicU64 = AtomicU64::new(0);
+            let us = US.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed) + self.0.elapsed().as_micros() as u64;
+            let b = BYTES.fetch_add(self.1 as u64, Ordering::Relaxed) + self.1 as u64;
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() || n % 1000 == 0 {
+                let ph = |i: usize| RB_PHASE[i].load(Ordering::Relaxed) / 1000;
+                crate::xlog_info!(
+                    "sparse readback on Map: {n} calls, {} ms in all, {} KB; locks {} ms, CPU writes sent first {} ms, copy and wait {} ms",
+                    us / 1000,
+                    b >> 10,
+                    ph(0),
+                    ph(1),
+                    ph(2)
+                );
+            }
+        }
+    }
+    let _timed = Timed(std::time::Instant::now(), len);
+    let mut t_phase = std::time::Instant::now();
+    let mut phase = |i: usize| {
+        RB_PHASE[i].fetch_add(t_phase.elapsed().as_micros() as u64, Ordering::Relaxed);
+        t_phase = std::time::Instant::now();
+    };
+    // (only the sparse windows have copies to read back: the rest returns before any lock) LOCAL
+    if !crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va)) {
+        return;
+    }
+    let parallel = readback_parallel_on();
+    let _one = (!parallel).then(|| READBACK.lock().unwrap());
     let mut g = lock_state();
+    phase(0);
     let Some(mut s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
         return;
@@ -1803,13 +1928,101 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
-    readback_released(g, &[(va, len)]);
+    phase(1);
+    if parallel {
+        readback_parallel(g, va, len);
+    } else {
+        readback_released(g, &[(va, len)]);
+    }
+    phase(2);
 }
+
+/// `XCL_READBACK_PARALLEL=1`: a Map's copy back takes a job of its own (list and readback
+/// buffer) instead of the one shared buffer behind `READBACK`, so maps on several threads wait
+/// for their copies at the same time instead of one after another. LOCAL
+fn readback_parallel_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_READBACK_PARALLEL").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `readback_released` for one range on a job of its own: submitted on the state's queue,
+/// waited for with `STATE` released, landed in the pages still committed then. A job whose copy
+/// did not finish (5 s) is not used again (its list may still run). LOCAL
+unsafe fn readback_parallel(mut g: MutexGuard<'static, Option<State>>, va: usize, len: usize) {
+    // copies back of earlier submissions first: their data is older than this one's
+    if let Some(s) = g.as_mut() {
+        s.drain_readbacks(Drain::TitleDone);
+    }
+    let end = va + len;
+    let mut at = va;
+    while at < end {
+        let Some(s) = g.as_mut() else { return };
+        let Some(job) = s.rb_job((end - at).min(READBACK_STAGING)) else { return };
+        let mut parts: Vec<(usize, usize, usize)> = Vec::new();
+        let mut used = 0usize;
+        let mut cur = at;
+        while cur < end && used < job.cap {
+            let tile = cur & !(TILE - 1);
+            let Some(wi) = s.window_index(cur) else {
+                cur = end;
+                break;
+            };
+            let b = s.windows[wi].0;
+            let to_tile_end = (tile + TILE) - cur;
+            if !s.mapped.contains_key(&tile) {
+                cur += (end - cur).min(to_tile_end);
+                continue;
+            }
+            let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
+            let chunk = (end - cur).min(job.cap - used).min(to_tile_end).min(to_win_end);
+            if parts.is_empty() {
+                let _ = super::real::own_allocator_reset(&job.alloc);
+                let _ = job.list.Reset(&job.alloc, None);
+            }
+            job.list.CopyBufferRegion(&job.buf, used as u64, &s.windows[wi].1, (cur - b) as u64, chunk as u64);
+            parts.push((cur, used, chunk));
+            used += chunk;
+            cur += chunk;
+        }
+        at = cur;
+        if parts.is_empty() {
+            s.rb_pool.push(job);
+            continue;
+        }
+        if job.list.Close().is_err() {
+            return;
+        }
+        if let Ok(l) = job.list.cast::<ID3D12CommandList>() {
+            super::title_textures::own_work(|| s.queue.ExecuteCommandLists(&[Some(l)]));
+        }
+        s.signal();
+        let value = s.value;
+        let (again, there) = wait_released(g, value);
+        g = again;
+        if !there {
+            // (its list and buffer may still be in use: the job is dropped, not pooled)
+            std::mem::forget(job);
+            return;
+        }
+        if let Some(s) = g.as_mut() {
+            s.copy_back_parts(job.ptr, &parts);
+            s.rb_pool.push(job);
+        }
+    }
+}
+
+/// LOCAL: `readback_now`'s time in µs: [taking READBACK and the state, sending CPU writes first,
+/// the copy back and its wait]
+static RB_PHASE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
 /// lie outside the range are not committed (holes); the range's pages are.
 pub unsafe fn committed(a: usize, n: usize) {
     if n == 0 {
+        return;
+    }
+    // whole-committed already: there are no tiles to map and no `State` to tell
+    if direct() {
         return;
     }
     let mut g = lock_state();
@@ -1826,6 +2039,9 @@ pub unsafe fn committed(a: usize, n: usize) {
 /// (unless a placed buffer still pins the pool tile).
 pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
+        return;
+    }
+    if direct() {
         return;
     }
     let mut g = lock_state();
@@ -1886,7 +2102,7 @@ impl State {
             }
         }
         MAPPED_GEN.fetch_add(1, Ordering::Release);
-        if self.parked.len() >= PARKED_MAX && self.flush_parked() {
+        if self.parked.len() >= PARKED_MAX && !keep_parked() && self.flush_parked() {
             self.retire_free_pools();
         }
     }
@@ -1945,12 +2161,32 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
 
 /// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
 static WATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static WATCH_N: AtomicU64 = AtomicU64::new(0);
 /// [lock wait, chunk scan, upload] in µs, runs uploaded
 static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// LOCAL: copies and bytes recorded into the open upload slot (for the removal tripwire)
+static SLOT_COPIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static SLOT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// LOCAL: `XCL_SPARSE_KEEP_PARKED=1` – decommitted tiles stay mapped until the free list runs out.
+fn keep_parked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SPARSE_KEEP_PARKED").is_ok_and(|v| v == "1"))
+}
 
 pub fn note_watch(t: std::time::Duration, pages: usize) {
     WATCH[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
+    let n = WATCH_N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() && n >= 16 {
+        crate::xlog_info!(
+            "write-watch: {n} looks, {} ms total ({} dirty pages), this look {} ms",
+            WATCH[0].load(Ordering::Relaxed) / 1000,
+            WATCH[1].load(Ordering::Relaxed),
+            t.as_millis()
+        );
+    }
 }
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
@@ -1964,7 +2200,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let Some(s) = g.as_mut() else { return };
     s.drain_readbacks(Drain::Finished);
     // the title's work sees what was decommitted unmapped, as it was
-    if s.flush_parked() {
+    if !keep_parked() && s.flush_parked() {
         s.retire_free_pools();
     }
     let t_locked = std::time::Instant::now();
@@ -2062,14 +2298,35 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = lock_state();
-    let s = g.as_mut()?;
     let start = va & !(TILE - 1);
     let delta = va - start;
     let bytes = desc.Width as usize;
     if bytes == 0 {
         return None;
     }
+    if direct() {
+        // the window is one buffer on an imported heap: place on that heap, at the same address
+        let u = crate::gpu::uma::get()?;
+        let k = u.window_of(start)?;
+        let (base, len) = u.window(k);
+        if !u.is_sparse_window(k) || start - base + bytes > len {
+            return None;
+        }
+        let heap = DIRECT.lock().unwrap().iter().find(|&&(b, _)| b == base)?.1.clone();
+        let mut d = *desc;
+        d.Width = (delta + bytes) as u64;
+        d.Alignment = 0;
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        // the imported heap is cross-adapter, so the buffer placed in it has to be
+        d.Flags = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        if state & (D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32 | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32) != 0 {
+            d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        }
+        let hr = super::real::dev_create_placed_resource(this, heap.into_raw() as usize, start - base, &d as *const _ as usize, state as usize, 0, riid, ppv);
+        return (hr >= 0 && !ppv.is_null() && !(*ppv).is_null()).then(|| (hr, delta));
+    }
+    let mut g = lock_state();
+    let s = g.as_mut()?;
     s.window_index(start)?;
     s.window_index(va.checked_add(bytes)?.checked_sub(1)?)?;
     let mut d = *desc;

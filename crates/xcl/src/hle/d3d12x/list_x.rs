@@ -1953,7 +1953,23 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
                 let completed = prune_completed_waits(cell);
                 if completed >= w.value {
                     // Fence already reached `w.value`: trust it if CPU memory agrees (not reset).
-                    return if w.is_satisfied() { GpuWaitOutcome::Handled } else { GpuWaitOutcome::FallbackCpu };
+                    if w.is_satisfied() {
+                        return GpuWaitOutcome::Handled;
+                    }
+                    // LOCAL: `XCL_SPARSE_TRUST_FENCE=1` – a label in a sparse window (a heap moved to
+                    // video memory, XCL_COHERENT_HEAPS=sparse) is written by the GPU there; its CPU
+                    // copy can lag behind the copy back. The monotonic cell's fence is the truth.
+                    static TRUST: OnceLock<bool> = OnceLock::new();
+                    if *TRUST.get_or_init(|| std::env::var("XCL_SPARSE_TRUST_FENCE").is_ok_and(|v| v.trim() == "1"))
+                        && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(w.va as usize))
+                    {
+                        static N: AtomicU64 = AtomicU64::new(0);
+                        if once(&N, 4) {
+                            crate::xlog_info!("D3D12.X: Wait64BitValueX at {:#x} >= {:#x}: fence done, CPU copy behind (sparse window) – trusted", w.va, w.value);
+                        }
+                        return GpuWaitOutcome::Handled;
+                    }
+                    return GpuWaitOutcome::FallbackCpu;
                 }
                 if cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {
                     return GpuWaitOutcome::Handled;
@@ -2148,6 +2164,10 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
     note_write(this as usize, dst, size);
+    // LOCAL: XCL_GPU_CULPRIT marker around what follows (out when this function returns)
+    let _mark = super::culprit::mark(this, || {
+        format!("CopyMemoryToMemoryX {src:#x} -> {dst:#x} +{size:#x}: {} <- {}{}", super::culprit::buffer_range("dst", d, doff, size), super::culprit::buffer_range("src", s, soff, size), if d == s { " same window" } else { "" })
+    });
     if d == s {
         // one window: one buffer cannot be in COPY_SOURCE and COPY_DEST at once (#958), so the
         // bytes go through a scratch buffer of the list
@@ -2406,7 +2426,9 @@ unsafe fn fill(list: *mut c_void, va: u64, size: u64, pat: [u8; 16], unit: u64, 
         return warn(&N, what, format_args!("no pattern buffer for {pat:x?}"));
     };
     note_write(list as usize, va, size);
-    as_copy_dest(list, d, || copy_buffer_region(list, d, off, src, 0, size));
+    // LOCAL: XCL_GPU_CULPRIT marker
+    let label = || format!("{what} {va:#x} +{size:#x}: {}", super::culprit::buffer_range("dst", d, off, size));
+    super::culprit::marked(list, label, || as_copy_dest(list, d, || copy_buffer_region(list, d, off, src, 0, size)));
 }
 
 fn pattern(bytes: &[u8]) -> [u8; 16] {
@@ -2456,7 +2478,9 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
-    as_copy_dest(list, d, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr()));
+    // LOCAL: XCL_GPU_CULPRIT marker (the GPU write; one the CPU makes is not marked)
+    let marker = || format!("{what} {va:#x} = {words:x?} (PC va {at:#x}): {}", super::culprit::resource("buf", d));
+    super::culprit::marked(list, marker, || as_copy_dest(list, d, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr())));
 }
 
 /// timestamp queries (one heap per device, used round-robin) and a lazily created READBACK
@@ -4117,7 +4141,10 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
         }
     }
     note_copy_into(this as usize, dst, dst_off, n);
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
+    let (d_off, s_off) = (dst_off + real::buffer_delta(dst), src_off + real::buffer_delta(src));
+    // LOCAL: XCL_GPU_CULPRIT marker (the PC offsets, with the console-placement delta)
+    let what = || format!("CopyBufferRegion {} <- {}", super::culprit::buffer_range("dst", dst, d_off, n), super::culprit::buffer_range("src", src, s_off, n));
+    super::culprit::marked(this, what, || pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, d_off, src, s_off, n))
 }
 
 /// `XCL_TRACE_FRAME` with a watched target (`present::watch_rt`): copies out of it – that
@@ -4223,7 +4250,14 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         note_copy_into(this as usize, transmute_copy::<_, usize>(&l.pResource), f.Offset, n);
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
-    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
+    // LOCAL: XCL_GPU_CULPRIT marker (the PC locations, with the console-placement delta)
+    let what = || {
+        let b = bx.as_ref().map_or(String::new(), |b| format!(" box ({},{},{})-({},{},{})", b.left, b.top, b.front, b.right, b.bottom, b.back));
+        format!("CopyTextureRegion {} at ({x},{y},{z}) <- {}{b}", super::culprit::location("dst", &d), super::culprit::location("src", &s))
+    };
+    super::culprit::marked(this, what, || {
+        pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx)
+    });
     std::mem::forget((d, s)); // borrowed resource pointers
 }
 
@@ -4249,7 +4283,11 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
+    // LOCAL: XCL_GPU_CULPRIT marker
+    let what = || format!("ClearDepthStencilView dsv {dsv:#x} flags {flags:#x}, {n} rects");
+    super::culprit::marked(this, what, || {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
+    })
 }
 
 const PC_CLEAR_UAV_UINT: usize = 49;
@@ -4290,7 +4328,11 @@ unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usi
             return;
         }
     };
-    pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
+    // LOCAL: XCL_GPU_CULPRIT marker
+    let what = || format!("ClearUnorderedAccessView{} gpu {gpu:#x} cpu {cpu:#x} {}, {n} rects", if slot == PC_CLEAR_UAV_FLOAT { "Float" } else { "Uint" }, super::culprit::resource("res", res));
+    super::culprit::marked(this, what, || {
+        pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
+    })
 }
 
 pub(super) unsafe extern "system" fn clear_uav_uint_x(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, n: u32, rects: *const windows::Win32::Foundation::RECT) {
@@ -4333,7 +4375,9 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
     trace_resolve("ResolveSubresource", dst, src, format, "");
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
+    // LOCAL: XCL_GPU_CULPRIT marker
+    let what = || format!("ResolveSubresource {} <- {} fmt {format}", super::culprit::subresource("dst", dst, dst_sub), super::culprit::subresource("src", src, src_sub));
+    super::culprit::marked(this, what, || pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format))
 }
 
 /// command list #108 ResolveSubresourceRegion(dst, dst sub, x, y, src, src sub, rect, format,
@@ -4344,7 +4388,14 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
+    // LOCAL: XCL_GPU_CULPRIT marker
+    let what = || {
+        let r = rect.as_ref().map_or(String::new(), |r| format!(" rect ({},{})-({},{})", r.left, r.top, r.right, r.bottom));
+        format!("ResolveSubresourceRegion {} at ({x},{y}) <- {}{r} fmt {format} mode {mode}", super::culprit::subresource("dst", dst, dst_sub), super::culprit::subresource("src", src, src_sub))
+    };
+    super::culprit::marked(this, what, || {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
+    })
 }
 
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
@@ -4358,10 +4409,48 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
         note_copy_into(this as usize, dst, 0, u64::MAX);
-        return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        // LOCAL: XCL_GPU_CULPRIT marker (the other branch is marked as CopyBufferRegion)
+        let what = || {
+            let (a, b) = (super::culprit::resource("dst", dst), super::culprit::resource("src", src));
+            let w = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0) });
+            format!("CopyResource {a} <- {b}{}", if w(dst) != w(src) { " SHAPE-MISMATCH" } else { "" })
+        };
+        return super::culprit::marked(this, what, || pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src));
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
     copy_buffer_region_x(this, dst, 0, src, 0, n);
+}
+
+const PC_COPY_TILES: usize = 18;
+const PC_DISCARD_RESOURCE: usize = 51;
+
+/// LOCAL: CopyTiles(tiled resource, start, size, buffer, buffer offset, flags) (PC #18; command
+/// list #18, DMA list #14): as on the PC, with the XCL_GPU_CULPRIT marker (64 KiB a tile in the
+/// buffer)
+pub(super) unsafe extern "system" fn copy_tiles_x(this: *mut c_void, res: usize, start: *const D3D12_TILED_RESOURCE_COORDINATE, size: *const D3D12_TILE_REGION_SIZE, buf: usize, off: u64, flags: u32) {
+    let what = || {
+        let s = start.as_ref().map_or("?".to_string(), |c| format!("({},{},{}) sub {}", c.X, c.Y, c.Z, c.Subresource));
+        let tiles = size.as_ref().map_or(0, |t| t.NumTiles);
+        let b = size.as_ref().map_or(String::new(), |t| if t.UseBox.as_bool() { format!(" box {}x{}x{}", t.Width, t.Height, t.Depth) } else { String::new() });
+        format!(
+            "CopyTiles {} at {s}, {tiles} tiles{b}, {} flags {flags:#x} (1 to buffer, 2 to tiles)",
+            super::culprit::resource("tiled", res),
+            super::culprit::buffer_range("buf", buf, off, tiles as u64 * 0x1_0000)
+        )
+    };
+    super::culprit::marked(this, what, || {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, *const D3D12_TILED_RESOURCE_COORDINATE, *const D3D12_TILE_REGION_SIZE, usize, u64, u32)>(this, PC_COPY_TILES)(this, res, start, size, buf, off, flags)
+    })
+}
+
+/// LOCAL: command list #55 DiscardResource(resource, region) (PC #51): as on the PC, with the
+/// XCL_GPU_CULPRIT marker
+pub(super) unsafe extern "system" fn discard_resource_x(this: *mut c_void, res: usize, region: *const D3D12_DISCARD_REGION) {
+    let what = || {
+        let r = region.as_ref().map_or(" (whole)".to_string(), |r| format!(" subres {}+{}, {} rects", r.FirstSubresource, r.NumSubresources, r.NumRects));
+        format!("DiscardResource {}{r}", super::culprit::resource("res", res))
+    };
+    super::culprit::marked(this, what, || pc::<unsafe extern "system" fn(*mut c_void, usize, *const D3D12_DISCARD_REGION)>(this, PC_DISCARD_RESOURCE)(this, res, region))
 }
 
 /// command list #28 BeginQuery(heap, type, index) (PC #52)

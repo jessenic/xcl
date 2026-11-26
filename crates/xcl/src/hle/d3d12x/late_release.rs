@@ -77,7 +77,7 @@ impl Held {
             }
         }
         let mut gone = Vec::new();
-        while self.sealed.front().is_some_and(|b| b.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
+        while self.sealed.front().is_some_and(|b| b.marks.iter().all(|(f, v)| super::real::fence_completed_unhooked(f) >= *v)) {
             gone.extend(self.sealed.pop_front().unwrap().dead);
         }
         gone

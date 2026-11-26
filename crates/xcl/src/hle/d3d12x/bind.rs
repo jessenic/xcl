@@ -52,15 +52,73 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, us
 
 pub(super) fn release_allocator_res(allocator: usize) {
     let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) else { return };
-    let mut free = FREE_RES.lock().unwrap();
-    for b in bufs {
-        if free.len() < 16 {
-            free.push(b);
+    // kept by bytes, not 16 of them: lists ask for 4–128 MB each, and with 16 kept a world frame
+    // made hundreds again (9.4 GB in 14 s here), each waiting on paging. Released outside the
+    // lock (a last release can wait on fences). LOCAL
+    let dropped = {
+        let mut free = FREE_RES.lock().unwrap();
+        free.extend(bufs);
+        let cap = two_pass_free_bytes();
+        let mut total: u64 = free.iter().map(|e| e.1).sum();
+        let mut dropped = Vec::new();
+        if total > cap {
+            free.sort_by_key(|e| e.1);
+            while total > cap {
+                let Some(e) = free.pop() else { break };
+                total -= e.1;
+                dropped.push(e);
+            }
         }
-    }
+        dropped
+    };
+    drop(dropped);
+}
+
+/// `XCL_TWO_PASS_FREE_MB`: bytes of free two-pass record buffers kept for reuse (512 MB). LOCAL
+fn two_pass_free_bytes() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_TWO_PASS_FREE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512u64) << 20)
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
+
+/// LOCAL: scaled indirect-argument buffers made
+fn note_scaled_made(bytes: u64) {
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() || n.is_multiple_of(1024) {
+        crate::xlog_info!("two-pass scaled argument buffers: {n} made (this one {} KB)", bytes >> 10);
+    }
+}
+
+/// LOCAL: two-pass record buffers made, and what is alive of them (in lists, held for
+/// allocators, free), logged every 64 made.
+fn note_res_made(bytes: u64) {
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    static MADE_BYTES: AtomicU64 = AtomicU64::new(0);
+    let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+    let b = MADE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    if n.is_power_of_two() || n.is_multiple_of(64) {
+        let mb = |v: u64| v >> 20;
+        let (in_lists, lists) = STATES.lock().unwrap().as_ref().map_or((0, 0), |m| {
+            let mut t = 0u64;
+            let mut c = 0usize;
+            for st in m.values() {
+                for e in st.res_buf.iter().chain(st.res_retired.iter()) {
+                    t += e.1;
+                    c += 1;
+                }
+            }
+            (t, c)
+        });
+        let held: u64 = ALLOC_RES.lock().unwrap().as_ref().map_or(0, |m| m.values().flatten().map(|e| e.1).sum());
+        let free: u64 = FREE_RES.lock().unwrap().iter().map(|e| e.1).sum();
+        crate::xlog_info!(
+            "two-pass record buffers: {n} made ({} MB in all); alive: {} MB in {lists} on lists, {} MB held for allocators, {} MB free",
+            mb(b), mb(in_lists), mb(held), mb(free)
+        );
+    }
+}
 
 /// draws / dispatches of console code: with a translated pipeline, skipped, with a PC one
 static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -381,11 +439,15 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
     let dev_key = dev.as_raw() as usize;
     let picked = {
         let mut free = FREE_RES.lock().unwrap();
-        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= need).map(|i| free.swap_remove(i))
+        free.iter().enumerate().filter(|(_, (_, cap, d))| *d == dev_key && *cap >= need).min_by_key(|(_, (_, cap, _))| *cap).map(|(i, _)| i).map(|i| free.swap_remove(i))
     };
     let entry = match picked {
         Some(e) => e,
-        None => (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key),
+        None => {
+            let made = (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key);
+            note_res_made(need);
+            made
+        }
     };
     let buf = entry.0.clone();
     let va = buf.GetGPUVirtualAddress();
@@ -443,6 +505,7 @@ unsafe fn bind_two_pass_stage(
         }
         let pso_raw = tp.compute as *mut c_void;
         let pc = ID3D12PipelineState::from_raw_borrowed(&pso_raw).ok_or("two-pass compute pipeline")?;
+        super::culprit::note_bound(pc); // LOCAL
         list.SetPipelineState(pc);
     } else {
         list.SetGraphicsRootSignature(rs);
@@ -451,6 +514,7 @@ unsafe fn bind_two_pass_stage(
         }
         let pso_raw = real_mesh_pso as *mut c_void;
         let pc = ID3D12PipelineState::from_raw_borrowed(&pso_raw).ok_or("two-pass mesh pipeline")?;
+        super::culprit::note_bound(pc); // LOCAL
         list.SetPipelineState(pc);
     }
     Ok(())
@@ -515,10 +579,24 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let src_ptr = src_raw as *mut c_void;
     let src = ID3D12Resource::from_raw_borrowed(&src_ptr).ok_or("indirect args buffer")?;
-    let bytes = (max as u64).saturating_mul(stride as u64).max(256).next_multiple_of(256);
-    let dst = default_uav_buffer(&dev, bytes, "scaled args buffer")?;
+    // from the free buffers when one fits, 64 KB at least (LOCAL): one made for each indirect mesh
+    // draw waited on paging, and video memory comes in 64 KB pieces anyway
+    let bytes = (max as u64).saturating_mul(stride as u64).max(64 << 10).next_multiple_of(64 << 10);
+    let dev_key0 = dev.as_raw() as usize;
+    let reused = {
+        let mut free = FREE_RES.lock().unwrap();
+        free.iter().enumerate().filter(|(_, (_, cap, d))| *d == dev_key0 && *cap >= bytes && *cap <= bytes.max(1 << 20)).min_by_key(|(_, (_, cap, _))| *cap).map(|(i, _)| i).map(|i| free.swap_remove(i))
+    };
+    let (dst, bytes) = match reused {
+        Some((b, cap, _)) => (b, cap),
+        None => {
+            note_scaled_made(bytes);
+            (default_uav_buffer(&dev, bytes, "scaled args buffer")?, bytes)
+        }
+    };
     emit_transition(list, src, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     list.SetComputeRootSignature(&rs);
+    super::culprit::note_bound(&pso); // LOCAL
     list.SetPipelineState(&pso);
     let consts = [max, stride, mesh_offset, mult];
     list.SetComputeRoot32BitConstants(0, 4, consts.as_ptr() as *const c_void, 0);
@@ -713,12 +791,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     if let (Ok(()), Ok(whole)) = (&result, &whole) {
         if let Some(whole) = whole {
+            super::culprit::note_bound(whole); // LOCAL
             list.SetPipelineState(whole);
         }
         ei_work(this, sig, super::targets::RAN);
         count(if gfx { DRAWS } else { DISPATCHES });
         // an indirect dispatch: its groups are in the argument buffer (`max` of them)
-        let mark = if gfx { 0 } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
+        // LOCAL: indirect draws get a marker too (draw tracing)
+        let mark = if gfx { super::culprit::before_draw(list, with(this, |s| s.pso), pso, 0, max) } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
         fresh_indirect_arguments(this, || match &bounded {
             Some(b) => pc(this, sig, max, b.raw(), 0, count_buf, count_off),
             None => pc(this, sig, max, args, args_off, count_buf, count_off),
@@ -886,7 +966,10 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
+        let title_pso = with(this, |s| s.pso);
+        let mark = super::culprit::before_draw(&list, title_pso, super::pso_async::resolve(title_pso), vertices, instances);
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        super::culprit::after_dispatch(&list, mark);
     }
 }
 
@@ -899,7 +982,10 @@ thread_local! {
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
+        let title_pso = with(this, |s| s.pso);
+        let mark = super::culprit::before_draw(&list, title_pso, super::pso_async::resolve(title_pso), indices, instances);
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
+        super::culprit::after_dispatch(&list, mark);
     }
 }
 
@@ -1472,6 +1558,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     }
     let real = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
+    super::culprit::note_bound(pc); // LOCAL
     list.SetPipelineState(pc);
     Ok(())
 }

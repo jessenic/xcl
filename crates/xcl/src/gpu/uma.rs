@@ -77,6 +77,12 @@ fn slot_limit(windows: usize) -> usize {
     if windows > MAX_WINDOWS { 1 << (40 - 32) } else { 512 }
 }
 
+/// Whether each sparse window is one whole-committed allocation, so `sparse.rs` can import it as a
+/// heap and skip the CPU→GPU copy (`XCL_SPARSE_DIRECT=1`).
+pub(crate) fn sparse_direct_wanted() -> bool {
+    std::env::var("XCL_SPARSE_DIRECT").ok().as_deref() == Some("1")
+}
+
 /// Requested runtime UMA window count (`XCL_UMA_WINDOWS=4|8|16`, default 4).
 /// Layouts wider than 4 windows require `XCL_HEAP_WINDOWS=1`.
 pub(crate) fn configured_runtime_windows() -> usize {
@@ -113,6 +119,8 @@ pub struct Uma {
     inner: Mutex<Inner>,
     /// free ranges of the sparse windows (address → length) and the reservations in them
     sparse_free: Mutex<(BTreeMap<usize, usize>, BTreeMap<usize, usize>)>,
+    /// usable bytes in a sparse window: 4 GiB, or `MAX_SIZE` when each is whole-committed for import
+    sparse_len: usize,
     /// the committed windows are not the GPU's memory: it has copies of them (`set_shadowed`)
     shadowed: AtomicBool,
     /// XCL's own pool in window 0 for `Arena` blocks: (start, end, free blocks). The title
@@ -252,23 +260,57 @@ impl Uma {
         Self::reserve_runtime(size, coherent, windows)
     }
 
+    /// The runtime layout the environment asks for; a direct layout the host cannot commit falls
+    /// back to the tiled one.
     fn reserve_runtime(size: usize, coherent: usize, windows: usize) -> Option<Uma> {
+        let direct = sparse_direct_wanted();
+        Self::reserve_runtime_layout(size, coherent, windows, direct)
+            .or_else(|| direct.then(|| Self::reserve_runtime_layout(size, coherent, windows, false)).flatten())
+    }
+
+    fn reserve_runtime_layout(size: usize, coherent: usize, windows: usize, direct: bool) -> Option<Uma> {
         let coh_sizes = coherent_window_sizes(size, coherent, windows);
         let coh_wins = coh_sizes.len();
         let sparse_wins = (windows - coh_wins).min(MAX_RUNTIME_SPARSE_WINDOWS);
-        let sparse_len = sparse_wins * WINDOW;
+        let sparse_len = sparse_wins * if direct { MAX_SIZE } else { WINDOW };
         for slot in (windows..slot_limit(windows)).step_by(windows) {
             let base = slot << 32;
-            let sp = unsafe { VirtualAlloc(base as *const std::ffi::c_void, sparse_len, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) };
-            if sp as usize != base {
-                if !sp.is_null() {
-                    unsafe { VirtualFree(sp, 0, MEM_RELEASE) };
+            let mut win_allocs = Vec::with_capacity(1 + coh_wins);
+            let mut sparse_free: (BTreeMap<usize, usize>, BTreeMap<usize, usize>) = Default::default();
+            let mut ok = true;
+            if direct {
+                // one whole-committed allocation per window: the 1 MiB left of each is not address space
+                for k in 0..sparse_wins {
+                    let w = base + k * WINDOW;
+                    let sp = unsafe { VirtualAlloc(w as *const std::ffi::c_void, MAX_SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+                    if sp as usize != w {
+                        if !sp.is_null() {
+                            unsafe { VirtualFree(sp, 0, MEM_RELEASE) };
+                        }
+                        ok = false;
+                        break;
+                    }
+                    win_allocs.push(w);
+                    sparse_free.0.insert(w, MAX_SIZE);
+                }
+            } else if sparse_wins > 0 {
+                let sp = unsafe { VirtualAlloc(base as *const std::ffi::c_void, sparse_len, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) };
+                if sp as usize == base {
+                    win_allocs.push(base);
+                    sparse_free.0.insert(base, sparse_len);
+                } else {
+                    if !sp.is_null() {
+                        unsafe { VirtualFree(sp, 0, MEM_RELEASE) };
+                    }
+                    ok = false;
+                }
+            }
+            if !ok {
+                for p in win_allocs {
+                    unsafe { VirtualFree(p as *mut std::ffi::c_void, 0, MEM_RELEASE) };
                 }
                 continue;
             }
-            let mut win_allocs = Vec::with_capacity(1 + coh_wins);
-            win_allocs.push(base);
-            let mut ok = true;
             for (c, &c_size) in coh_sizes.iter().enumerate() {
                 let c_base = base + (sparse_wins + c) * WINDOW;
                 let cp = unsafe { VirtualAlloc(c_base as *const std::ffi::c_void, c_size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
@@ -295,13 +337,12 @@ impl Uma {
                 inner.free.insert(k * WINDOW, c_size);
                 kinds[k] = WindowKind::Committed(c_size);
             }
-            let mut sparse_free: (BTreeMap<usize, usize>, BTreeMap<usize, usize>) = Default::default();
-            sparse_free.0.insert(base, sparse_len);
             let u = Uma {
                 base,
                 kinds,
                 win_allocs,
                 inner: Mutex::new(inner),
+                sparse_len: if direct { MAX_SIZE } else { WINDOW },
                 sparse_free: Mutex::new(sparse_free),
                 shadowed: AtomicBool::new(false),
                 pool: Mutex::new((0, 0, Vec::new())),
@@ -531,6 +572,7 @@ impl Uma {
                     kinds,
                     win_allocs,
                     inner: Mutex::new(inner),
+                    sparse_len: WINDOW,
                     sparse_free: Mutex::new(Default::default()),
                     shadowed: AtomicBool::new(false),
                     pool: Mutex::new((0, 0, Vec::new())),
@@ -563,11 +605,16 @@ impl Uma {
         self.kinds.iter().filter(|w| matches!(w, WindowKind::Committed(_))).count()
     }
 
-    /// (address, bytes) of window `k` (a sparse window: all 4 GiB)
+    /// Whether the sparse windows are whole-committed allocations (`MAX_SIZE` each, not 4 GiB).
+    pub fn sparse_direct(&self) -> bool {
+        self.sparse_len < WINDOW
+    }
+
+    /// (address, bytes) of window `k` (a sparse window: all 4 GiB, or `MAX_SIZE` when direct)
     pub fn window(&self, k: usize) -> (usize, usize) {
         let len = match self.kinds.get(k).copied().unwrap_or(WindowKind::None) {
             WindowKind::Committed(s) => s,
-            WindowKind::Sparse => WINDOW,
+            WindowKind::Sparse => self.sparse_len,
             WindowKind::None => 0,
         };
         (self.base + k * WINDOW, len)
@@ -575,7 +622,7 @@ impl Uma {
 
     /// Underlying write-watched `VirtualAlloc` regions `(base, size)` for `GetWriteWatch`:
     /// contiguous sparse windows belong to a single reservation, while each committed window
-    /// is its own allocation.
+    /// (and each whole-committed sparse one) is its own allocation.
     pub fn watch_regions(&self) -> Vec<(usize, usize)> {
         let mut out: Vec<(usize, usize)> = Vec::with_capacity(self.kinds.len());
         let mut k = 0;
@@ -590,8 +637,11 @@ impl Uma {
                     let start = self.base + k * WINDOW;
                     let mut len = 0usize;
                     while k < self.kinds.len() && matches!(self.kinds[k], WindowKind::Sparse) {
-                        len += WINDOW;
+                        len += self.sparse_len;
                         k += 1;
+                        if self.sparse_direct() {
+                            break;
+                        }
                     }
                     out.push((start, len));
                 }
@@ -1141,6 +1191,35 @@ mod tests {
         assert_eq!(u.sparse_used(), 0);
         // Contiguous sparse windows 0..2 are reported as one OS watch region; window 3 as another.
         assert_eq!(u.watch_regions(), vec![(u.base(), 3 * WINDOW), (u.base() + 3 * WINDOW, 16 << 20)]);
+    }
+
+    #[test]
+    fn the_direct_layout_shortens_the_sparse_windows_and_gives_each_its_own_watch_region() {
+        let test = "the_direct_layout_shortens_the_sparse_windows_and_gives_each_its_own_watch_region";
+        let Some(d) = Uma::reserve_runtime_layout(16 << 20, 16 << 20, MAX_WINDOWS, true) else {
+            eprintln!("SKIPPED {test}: the host refused {} MiB of committed memory", 3 * MAX_SIZE / (1 << 20));
+            return;
+        };
+        let b = d.base();
+        assert!(d.sparse_direct());
+        for k in 0..MAX_RUNTIME_SPARSE_WINDOWS {
+            assert_eq!(d.window(k), (b + k * WINDOW, MAX_SIZE), "sparse window {k} is one whole-committed allocation");
+            assert!(d.is_sparse_window(k));
+        }
+        assert_eq!(d.window_of(b + MAX_RUNTIME_SPARSE_WINDOWS * WINDOW - 1), None, "the 1 MiB at a window's end is not address space");
+        let (a, la) = d.sparse_alloc_in(2, MAX_SIZE - GRAIN, GRAIN).expect("a direct window's whole length is allocatable");
+        assert_eq!(d.window_of(a), Some(2));
+        assert!(a + la <= b + 2 * WINDOW + MAX_SIZE, "an allocation stays inside its window");
+        assert_eq!(d.sparse_release(a), Some(la));
+        assert_eq!(
+            d.watch_regions(),
+            vec![(b, MAX_SIZE), (b + WINDOW, MAX_SIZE), (b + 2 * WINDOW, MAX_SIZE), (b + 3 * WINDOW, 16 << 20)],
+            "each whole-committed sparse window is its own write-watch region"
+        );
+        let t = Uma::reserve_runtime_layout(16 << 20, 16 << 20, MAX_WINDOWS, false).expect("tiled layout");
+        assert!(!t.sparse_direct());
+        assert_eq!(t.window(0).1, WINDOW);
+        assert_eq!(t.watch_regions(), vec![(t.base(), 3 * WINDOW), (t.base() + 3 * WINDOW, 16 << 20)]);
     }
 
     #[test]

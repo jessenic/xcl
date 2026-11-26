@@ -101,7 +101,12 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp),
             ];
             let callers = stack_callers(c.Rsp as usize);
-            regs.iter().map(|(n, v)| format!(" {n}={v:#x}{}", obj(*v))).collect::<String>() + &if callers.is_empty() { String::new() } else { format!("; on the stack: {callers}") }
+            // LOCAL: physical-page events of the pages the registers point into
+            let pages: String = regs.iter().filter(|(_, v)| *v >= 0x1_0000_0000 && *v < 0x10_0000_0000).filter_map(|(n, v)| {
+                let a = crate::hle::kernelx::page_log::about(*v as usize);
+                (!a.is_empty()).then(|| format!(" [{n} page: {a}]"))
+            }).collect();
+            regs.iter().map(|(n, v)| format!(" {n}={v:#x}{}", obj(*v))).collect::<String>() + &pages + &if callers.is_empty() { String::new() } else { format!("; on the stack: {callers}") }
         };
         let msg = format!(
             "unhandled exception {:#010x} in {}{extra}{regs}",

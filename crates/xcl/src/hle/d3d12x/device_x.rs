@@ -1109,7 +1109,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                 return hr;
             }
         } else {
-            placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
+            placed_hr = super::vram::place_pages_console(this, va as usize, &pc, state, clear, console_bytes, Some(&x), riid, ppv); // LOCAL: the console desc for XCL_TEXTURE_FOLLOW=3
         }
     }
     let hr = match placed_hr {

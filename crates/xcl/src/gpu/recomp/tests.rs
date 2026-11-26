@@ -4632,6 +4632,70 @@ fn gpu_arena_partial_commit_probe() {
     }
 }
 
+/// A whole-committed write-watched window imports as a heap and buffers placed in it sit at the
+/// window's GPU address plus their offset (`hle::d3d12x::sparse`, the direct sparse windows).
+#[test]
+fn gpu_buffers_placed_on_an_imported_window_heap_stay_at_the_window_offset() {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows_sys::Win32::System::Memory::*;
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    let mb = crate::gpu::uma::MAX_SIZE >> 20;
+    unsafe {
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+            runner::skip_test("no GPU");
+            return;
+        }
+        let dev = dev.unwrap();
+        let Ok(dev3) = dev.cast::<ID3D12Device3>() else {
+            runner::skip_test("no ID3D12Device3");
+            return;
+        };
+        let p = VirtualAlloc(std::ptr::null(), crate::gpu::uma::MAX_SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+        assert!(!p.is_null(), "no {} MB of commit", mb);
+        let heap: ID3D12Heap = match dev3.OpenExistingHeapFromAddress(p) {
+            Ok(h) => h,
+            Err(e) => {
+                VirtualFree(p, 0, MEM_RELEASE);
+                panic!("OpenExistingHeapFromAddress of a {} MB write-watched window: {e}", mb);
+            }
+        };
+        assert_eq!(heap.GetDesc().SizeInBytes as usize, crate::gpu::uma::MAX_SIZE, "the heap is not the whole window");
+        let buf = |w: u64| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: w,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+            ..Default::default()
+        };
+        let mut keep: Vec<ID3D12Resource> = Vec::new();
+        let mut placed = |offset: u64, w: u64| -> Result<u64, String> {
+            let mut r: Option<ID3D12Resource> = None;
+            match dev.CreatePlacedResource(&heap, offset, &buf(w), D3D12_RESOURCE_STATE_COMMON, None, &mut r) {
+                Ok(()) => {
+                    let res = r.unwrap();
+                    let va = res.GetGPUVirtualAddress();
+                    keep.push(res);
+                    Ok(va)
+                }
+                Err(e) => Err(format!("{e}")),
+            }
+        };
+        let base = placed(0, crate::gpu::uma::MAX_SIZE as u64).expect("a buffer over the whole window");
+        assert_eq!(placed(0x1_0000, 0x2_0000).unwrap(), base + 0x1_0000, "a placed buffer is not at its address in the window");
+        assert_eq!(placed(0x2_0000, 0x2_0000).unwrap(), base + 0x2_0000, "a placement may overlap one already there (the title aliases)");
+        assert!(placed(0x1_8000, 0x2_0000).is_err(), "a placed buffer needs a 64 KiB-aligned offset");
+        drop(heap);
+        VirtualFree(p, 0, MEM_RELEASE);
+    }
+}
+
 /// Decoded GFX10 T#s give resource descriptions the driver accepts.
 #[test]
 fn gpu_tsharp_to_d3d12_resources() {

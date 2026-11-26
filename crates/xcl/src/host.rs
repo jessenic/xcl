@@ -83,6 +83,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                if let Some((lb, nb)) = crate::hle::d3d12x::real::video_budget() {
+                    crate::xlog_info!("video memory budget: {} MB local, {} MB non-local", mb(lb), mb(nb)); // LOCAL
+                }
                 let (evicted, mapped_again) = crate::hle::d3d12x::vram::eviction_counts();
                 if evicted > 0 {
                     crate::xlog_info!("page budget: {evicted} textures evicted, {mapped_again} mapped again");

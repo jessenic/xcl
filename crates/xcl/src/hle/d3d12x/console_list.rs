@@ -798,7 +798,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let q = |k: usize| get(1 + 2 * k) as u64 | (get(2 + 2 * k) as u64) << 32;
                 let (dst, src) = (q(0) as *mut c_void, q(2) as *mut c_void);
                 if let (Some(d), Some(s)) = (ID3D12Resource::from_raw_borrowed(&dst), ID3D12Resource::from_raw_borrowed(&src)) {
-                    list.CopyBufferRegion(d, q(1), s, q(3), q(4));
+                    // LOCAL: XCL_GPU_CULPRIT marker
+                    let what = || format!("CopyBufferRegion (console list) {} <- {}", super::culprit::buffer_range("dst", dst as usize, q(1), q(4)), super::culprit::buffer_range("src", src as usize, q(3), q(4)));
+                    super::culprit::marked(list.as_raw(), what, || list.CopyBufferRegion(d, q(1), s, q(3), q(4)));
                     out.copies += 1;
                 } else {
                     out.skipped += 1;
@@ -809,15 +811,36 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let values = [get(8), get(9), get(10), get(11)];
                 let res = q(2) as *mut c_void;
                 let (gpu, cpu) = (super::console_heap::slot(q(0)), super::console_heap::slot(q(1)));
+                // LOCAL: `XCL_CLEAR_UAV_LOG=1` logs the replayed clears (first 64), `XCL_SKIP_CLEAR_UAV=1`
+                // leaves them out (to find a clear that hangs the GPU)
+                static LOG_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if std::env::var("XCL_CLEAR_UAV_LOG").is_ok_and(|v| v.trim() == "1") {
+                    let k = LOG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k < 64 || k.is_power_of_two() {
+                        let d = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+                        crate::xlog_info!(
+                            "console list: clear #{k} {} gpu slot {:?} cpu slot {:?}, resource {res:p} {:?}",
+                            if get(1) != 0 { "float" } else { "uint" },
+                            gpu.map(|g| g.pc_gpu_uav), cpu.map(|c| c.pc_uav),
+                            d.map(|d| (d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0, d.Flags.0))
+                        );
+                    }
+                }
+                let skip_clear = std::env::var("XCL_SKIP_CLEAR_UAV").is_ok_and(|v| v.trim() == "1");
                 match (gpu, cpu, ID3D12Resource::from_raw_borrowed(&res)) {
+                    _ if skip_clear => out.skipped += 1,
                     (Some(g), Some(c), Some(r)) if g.pc_gpu_uav != 0 => {
                         let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: g.pc_gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
-                        if get(1) != 0 {
-                            let f = values.map(f32::from_bits);
-                            list.ClearUnorderedAccessViewFloat(gh, ch, r, &f, &[]);
-                        } else {
-                            list.ClearUnorderedAccessViewUint(gh, ch, r, &values, &[]);
-                        }
+                        // LOCAL: XCL_GPU_CULPRIT marker
+                        let what = || format!("ClearUnorderedAccessView{} (console list) gpu {:#x} {}", if get(1) != 0 { "Float" } else { "Uint" }, g.pc_gpu_uav, super::culprit::resource("res", res as usize));
+                        super::culprit::marked(list.as_raw(), what, || {
+                            if get(1) != 0 {
+                                let f = values.map(f32::from_bits);
+                                list.ClearUnorderedAccessViewFloat(gh, ch, r, &f, &[]);
+                            } else {
+                                list.ClearUnorderedAccessViewUint(gh, ch, r, &values, &[]);
+                            }
+                        });
                         out.clears += 1;
                     }
                     _ => out.skipped += 1,
@@ -835,14 +858,21 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let bx: [u32; 6] = [get(29), get(30), get(31), get(32), get(33), get(34)];
                 let (pd, ps) = (dst[0] as *mut c_void, src[0] as *mut c_void);
                 if ID3D12Resource::from_raw_borrowed(&pd).is_some() && ID3D12Resource::from_raw_borrowed(&ps).is_some() {
-                    list.CopyTextureRegion(
-                        dst.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION,
-                        get(13),
-                        get(14),
-                        get(15),
-                        src.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION,
-                        if get(28) != 0 { Some(bx.as_ptr() as *const D3D12_BOX) } else { None },
-                    );
+                    // LOCAL: XCL_GPU_CULPRIT marker
+                    let what = || {
+                        let (d, s) = (dst.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION, src.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION);
+                        format!("CopyTextureRegion (console list) {} <- {}", super::culprit::location("dst", d), super::culprit::location("src", s))
+                    };
+                    super::culprit::marked(list.as_raw(), what, || {
+                        list.CopyTextureRegion(
+                            dst.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION,
+                            get(13),
+                            get(14),
+                            get(15),
+                            src.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION,
+                            if get(28) != 0 { Some(bx.as_ptr() as *const D3D12_BOX) } else { None },
+                        )
+                    });
                     out.copies += 1;
                 } else {
                     out.skipped += 1;
@@ -902,6 +932,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         }
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
+                        super::culprit::note_bound(pc); // LOCAL
                         list.SetPipelineState(pc);
                         let mark = super::culprit::before_dispatch(&list, (*p).pc, real, [x, y, z]);
                         let ran = super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z]);

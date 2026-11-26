@@ -241,6 +241,11 @@ unsafe extern "system" fn get_cached_blob(this: *mut c_void, ppv: *mut *mut c_vo
 
 const SLOTS: usize = 64;
 
+/// LOCAL: whether `obj` is one of the shells (not a driver object)
+pub unsafe fn is_shell(obj: usize) -> bool {
+    obj != 0 && *(obj as *const usize) == vtable()
+}
+
 fn vtable() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| {

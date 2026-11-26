@@ -57,7 +57,9 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     }
     let token = (planes as *const u64).read_unaligned();
     let _present = PRESENTX_LOCK.lock().unwrap();
+    super::real::crumb(false, || format!("PresentX x{plane_count}"));
     present_x_frame(queue, plane_count, planes);
+    super::real::crumb(true, || "PresentX".into());
     // The title can use flip statistics to decide when to reuse its buffer.
     // Queue our copy before reporting the flip.
     super::frame::mark_flipped(token);

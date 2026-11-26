@@ -524,6 +524,14 @@ fn source_of(va: usize, len: usize) -> Source {
 fn recheck_gpu_view_sources() {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     let pages = crate::hle::kernelx::mirrors::take_changed();
+    // LOCAL (#1514, XCL_TEXTURE_FOLLOW): the texture pages there follow the method's mapping too
+    // (`vram::before_execute`, which comes after this in the submit): memory where it mapped a
+    // page, none where it took it
+    if super::vram::following() {
+        for &(a, b) in &pages {
+            super::vram::title_memory_changed(a, b.saturating_sub(a));
+        }
+    }
     let gen = crate::hle::kernelx::gpu_view_map_gen();
     let all = SEEN.swap(gen, Ordering::AcqRel) != gen;
     if !all && pages.is_empty() {
@@ -807,6 +815,24 @@ fn revive_named(mut named: Vec<usize>) {
     }
 }
 
+/// LOCAL: the textures `keys` go up whole at the next upload: their content hash is forgotten.
+fn mark_reupload(mut keys: Vec<usize>) {
+    keys.sort_unstable();
+    keys.dedup();
+    for &res in &keys {
+        forget_content(res);
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    for res in keys {
+        if let Some(e) = t.get_mut(res) {
+            if !e.pending && !e.gpu_written {
+                e.pending = true;
+                PENDING.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Subresources of a texture kept in step (as `subresources` makes them).
 fn subresource_count(tex: &xg::Texture) -> usize {
     tex.texels().map_or(1, |s| s.array as usize * s.chain.levels.len())
@@ -863,6 +889,17 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().flat_map(|e| e.src.ranges(e.tex.size() as usize).map(|(s, e)| (s & !0xFFF, (e + 0xFFF) & !0xFFF)).collect::<Vec<_>>()).collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
+    {
+        // LOCAL: what the look walks (ranges and bytes), each time the set changes, at most every 5 s
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let mut l = LAST.lock().unwrap();
+        if l.is_none_or(|t| t.elapsed().as_secs() >= 5) {
+            *l = Some(std::time::Instant::now());
+            let bytes: usize = computed.iter().map(|r| r.1).sum();
+            let big = computed.iter().filter(|r| r.1 >= 64 << 20).count();
+            crate::xlog_info!("write-watch ranges: {} ranges, {} MB ({} of 64 MB or more); {} regions", computed.len(), bytes >> 20, big, regions.len());
+        }
+    }
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
@@ -887,8 +924,42 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    let arrived = look_clock();
     let _refresh = REFRESH.lock().unwrap();
+    // LOCAL (XCL_LOOK_COMBINE=1): a look that started after this submit arrived has seen every
+    // CPU write made before it, and its texture uploads finished before it let `REFRESH` go
+    // (`upload_batch` waits for them). This queue only has to wait for the sparse uploads and
+    // tile mappings it sent, which these two calls do with nothing dirty.
+    if look_combine() && LAST_LOOK.load(Ordering::Acquire) > arrived {
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+            own_work(|| {
+                super::sparse::before_execute(q, &[], 0x1000);
+                super::vram::before_execute(q);
+            });
+            let n = LOOKS_SHARED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("write-watch: {n} submits used a look another submit started after them");
+            }
+            return;
+        }
+    }
     own_work(|| refresh_once(queue));
+}
+
+/// LOCAL: when the last look started, in µs of `look_clock` (0: none yet)
+static LAST_LOOK: AtomicU64 = AtomicU64::new(0);
+static LOOKS_SHARED: AtomicU64 = AtomicU64::new(0);
+
+/// LOCAL: µs since the first call, never 0
+fn look_clock() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1
+}
+
+/// LOCAL: `XCL_LOOK_COMBINE=1`
+fn look_combine() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_LOOK_COMBINE").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
@@ -918,6 +989,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
         return;
     }
     recheck_gpu_view_sources();
+    // (before the first GetWriteWatch: a submit that arrived before this may share it) LOCAL
+    LAST_LOOK.store(look_clock(), Ordering::Release);
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
@@ -970,8 +1043,13 @@ unsafe fn refresh_once(queue: *mut c_void) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
             super::sparse::before_execute(q, &dirty, page as usize);
-            super::vram::before_execute(q);
+            super::vram::before_title_execute(q);
         });
+    }
+    // LOCAL (#1514 port review): textures a page was mapped for again go up whole
+    let again = super::vram::take_reupload();
+    if !again.is_empty() {
+        mark_reupload(again);
     }
     let recheck_frame = {
         let (p, b) = super::present::counters();

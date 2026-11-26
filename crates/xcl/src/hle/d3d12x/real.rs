@@ -483,6 +483,58 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
+
+// LOCAL: XCL_REMOVAL_TRIPWIRE=1 – the last D3D12 calls, and the first one after which the device
+// is found removed (checked right after the call, and by a 1 ms poller)
+static CRUMBS: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+static TRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn tripwire_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_REMOVAL_TRIPWIRE").is_ok_and(|v| v == "1"))
+}
+
+fn trip(after: &str) {
+    let raw = device_raw();
+    let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
+    let Err(e) = (unsafe { dev.GetDeviceRemovedReason() }) else { return };
+    if TRIPPED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let r = CRUMBS.lock().unwrap();
+    crate::xlog_error!("tripwire: device removed ({:#x}) first seen at {:.4} {after}; the last {} calls:", e.code().0 as u32, crate::log::uptime(), r.len());
+    for l in r.iter() {
+        crate::xlog_error!("  {l}");
+    }
+}
+
+/// LOCAL: note a call (`what`), and check the device after it (`after`: true when it has returned).
+pub fn crumb(after: bool, what: impl FnOnce() -> String) {
+    if !tripwire_on() || TRIPPED.load(Ordering::Relaxed) {
+        return;
+    }
+    static POLL: std::sync::Once = std::sync::Once::new();
+    POLL.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-tripwire".into()).spawn(|| {
+            while !TRIPPED.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                trip("by the poller");
+            }
+        });
+    });
+    let line = format!("[{:.4}] {}{}", crate::log::uptime(), if after { "done " } else { "" }, what());
+    {
+        let mut r = CRUMBS.lock().unwrap();
+        if r.len() == 96 {
+            r.pop_front();
+        }
+        r.push_back(line.clone());
+    }
+    if after {
+        trip(&format!("right after: {line}"));
+    }
+}
+
 /// The process's video memory on the device's adapter: (local, non-local) bytes in use.
 pub fn video_memory() -> Option<(u64, u64)> {
     use windows::Win32::Graphics::Dxgi::*;
@@ -497,6 +549,23 @@ pub fn video_memory() -> Option<(u64, u64)> {
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
         Some((local.CurrentUsage, non_local.CurrentUsage))
+    }
+}
+
+/// The OS's local and non-local video memory budgets for the process (bytes). LOCAL
+pub fn video_budget() -> Option<(u64, u64)> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let raw = device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
+    unsafe {
+        let luid = dev.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(luid).ok()?;
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
+        Some((local.Budget, non_local.Budget))
     }
 }
 
@@ -618,11 +687,34 @@ pub fn init() -> Result<String, String> {
 /// A debug layer message: errors and warnings into the log – the first 8 of each message id
 /// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
 /// errors of a retail game, long before the message that came with its device removal.
+static DEBUG_RING: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+
+/// LOCAL: the debug layer's last messages, in the log (called at a device removal).
+pub fn dump_debug_ring() {
+    let r = DEBUG_RING.lock().unwrap();
+    if r.is_empty() {
+        return;
+    }
+    crate::xlog_error!("D3D12 debug layer: the last {} messages before the removal:", r.len());
+    for l in r.iter() {
+        crate::xlog_error!("  {}", l.chars().take(600).collect::<String>());
+    }
+}
+
 unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
     if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
         return;
+    }
+    // LOCAL: the last 64 messages of any kind, printed at a device removal (`dump_debug_ring`)
+    if !text.is_null() {
+        let line = format!("[{:.3}] ({}, id {}) {}", crate::log::uptime(), if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 { "error" } else { "warning" }, id.0, String::from_utf8_lossy(text.as_bytes()));
+        let mut r = DEBUG_RING.lock().unwrap();
+        if r.len() == 64 {
+            r.pop_front();
+        }
+        r.push_back(line);
     }
     {
         let mut g = PER_ID.lock().unwrap();
@@ -1033,7 +1125,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
         Kind::DmaList => {
             use super::list_x as l;
-            vec![(9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize)]
+            // LOCAL: #14 CopyTiles (PC #18) through a pass-through with the XCL_GPU_CULPRIT marker
+            vec![(9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize), (14, l::copy_tiles_x as usize)]
         }
         Kind::CommandList => {
             use super::bind as b;
@@ -1044,6 +1137,10 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (15, l::copy_buffer_region_x as usize),
                 (16, l::copy_texture_region_x as usize),
                 (17, l::copy_resource_x as usize),
+                // LOCAL: CopyTiles (#18 as on PC) and DiscardResource (#55 = PC #51): pass-throughs
+                // with the XCL_GPU_CULPRIT marker
+                (18, l::copy_tiles_x as usize),
+                (55, l::discard_resource_x as usize),
                 (19, l::resolve_subresource_x as usize),
                 (51, l::clear_depth_stencil_x as usize),
                 (53, l::clear_uav_uint_x as usize),
@@ -1647,10 +1744,12 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
                     let begin = r.Begin.min(bytes);
                     let end = r.End.min(bytes);
                     if end > begin {
+                        note_map_readback(this as usize, p, bytes, begin, end, u_kind(p));
                         super::sparse::readback_now(p + begin, end - begin);
                     }
                 }
             } else if SPARSE_READBACK.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
+                note_map_readback(this as usize, p, bytes, 0, bytes, u_kind(p) + " (readback heap)");
                 super::sparse::readback_now(p, bytes);
             }
         }
@@ -1687,6 +1786,34 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
             }
             hr
         }
+    }
+}
+
+/// LOCAL: which memory the title's Map reads back: the first 24 maps, then per resource every
+/// 8192 calls (the top 8 by calls).
+fn u_kind(p: usize) -> String {
+    match crate::gpu::uma::get() {
+        Some(u) if u.is_sparse(p) => "sparse".into(),
+        Some(_) => "coherent".into(),
+        None => "?".into(),
+    }
+}
+fn note_map_readback(res: usize, p: usize, bytes: usize, begin: usize, end: usize, kind: String) {
+    static SEEN: Mutex<Option<(u64, HashMap<usize, (u64, u64, usize, String)>)>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap();
+    let (n, m) = g.get_or_insert_with(Default::default);
+    *n += 1;
+    let e = m.entry(res).or_insert((0, 0, bytes, kind.clone()));
+    e.0 += 1;
+    e.1 += (end - begin) as u64;
+    if *n <= 24 {
+        crate::xlog_info!("map readback #{n}: resource {res:#x} at {p:#x} ({bytes} B, {kind}), range {begin:#x}..{end:#x}");
+    }
+    if n.is_multiple_of(8192) {
+        let mut top: Vec<_> = m.iter().map(|(r, v)| (*r, v.clone())).collect();
+        top.sort_by_key(|(_, v)| std::cmp::Reverse(v.0));
+        let list: Vec<String> = top.iter().take(8).map(|(r, (c, b, size, k))| format!("{r:#x} {size} B {k}: {c} maps, {} KB", b >> 10)).collect();
+        crate::xlog_info!("map readbacks: {n} in all over {} resources; most: {}", m.len(), list.join("; "));
     }
 }
 
@@ -2966,6 +3093,8 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateCommandList1", dev_create_command_list1 as usize),
             ("CreateCommittedResource1", dev_create_committed_resource1 as usize),
             ("CreateHeap1", dev_create_heap1 as usize),
+            ("MakeResident", dev_make_resident_counted as usize), // LOCAL
+            ("Evict", dev_evict_counted as usize), // LOCAL
             ("CreateReservedResource1", dev_create_reserved_resource1 as usize),
             ("CreateStateObject", dev_create_state_object as usize),
             ("CreateCommittedResource2", dev_create_committed_resource2 as usize),
@@ -2991,7 +3120,10 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("Close", cl_close as usize),
             ("Reset", cl_reset as usize),
         ]),
-        Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
+        Kind::CommandQueue => v.extend_from_slice(&[
+            ("Release", q_release as usize),
+            ("ExecuteCommandLists", q_execute_command_lists as usize),
+        ]),
         Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
         Kind::Resource => v.extend_from_slice(&[
             ("Release", res_release as usize),
@@ -3436,7 +3568,7 @@ unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
     hr
 }
 
-unsafe fn is_reserved(res: *mut c_void) -> bool {
+pub(super) unsafe fn is_reserved(res: *mut c_void) -> bool { // LOCAL: pub(super) for the culprit labels
     let kept = RESERVED.lock().unwrap().as_ref().and_then(|m| m.get(&(res as usize)).copied());
     kept.is_some_and(|k| desc_of(res) == Some(k))
 }
@@ -3510,6 +3642,10 @@ struct HeapUma {
     /// in it read back on `Map(0, NULL, ...)`.
     cpu_readback: bool,
     block: Option<usize>,
+    /// something was placed (or tiles mapped) in the PC heap itself. LOCAL
+    pc_used: bool,
+    /// the PC heap is evicted: its buffers are all in `block`, nothing else is in it. LOCAL
+    evicted: bool,
 }
 
 /// heap → its backing block (allocated lazily on the first placed buffer; sparse VRAM for
@@ -3545,6 +3681,8 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
             prefer_coherent: is_rb && size <= COHERENT_READBACK_MAX,
             cpu_readback: is_rb || is_custom_wb,
             block: None,
+            pc_used: false,
+            evicted: false,
         },
     );
 }
@@ -3604,6 +3742,18 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
         return Some((existing, cr));
     }
     e.block = Some(p);
+    if false && !e.pc_used && u.is_sparse(p) && heap_evict_enabled() { // LOCAL: off (never fired on this title)
+        // the PC heap would only hold textures, and none is in it: it stops taking video
+        // memory (`heap_pc_use` makes it resident before anything uses it). LOCAL
+        if unsafe { heap_residency(heap, false) } {
+            e.evicted = true;
+            let n = HEAPS_EVICTED.fetch_add(1, Ordering::Relaxed) + 1;
+            let b = HEAP_BYTES_EVICTED.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} title heaps with their buffers in sparse VRAM evicted on the PC ({} MB)", b >> 20);
+            }
+        }
+    }
     drop(g);
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -3611,6 +3761,92 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
         crate::xlog_info!("D3D12.X: heap {heap:#x} ({size:#x} bytes) holds buffers: in {kind} at {p:#x}");
     }
     Some((p, cpu_readback))
+}
+
+static HEAPS_EVICTED: AtomicU64 = AtomicU64::new(0);
+static HEAP_BYTES_EVICTED: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_HEAP_EVICT=0`: title heaps whose buffers are in sparse VRAM keep their PC heap resident. LOCAL
+fn heap_evict_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XCL_HEAP_EVICT").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// Evict (`resident` false) or MakeResident a PC heap; whether the call succeeded. LOCAL
+unsafe fn heap_residency(heap: usize, resident: bool) -> bool {
+    let raw = heap as *mut c_void;
+    let Some(h) = ID3D12Heap::from_raw_borrowed(&raw) else { return false };
+    let mut dev: Option<ID3D12Device> = None;
+    if h.GetDevice(&mut dev).is_err() {
+        return false;
+    }
+    let Some(dev) = dev else { return false };
+    // the heap is an ID3D12Pageable; no reference is taken or dropped for the call
+    let list = [Some(ID3D12Pageable::from_raw(raw))];
+    let r = if resident { dev.MakeResident(&list) } else { dev.Evict(&list) };
+    std::mem::forget(list);
+    if let Err(e) = &r {
+        crate::xlog_warn!("D3D12.X: {} of title heap {heap:#x} failed: {e}", if resident { "MakeResident" } else { "Evict" });
+    }
+    r.is_ok()
+}
+
+/// Something is placed in, or tiles are mapped to, the PC heap `heap`: if it is a title heap
+/// XCL evicted, it is made resident first, and it stays so. LOCAL
+pub(super) unsafe fn heap_pc_use(heap: usize) {
+    if heap == 0 {
+        return;
+    }
+    let mut g = HEAP_UMA.lock().unwrap();
+    let Some(e) = g.as_mut().and_then(|m| m.get_mut(&heap)) else { return };
+    e.pc_used = true;
+    if e.evicted {
+        e.evicted = false;
+        // under the lock: a block taken at the same time must not evict it again
+        heap_residency(heap, true);
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_info!("D3D12.X: evicted title heap {heap:#x} is used on the PC: resident again");
+        }
+    }
+}
+
+/// ID3D12CommandQueue::UpdateTileMappings: tiles mapped to an evicted title heap make it
+/// resident first. LOCAL
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn q_update_tile_mappings(
+    this: *mut c_void, res: usize, regions: u32, coords: usize, sizes: usize, heap: usize, ranges: u32, flags: usize, offsets: usize, counts: usize, f: u32,
+) {
+    heap_pc_use(heap);
+    type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, usize, usize, u32, usize, usize, usize, u32);
+    let g: F = std::mem::transmute(orig_fn(this, slot_of(this, "UpdateTileMappings")));
+    g(this, res, regions, coords, sizes, heap, ranges, flags, offsets, counts, f)
+}
+
+/// LOCAL: how often residency calls come and with what: (calls, objects, shells among them)
+static RESIDENCY: [[AtomicU64; 3]; 2] = [const { [const { AtomicU64::new(0) }; 3] }; 2];
+unsafe fn note_residency(which: usize, n: u32, objs: *const usize) {
+    let shells = if objs.is_null() { 0 } else { (0..n as usize).filter(|&i| super::standin::is_shell(*objs.add(i))).count() as u64 };
+    let c = RESIDENCY[which][0].fetch_add(1, Ordering::Relaxed) + 1;
+    RESIDENCY[which][1].fetch_add(n as u64, Ordering::Relaxed);
+    RESIDENCY[which][2].fetch_add(shells, Ordering::Relaxed);
+    if c.is_power_of_two() {
+        let v = |w: usize, i: usize| RESIDENCY[w][i].load(Ordering::Relaxed);
+        crate::xlog_info!(
+            "residency: MakeResident {} calls ({} objects, {} stand-in shells), Evict {} calls ({} objects, {} shells)",
+            v(0, 0), v(0, 1), v(0, 2), v(1, 0), v(1, 1), v(1, 2)
+        );
+    }
+}
+unsafe extern "system" fn dev_make_resident_counted(this: *mut c_void, n: u32, objs: *const usize) -> HRESULT {
+    note_residency(0, n, objs);
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const usize) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "MakeResident")));
+    f(this, n, objs)
+}
+unsafe extern "system" fn dev_evict_counted(this: *mut c_void, n: u32, objs: *const usize) -> HRESULT {
+    note_residency(1, n, objs);
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const usize) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Evict")));
+    f(this, n, objs)
 }
 
 /// ID3D12Heap::Release: its block of unified memory goes with it.
@@ -4396,6 +4632,12 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     let cs = shader_bytes(&d.CS)?;
     if !is_console(cs) {
         return None;
+    }
+    // LOCAL: XCL_REFUSE_CS: never translated nor handed to the driver (before `defer`, so no
+    // background / lazy build or preload is made of it either): main's fallback for a console CS
+    // without a translation follows, and its dispatches are skipped
+    if super::culprit::refused_cs(cs) {
+        return Some(Err(())); // LOCAL
     }
     // made when first bound (`pso_async::lazy`): not even translated now
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
@@ -5668,7 +5910,13 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 }
 
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    graphics_pso(this, desc, riid, ppv, false)
+    crumb(false, || "CreateGraphicsPipelineState".into());
+    let hr = graphics_pso(this, desc, riid, ppv, false);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::culprit::note_graphics(*ppv as usize, desc); // LOCAL: draw markers name VS / PS
+    }
+    crumb(true, || { let p = if ppv.is_null() { 0 } else { *ppv as usize }; format!("CreateGraphicsPipelineState {hr:#x} -> {p:#x} {}", super::culprit::gfx_names(p)) });
+    hr
 }
 
 /// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
@@ -5718,10 +5966,12 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 }
 
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    crumb(false, || "CreateComputePipelineState".into());
     let hr = create_compute_pso(this, desc, riid, ppv);
     if hr >= 0 && !ppv.is_null() {
         super::culprit::note_compute(*ppv as usize, desc);
     }
+    crumb(true, || format!("CreateComputePipelineState {hr:#x} -> {:#x}", if ppv.is_null() { 0 } else { *ppv as usize }));
     hr
 }
 
@@ -7079,7 +7329,9 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::present::note_use(r, super::present::USE_CLEAR);
         }
     }
-    f(this, rtv, color, n, rects)
+    // LOCAL: XCL_GPU_CULPRIT marker (the PC override: title and XCL clears)
+    let what = || format!("ClearRenderTargetView rtv {rtv:#x} {}, {n} rects", super::present::rtv_resource(rtv).map_or("(resource unknown)".to_string(), |r| super::culprit::resource("res", r)));
+    super::culprit::marked(this, what, || f(this, rtv, color, n, rects))
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
@@ -7205,6 +7457,19 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
 }
 
 /// Reset the (adopted) PC allocator `raw` itself.
+/// Reset one of XCL's own allocators past the title's hook (`alloc_reset`): made after the device
+/// was hooked, it is adopted, and the hook's allocator bookkeeping takes locks a caller holding
+/// the sparse state must not wait for. LOCAL
+pub(super) unsafe fn own_allocator_reset(a: &ID3D12CommandAllocator) -> windows::core::Result<()> {
+    let raw = a.as_raw();
+    if !is_adopted(raw) {
+        return a.Reset();
+    }
+    type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
+    windows::core::HRESULT(f(raw)).ok()
+}
+
 pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
@@ -7452,6 +7717,14 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     hr
 }
 
+/// A fence's completed value for XCL's own bookkeeping, past the hook below: settling the
+/// title's copy-backs (which may spin for 2 ms on a busy lock) is for the title's reads only. LOCAL
+pub(super) unsafe fn fence_completed_unhooked(f: &ID3D12Fence) -> u64 {
+    let this = f.as_raw();
+    let g: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, slot_of(this, "GetCompletedValue")));
+    g(this)
+}
+
 /// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
 /// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land first.
 unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
@@ -7533,6 +7806,7 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
+    crumb(false, || format!("ExecuteCommandLists queue {this:p} x{n}"));
     if n == 0 || lists.is_null() {
         f(this, n, lists);
         stop_if_device_removed();
@@ -7681,6 +7955,9 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    crate::xlog_error!("bound code at the removal: {}", super::culprit::bound_code_summary()); // LOCAL
+    super::culprit::on_watchdog_release(); // LOCAL (qcdaark, #675): report at removal too
+    dump_debug_ring();
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {

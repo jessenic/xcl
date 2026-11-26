@@ -554,6 +554,11 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     }
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
+    // LOCAL (#1514, XCL_TEXTURE_FOLLOW): memory committed in a graphics reservation (or a CPU
+    // view with a GPU view): the texture pages there follow it
+    if !q.is_null() && t & mem::MEM_COMMIT != 0 && crate::hle::d3d12x::vram::following() && (in_graphics_reservation(q as usize) || !mirrors::gpu_views_of(q as usize).is_empty()) {
+        crate::hle::d3d12x::vram::title_memory_changed(q as usize, size);
+    }
     q
 }
 
@@ -678,7 +683,21 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         return 1;
     }
+    // LOCAL (#1514, XCL_TEXTURE_FOLLOW): memory going from a graphics reservation (or a CPU view
+    // with a GPU view): the decommitted range, or to its end (a release, or size 0), computed
+    // before the reservation is forgotten
+    let gone = (crate::hle::d3d12x::vram::following() && (in_graphics_reservation(addr as usize) || !mirrors::gpu_views_of(addr as usize).is_empty())).then(|| {
+        let a = addr as usize;
+        if t & 0x8000 != 0 || size == 0 {
+            GRAPHICS_RESERVATIONS.lock().unwrap().range(..=a).next_back().filter(|(&b, &s)| a < b + s).map_or(size, |(&b, &s)| b + s - a)
+        } else {
+            size
+        }
+    });
     let ok = mem::VirtualFree(addr, size, t);
+    if let Some(n) = gone.filter(|_| ok != 0) {
+        crate::hle::d3d12x::vram::title_memory_changed(addr as usize, n);
+    }
     if ok != 0 && t & 0x8000 != 0 {
         let released = GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize));
         if let Some(len) = released {
@@ -1167,6 +1186,42 @@ fn page_now(page: usize) -> Option<usize> {
     away.or_else(|| page_home(page))
 }
 
+/// LOCAL DIAGNOSTIC: the last physical-page events (map, move, unmap, free, home given up) by
+/// the 64 KiB page they touched, for the fault logger (`page_log::about`).
+pub mod page_log {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    const CAP: usize = 1 << 18;
+    static RING: Mutex<VecDeque<(f64, u8, usize, usize, usize)>> = Mutex::new(VecDeque::new());
+
+    /// `op`: b'M' mapped (home copied to va), b'L' mapped lazily, b'Z' mapped as zeros,
+    /// b'U' unmapped (va copied back to home), b'V' moved here from `other`, b'v' moved away to
+    /// `other`, b'F' freed while mapped at va, b'H' home at va given up (decommitted later).
+    pub fn note(op: u8, va: usize, page: usize, other: usize) {
+        let t = crate::log::uptime();
+        if let Ok(mut r) = RING.lock() {
+            if r.len() == CAP {
+                r.pop_front();
+            }
+            r.push_back((t, op, va & !(super::PHYS_PAGE - 1), page, other));
+        }
+    }
+
+    /// The events of the page holding `va`, newest last (at most 6), or "".
+    pub fn about(va: usize) -> String {
+        let p = va & !(super::PHYS_PAGE - 1);
+        let Ok(r) = RING.try_lock() else { return String::new() };
+        let hits: Vec<_> = r.iter().filter(|e| e.2 == p || (e.1 == b'v' && e.4 & !(super::PHYS_PAGE - 1) == p)).collect();
+        let n = hits.len();
+        hits[n.saturating_sub(6)..]
+            .iter()
+            .map(|e| format!("{}@{:.3}s(page {:#x}, {:#x})", e.1 as char, e.0, e.3, e.4))
+            .collect::<Vec<_>>()
+            .join(" ")
+            + &if n > 6 { format!(" [{n} events]") } else { String::new() }
+    }
+}
+
 /// Whether a physical page is mapped at the page holding `va` away from its home – committed
 /// or not yet (`lazy`: a page never used is committed at its first access).
 pub fn physical_page_at(va: usize) -> bool {
@@ -1314,6 +1369,7 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
 /// not see the page while it is away). True if homes were given back now.
 unsafe fn move_home_away(away: &mut Away, home: usize) -> bool {
     if lazy_home(home) {
+        page_log::note(b'H', home, 0, 0);
         away.gone.push(home);
         // (256 MB at a time: a call that maps gigabytes would otherwise hold them twice until
         // it ends)
@@ -1453,6 +1509,7 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
     if let Some(page) = away.at.remove(&at) {
         away.page.remove(&page);
         mirrors::page_moved(page);
+        page_log::note(b'U', at, page, page_home(page).unwrap_or(0));
         // never used where it was mapped: its home still holds the page (zeros)
         if lazy::unmark(at) {
             return false;
@@ -1511,6 +1568,8 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
         crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
     }
     release_at(old);
+    page_log::note(b'V', at, page, old);
+    page_log::note(b'v', old, page, at);
     away.at.insert(at, page);
     away.page.insert(page, at);
     Ok(true)
@@ -1584,6 +1643,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
             if let Some(at) = away.page.remove(&page) {
                 away.at.remove(&at);
                 lazy::unmark(at);
+                page_log::note(b'F', at, *arr.add(i), 0);
                 note_mapping_at(at);
             }
             if page_index(page).is_some() {
@@ -1730,6 +1790,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at));
         if fresh && plain && !committed_page_in(home, &mut home_run) {
             lazy::mark(at);
+            page_log::note(b'L', at, p, home);
             away.at.insert(at, p);
             away.page.insert(p, at);
             away.title.insert(at, p);
@@ -1740,11 +1801,13 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             return std::ptr::null_mut();
         }
         if committed_page(home) {
+            page_log::note(b'M', at, p, home);
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
             if move_home_away(away, home) {
                 (at_run, home_run) = Default::default();
             }
         } else if !fresh {
+            page_log::note(b'Z', at, p, home);
             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
@@ -1753,6 +1816,11 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         away.at.insert(at, p);
         away.page.insert(p, at);
         away.title.insert(at, p);
+    }
+    // LOCAL (#1514, XCL_TEXTURE_FOLLOW): pages mapped or unmapped in a graphics reservation (or
+    // a CPU view with a GPU view): the texture pages there follow them
+    if crate::hle::d3d12x::vram::following() && (in_graphics_reservation(base) || !mirrors::gpu_views_of(base).is_empty()) {
+        crate::hle::d3d12x::vram::title_memory_changed(base, n * PHYS_PAGE);
     }
     va
 }
