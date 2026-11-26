@@ -3205,6 +3205,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     lists.push(this);
     super::title_textures::revive_listed(&lists);
     super::title_textures::refresh(q_raw);
+    super::gpu_profile::note_queue(q_raw);
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {

@@ -819,6 +819,7 @@ fn revive_named(mut named: Vec<usize>) {
 fn mark_reupload(mut keys: Vec<usize>) {
     keys.sort_unstable();
     keys.dedup();
+    REUPLOADS_MARKED.fetch_add(keys.len() as u64, Ordering::Relaxed);
     for &res in &keys {
         forget_content(res);
     }
@@ -887,7 +888,8 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().flat_map(|e| e.src.ranges(e.tex.size() as usize).map(|(s, e)| (s & !0xFFF, (e + 0xFFF) & !0xFFF)).collect::<Vec<_>>()).collect();
-    wanted.extend(super::sparse::mapped_ranges());
+    let sparse_runs = super::sparse::mapped_ranges();
+    wanted.extend(sparse_runs.iter().copied());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     {
         // LOCAL: what the look walks (ranges and bytes), each time the set changes, at most every 5 s
@@ -900,8 +902,53 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
             crate::xlog_info!("write-watch ranges: {} ranges, {} MB ({} of 64 MB or more); {} regions", computed.len(), bytes >> 20, big, regions.len());
         }
     }
+    // LOCAL (XCL_LOOK_TEXTURES_MS): the sparse windows' tiles every look, what only textures use
+    // (outside them) at most every N ms – write-watch bits stay set until a look takes them, so
+    // a texture write is uploaded at most N ms late, never lost
+    let computed = if look_textures_ms() > 0 {
+        let fast = watch_ranges(&regions, sparse_runs);
+        *WATCH_SLOW.lock().unwrap() = Some(Arc::new(subtract_ranges(&computed, &fast)));
+        Arc::new(fast)
+    } else {
+        computed
+    };
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
+}
+
+/// LOCAL: the texture-only ranges looked at every `XCL_LOOK_TEXTURES_MS` (`cached_watch_ranges`)
+static WATCH_SLOW: Mutex<Option<Arc<Vec<(usize, usize)>>>> = Mutex::new(None);
+static SLOW_LOOK_AT: AtomicU64 = AtomicU64::new(0);
+
+/// LOCAL: `XCL_LOOK_TEXTURES_MS` (0: off, every range every look)
+fn look_textures_ms() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_LOOK_TEXTURES_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// LOCAL: `all` without what `cut` covers; both sorted, disjoint (base, size) lists.
+fn subtract_ranges(all: &[(usize, usize)], cut: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut j = 0;
+    for &(base, size) in all {
+        let (mut a, end) = (base, base + size);
+        while j < cut.len() && cut[j].0 + cut[j].1 <= a {
+            j += 1;
+        }
+        let mut k = j;
+        while a < end && k < cut.len() && cut[k].0 < end {
+            let (cb, ce) = (cut[k].0, cut[k].0 + cut[k].1);
+            if cb > a {
+                out.push((a, cb - a));
+            }
+            a = a.max(ce);
+            k += 1;
+        }
+        if a < end {
+            out.push((a, end - a));
+        }
+    }
+    out
 }
 
 /// Run `f` as XCL's own GPU work: ExecuteCommandLists inside it does not refresh.
@@ -925,7 +972,18 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
         return;
     }
     let arrived = look_clock();
+    let t_wait = std::time::Instant::now();
     let _refresh = REFRESH.lock().unwrap();
+    let t_held = std::time::Instant::now();
+    REFRESH_PHASES[5].fetch_add(t_wait.elapsed().as_micros() as u64, Ordering::Relaxed);
+    struct Held(std::time::Instant);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            REFRESH_PHASES[0].fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            log_refresh_phases();
+        }
+    }
+    let _held = Held(t_held);
     // LOCAL (XCL_LOOK_COMBINE=1): a look that started after this submit arrived has seen every
     // CPU write made before it, and its texture uploads finished before it let `REFRESH` go
     // (`upload_batch` waits for them). This queue only has to wait for the sparse uploads and
@@ -944,6 +1002,37 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
         }
     }
     own_work(|| refresh_once(queue));
+}
+
+/// LOCAL: µs per phase of the title's submits under `REFRESH`: [held, look, sparse uploads,
+/// texture backing (vram), texture uploads, waiting for the lock]; logged every 2 s
+static REFRESH_PHASES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static REFRESH_TEXTURES: AtomicU64 = AtomicU64::new(0);
+static REUPLOADS_MARKED: AtomicU64 = AtomicU64::new(0);
+
+fn log_refresh_phases() {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, [u64; 9])>> = std::sync::Mutex::new(None);
+    let mut g = LAST.lock().unwrap();
+    let now = std::time::Instant::now();
+    let cur: [u64; 9] = std::array::from_fn(|i| match i {
+        0..=5 => REFRESH_PHASES[i].load(Ordering::Relaxed),
+        6 => REFRESH_TEXTURES.load(Ordering::Relaxed),
+        7 => REUPLOADS_MARKED.load(Ordering::Relaxed),
+        _ => crate::gpu::texture::UPLOAD_WAIT_US.load(Ordering::Relaxed),
+    });
+    let Some((t, before)) = g.as_ref() else {
+        *g = Some((now, cur));
+        return;
+    };
+    if now.duration_since(*t).as_secs() < 2 {
+        return;
+    }
+    let d = |i: usize| (cur[i] - before[i]) / 1000;
+    crate::xlog_info!(
+        "submit path ({} ms): REFRESH held {} ms (look {} ms, sparse uploads {} ms, texture backing {} ms, texture uploads {} ms of {} textures, {} of them re-uploads for turned-on tiles, {} ms waiting for the copies), waited for it {} ms",
+        now.duration_since(*t).as_millis(), d(0), d(1), d(2), d(3), d(4), cur[6] - before[6], cur[7] - before[7], d(8), d(5)
+    );
+    *g = Some((now, cur));
 }
 
 /// LOCAL: when the last look started, in µs of `look_clock` (0: none yet)
@@ -994,6 +1083,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
+    let t_look = std::time::Instant::now();
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
@@ -1005,10 +1095,23 @@ unsafe fn refresh_once(queue: *mut c_void) {
             for &(base, size) in ranges.iter() {
                 take_written(base, size, &mut buf, &mut dirty, &mut page);
             }
+            // LOCAL (XCL_LOOK_TEXTURES_MS): the texture-only ranges when their time has come
+            let every = look_textures_ms();
+            if every > 0 {
+                let now = look_clock();
+                if now.saturating_sub(SLOW_LOOK_AT.load(Ordering::Relaxed)) >= every * 1000 {
+                    SLOW_LOOK_AT.store(now, Ordering::Relaxed);
+                    let slow = WATCH_SLOW.lock().unwrap().clone().unwrap_or_default();
+                    for &(base, size) in slow.iter() {
+                        take_written(base, size, &mut buf, &mut dirty, &mut page);
+                    }
+                }
+            }
         });
         dirty.sort_unstable();
         dirty.len()
     });
+    REFRESH_PHASES[1].fetch_add(t_look.elapsed().as_micros() as u64, Ordering::Relaxed); // LOCAL
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
@@ -1042,8 +1145,12 @@ unsafe fn refresh_once(queue: *mut c_void) {
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
+            let t0 = std::time::Instant::now();
             super::sparse::before_execute(q, &dirty, page as usize);
+            let t1 = std::time::Instant::now();
             super::vram::before_title_execute(q);
+            REFRESH_PHASES[2].fetch_add((t1 - t0).as_micros() as u64, Ordering::Relaxed);
+            REFRESH_PHASES[3].fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
         });
     }
     // LOCAL (#1514 port review): textures a page was mapped for again go up whole
@@ -1103,7 +1210,10 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     super::vram::touch(todo.iter().map(|(r, _)| r.as_raw() as usize));
     seed_stream_recheck(&todo, &ranges, recheck_frame);
+    let t_up = std::time::Instant::now();
+    REFRESH_TEXTURES.fetch_add(todo.len() as u64, Ordering::Relaxed);
     upload_all(todo);
+    REFRESH_PHASES[4].fetch_add(t_up.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -2331,6 +2441,16 @@ mod tests {
     }
 
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
+    #[test]
+    fn subtract_ranges_leaves_what_the_cut_does_not_cover() {
+        // LOCAL
+        let all = [(0x1000, 0x9000), (0x20000, 0x1000)];
+        let cut = [(0x0, 0x2000), (0x4000, 0x1000), (0x9000, 0x4000), (0x20000, 0x1000)];
+        assert_eq!(subtract_ranges(&all, &cut), vec![(0x2000, 0x2000), (0x5000, 0x4000)]);
+        assert_eq!(subtract_ranges(&all, &[]), all.to_vec());
+        assert_eq!(subtract_ranges(&[], &cut), Vec::<(usize, usize)>::new());
+    }
+
     #[test]
     fn watch_ranges_clip_and_merge() {
         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];

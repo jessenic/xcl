@@ -267,6 +267,9 @@ impl Uploader {
 /// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
 /// order). A failure of one is returned with its index; the others still run. The texels go
 /// through the queue's kept upload buffer (`Uploader`).
+/// LOCAL: µs the texture uploads waited on the CPU for their copies
+pub static UPLOAD_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
     if items.is_empty() {
         return Ok(Vec::new());
@@ -307,7 +310,10 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
     queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-    if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
+    let t_wait = std::time::Instant::now();
+    let waited = fence::wait(&up.fence, up.value, dev, None, 10_000);
+    UPLOAD_WAIT_US.fetch_add(t_wait.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); // LOCAL
+    if let Err(e) = waited {
         // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
         // uploader next time) – freeing them under the GPU removed the device
         std::mem::forget(up);

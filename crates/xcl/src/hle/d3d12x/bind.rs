@@ -764,7 +764,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             list.SetGraphicsRootSignature(r);
         }
         ei_work(this, sig, super::targets::PC);
-        return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::PcIndirect, [max, 0, 0]);
+        fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        super::gpu_profile::end(this, t);
+        return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         ei_work(this, sig, super::targets::SKIPPED);
@@ -799,10 +802,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // an indirect dispatch: its groups are in the argument buffer (`max` of them)
         // LOCAL: indirect draws get a marker too (draw tracing)
         let mark = if gfx { super::culprit::before_draw(list, with(this, |s| s.pso), pso, 0, max) } else { super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [0, 0, max]) };
+        let t = super::gpu_profile::begin(this, pso, if gfx { super::gpu_profile::Kind::IndirectDraw } else { super::gpu_profile::Kind::IndirectDispatch }, [max, 0, 0]);
         fresh_indirect_arguments(this, || match &bounded {
             Some(b) => pc(this, sig, max, b.raw(), 0, count_buf, count_off),
             None => pc(this, sig, max, args, args_off, count_buf, count_off),
         });
+        super::gpu_profile::end(this, t);
         super::culprit::after_dispatch(list, mark)
     }
     if let Some(b) = bounded {
@@ -968,7 +973,9 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
         let title_pso = with(this, |s| s.pso);
         let mark = super::culprit::before_draw(&list, title_pso, super::pso_async::resolve(title_pso), vertices, instances);
+        let t = super::gpu_profile::begin(this, title_pso, super::gpu_profile::Kind::Draw, [vertices, instances, 0]);
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        super::gpu_profile::end(this, t);
         super::culprit::after_dispatch(&list, mark);
     }
 }
@@ -1010,7 +1017,10 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     base_vertex: i32,
     first_instance: u32,
 ) {
+    let this = list.as_raw();
+    let t = super::gpu_profile::begin(this, with(this, |s| s.pso), super::gpu_profile::Kind::Draw, [indices, instances, 0]);
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    super::gpu_profile::end(this, t);
 }
 
 /// The pipeline a draw (or an ExecuteIndirect) uses now: a graphics pipeline still being built
@@ -1496,7 +1506,9 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     }
     bind_abi(this, list, pso, false)?;
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
+    let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);
     let result = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
+    super::gpu_profile::end(this, t);
     super::culprit::after_dispatch(list, mark);
     result
 }
