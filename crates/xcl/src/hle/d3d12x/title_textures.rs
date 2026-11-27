@@ -1752,6 +1752,20 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
+        if filter_index_on() {
+            // the same textures, found through a sorted index of their memory (`filter_candidates`)
+            let picked = filter_candidates(&t, &dirty, page as usize);
+            return picked
+                .into_iter()
+                .filter_map(|res| {
+                    let e = t.by_res.get_mut(&res)?;
+                    if !e.pending && e.gpu_written {
+                        return None;
+                    }
+                    take_for_upload(res, e)
+                })
+                .collect();
+        }
         let wanted = |e: &Entry| e.pending || (!e.gpu_written && e.src.written(e.tex.size() as usize, &dirty, page as usize));
         let take = |res: usize, e: &mut Entry| {
             if e.pending {
@@ -1820,6 +1834,120 @@ fn note_index_check(wanted: usize, missed: &[String]) {
     if n.is_power_of_two() && n >= 1024 {
         crate::xlog_info!("D3D12.X: XCL_TEXTURE_INDEX=2: {n} submits checked, {w} textures to upload, {m} of them missed by the index");
     }
+}
+
+/// A texture the filter picked: no longer pending, and a reference for its upload.
+/// Safety: as in `refresh_once`, its only caller: `res` is a live resource of the registry.
+unsafe fn take_for_upload(res: usize, e: &mut Entry) -> Option<(ID3D12Resource, Upload)> {
+    if e.pending {
+        e.pending = false;
+        PENDING.fetch_sub(1, Ordering::Relaxed);
+    }
+    let p = res as *mut c_void;
+    ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src.clone(), Arc::clone(&e.tex), e.states.clone())))
+}
+
+/// Lab, `XCL_FILTER_INDEX=1` (off unless set): the textures to upload before a submit are found
+/// through a sorted index of the memory they are read from (built again when the set of textures
+/// or their sources change, `TEXTURES_GEN`), walked once beside the written pages, instead of
+/// asking every texture kept in step (~6 000 in a retail title's world: ~0.7 ms a submit). The
+/// same textures are picked, in the same order.
+fn filter_index_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_FILTER_INDEX").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: lab XCL_FILTER_INDEX=1: textures written since their last upload are found through a sorted index");
+        }
+        on
+    })
+}
+
+/// (`TEXTURES_GEN` it was built at, every active texture's source ranges as (start, end, texture)
+/// sorted by start)
+static FILTER_INDEX: Mutex<Option<(u64, Arc<Vec<(usize, usize, usize)>>)>> = Mutex::new(None);
+/// index builds, filters through the index, textures they found (diagnostic)
+static FILTER_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The index of `t` (its caller holds `TEXTURES`). A change of the table bumps `TEXTURES_GEN`
+/// after it: an index tagged with the old value is built again at the next use. A texture made or
+/// given a new source meanwhile is pending, and pending textures are not taken from the index.
+fn filter_index(t: &Table) -> Arc<Vec<(usize, usize, usize)>> {
+    let gen = TEXTURES_GEN.load(Ordering::Acquire);
+    let mut g = FILTER_INDEX.lock().unwrap();
+    if let Some((k, ref idx)) = *g {
+        if k == gen {
+            return Arc::clone(idx);
+        }
+    }
+    let idx = Arc::new(build_filter_index(t));
+    FILTER_STATS[0].fetch_add(1, Ordering::Relaxed);
+    *g = Some((gen, Arc::clone(&idx)));
+    idx
+}
+
+/// Every active texture's source ranges as (start, end, texture), sorted.
+fn build_filter_index(t: &Table) -> Vec<(usize, usize, usize)> {
+    let mut v = Vec::with_capacity(t.by_res.len());
+    for (&res, e) in &t.by_res {
+        v.extend(e.src.ranges(e.tex.size() as usize).map(|(s, end)| (s, end, res)));
+    }
+    v.sort_unstable();
+    v
+}
+
+/// The textures of `t` that are pending, or whose memory holds a page of `dirty` (sorted, `page`
+/// bytes each: `Source::written`), sorted and once each: what the plain filter asks of every
+/// texture, the GPU-written ones aside (the caller leaves those out unless pending).
+fn filter_candidates(t: &Table, dirty: &[usize], page: usize) -> Vec<usize> {
+    let idx = (!dirty.is_empty()).then(|| filter_index(t));
+    let out = candidates_in(t, idx.as_deref().map_or(&[][..], |v| &v[..]), dirty, page, PENDING.load(Ordering::Relaxed) > 0);
+    FILTER_STATS[1].fetch_add(1, Ordering::Relaxed);
+    FILTER_STATS[2].fetch_add(out.len() as u64, Ordering::Relaxed);
+    out
+}
+
+/// `filter_candidates` with the index `idx` of `t` (`build_filter_index`); `pending`: whether
+/// some texture may be pending.
+fn candidates_in(t: &Table, idx: &[(usize, usize, usize)], dirty: &[usize], page: usize, pending: bool) -> Vec<usize> {
+    let mut out = Vec::new();
+    if pending {
+        out.extend(t.by_res.iter().filter(|(_, e)| e.pending).map(|(&res, _)| res));
+    }
+    if !dirty.is_empty() {
+        // the written pages as runs [start, end)
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for &p in dirty {
+            match runs.last_mut() {
+                Some(r) if p <= r.1 => r.1 = r.1.max(p + page),
+                _ => runs.push((p, p + page)),
+            }
+        }
+        // (ranges sorted by start: the first run that ends after a range's start only moves on)
+        let mut j = 0;
+        for &(s, e, res) in idx.iter() {
+            if s >= e {
+                // an empty range: `Source::written`'s own test
+                let i = dirty.partition_point(|&p| p + page <= s);
+                if dirty.get(i).is_some_and(|&p| p < e) {
+                    out.push(res);
+                }
+                continue;
+            }
+            while j < runs.len() && runs[j].1 <= s {
+                j += 1;
+            }
+            if j == runs.len() {
+                break;
+            }
+            if runs[j].0 < e {
+                out.push(res);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -4171,6 +4299,66 @@ mod tests {
             forget(b);
             drop((gone, kept));
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// `XCL_FILTER_INDEX`: the index walk picks exactly the textures the plain filter picks
+    /// (pending ones, and those with a written page that the GPU did not write), on random
+    /// tables of plain and page-run sources and random written pages.
+    #[test]
+    fn filter_index_picks_what_the_plain_filter_picks() {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let size = tex.size() as usize;
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..200 {
+            let mut t = Table::new();
+            let n = 1 + rnd(300) as usize;
+            for k in 0..n {
+                let va = 0x1000_0000 + (rnd(4096) as usize) * 0x1000 + if rnd(4) == 0 { rnd(0x1000) as usize } else { 0 };
+                let src = if rnd(5) == 0 {
+                    let runs: Vec<(usize, usize, usize)> = (0..1 + rnd(3) as usize)
+                        .map(|r| (r * 0x1000, 0x1000, if rnd(4) == 0 { 0 } else { 0x2000_0000 + (rnd(4096) as usize) * 0x1000 }))
+                        .collect();
+                    Source::Pages(runs.into())
+                } else {
+                    Source::At(va)
+                };
+                let e = Entry {
+                    device: 0,
+                    va,
+                    src,
+                    in_gpu_view: false,
+                    tex: Arc::clone(&tex),
+                    states: vec![D3D12_RESOURCE_STATE_COMMON],
+                    pending: rnd(8) == 0,
+                    gpu_written: rnd(6) == 0,
+                    placed: false,
+                    unmapped: false,
+                    seq: 0,
+                };
+                t.by_res.insert(0x10_0000 + k * 8, e);
+            }
+            let page = 0x1000usize;
+            let mut dirty: Vec<usize> = (0..rnd(400)).map(|_| (if rnd(2) == 0 { 0x1000_0000usize } else { 0x2000_0000 }) + (rnd(4200) as usize) * page).collect();
+            dirty.sort_unstable();
+            let plain: Vec<usize> = t
+                .by_res
+                .iter()
+                .filter(|(_, e)| e.pending || (!e.gpu_written && e.src.written(size, &dirty, page)))
+                .map(|(&r, _)| r)
+                .collect();
+            let idx = build_filter_index(&t);
+            let indexed: Vec<usize> = candidates_in(&t, &idx, &dirty, page, true)
+                .into_iter()
+                .filter(|r| t.by_res.get(r).is_some_and(|e| e.pending || !e.gpu_written))
+                .collect();
+            assert_eq!(indexed, plain, "round {round}: {n} textures, {} written pages", dirty.len());
         }
     }
 
