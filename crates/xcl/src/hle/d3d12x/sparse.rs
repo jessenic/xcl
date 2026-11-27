@@ -4997,4 +4997,77 @@ mod tests {
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
+
+    /// lab `XCL_SPARSE_SCATTER`: with runs not all 16-byte aligned the upload goes by copies (no
+    /// dispatch) and lands the copies' bytes; a tile cleared (`flush_zeros`) and then written in
+    /// part holds zeros around the runs, the same with the scatter as with the copies.
+    #[test]
+    fn gpu_sparse_scatter_unaligned_runs_and_clears_land_the_copies_bytes() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            if crate::gpu::recomp::dxc::create_instance().is_none() {
+                println!("no DXC – skipping");
+                return;
+            }
+            const TILES: usize = 4;
+            let len = TILES * TILE;
+            let (base, mut s) = test_state_with_reserved(TILES);
+            s.commit_range(base, len);
+            s.wait_for(s.value);
+            assert!(!VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null(), "CPU view");
+            assert!(scatter_pipeline(&s.dev).is_some(), "the scatter pipeline");
+            let mem = std::slice::from_raw_parts_mut(base as *mut u8, len);
+            let old = |i: usize| (i * 7 + 1) as u8;
+            let new = |i: usize| (i * 13 + 5) as u8 ^ 0x5A;
+            // (the new tiles' own clears are left out: the first upload below writes every byte, and only
+            // the clear this test pushes must run)
+            s.to_zero.clear();
+            // unaligned: odd starts and lengths, one across a tile end; aligned: in tile 2, which is cleared first
+            let unaligned: Vec<(usize, usize)> = vec![(base + 3, 5), (base + 0x1001, 0x7F), (base + TILE - 7, 30), (base + TILE + 0x2222, 0x333)];
+            let in_cleared: Vec<(usize, usize)> = vec![(base + 2 * TILE + 0x40, 0x40), (base + 2 * TILE + 0x8000, 0x1000), (base + 3 * TILE - 0x20, 0x20)];
+            let mut got = Vec::new();
+            for scatter in [false, true] {
+                for (i, b) in mem.iter_mut().enumerate() {
+                    *b = old(i);
+                }
+                s.upload_dirty_with(&[(base, len)], false);
+                s.wait_for(s.value);
+                for (i, b) in mem.iter_mut().enumerate() {
+                    *b = new(i);
+                }
+                let before = UPLOAD_CMDS[1].load(Ordering::Relaxed);
+                s.upload_dirty_with(&unaligned, scatter);
+                s.wait_for(s.value);
+                assert_eq!(UPLOAD_CMDS[1].load(Ordering::Relaxed), before, "unaligned runs: no dispatch (copies)");
+                // tile 2 cleared (as a reused tile is), then written in part
+                s.to_zero.push((base + 2 * TILE, TILE));
+                s.flush_zeros();
+                s.upload_dirty_with(&in_cleared, scatter);
+                s.wait_for(s.value);
+                if scatter {
+                    assert!(UPLOAD_CMDS[1].load(Ordering::Relaxed) > before, "aligned runs after the clear: by dispatch");
+                }
+                got.push(read_window(&s, len));
+            }
+            let mut want: Vec<u8> = (0..len).map(old).collect();
+            for &(a, n) in &unaligned {
+                for i in a - base..a - base + n {
+                    want[i] = new(i);
+                }
+            }
+            for b in &mut want[2 * TILE..3 * TILE] {
+                *b = 0;
+            }
+            for &(a, n) in &in_cleared {
+                for i in a - base..a - base + n {
+                    want[i] = new(i);
+                }
+            }
+            assert!(got[0] == want, "copies: unaligned runs, the cleared tile's zeros and its runs");
+            assert!(got[1] == want, "scatter: the same bytes as the copies");
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
 }
