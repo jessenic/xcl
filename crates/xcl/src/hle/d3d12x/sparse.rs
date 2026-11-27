@@ -305,6 +305,26 @@ fn scatter_pipeline(dev: &ID3D12Device) -> Option<std::sync::Arc<Scatter>> {
     }
 }
 
+/// `XCL_SPARSE_SCATTER`: scatter tables the GPU is done with, let go while `STATE` was held
+/// (`begin_slot`), released by the next `before_execute` once it has let `STATE` go: no Release
+/// (D3D12's own locks) under `STATE`. Raw pointers, each holding one reference.
+static RETIRED_TABLES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn retire_tables(tables: Vec<ID3D12Resource>) {
+    if tables.is_empty() {
+        return;
+    }
+    RETIRED_TABLES.lock().unwrap_or_else(|e| e.into_inner()).extend(tables.into_iter().map(|t| t.into_raw() as usize));
+}
+
+/// The retired scatter tables released (not to be called with `STATE` held).
+fn drop_retired_tables() {
+    let gone = std::mem::take(&mut *RETIRED_TABLES.lock().unwrap_or_else(|e| e.into_inner()));
+    for p in gone {
+        drop(unsafe { ID3D12Resource::from_raw(p as *mut c_void) });
+    }
+}
+
 /// (diagnostic, the activity line) the sparse fence of the last state made, the last value
 /// signalled on it, and the value a CPU wait under `STATE` waits for (0: none)
 static FENCE_OBJ: Mutex<Option<ID3D12Fence>> = Mutex::new(None);
@@ -368,13 +388,25 @@ unsafe fn make_scatter(dev: &ID3D12Device) -> Result<Scatter, String> {
 }
 
 /// An upload buffer of `size` bytes, mapped.
+/// An upload buffer of `size` bytes, mapped: (buffer, its bytes, size). Made with the device's
+/// original creator (`real::pc_vtable`), so the buffer is not adopted: its Map and its Release run
+/// none of XCL's hooks. The scatter tables are made and let go with `STATE` held (`scatter_flush`,
+/// `begin_slot`), and an adopted resource's last Release goes through `res_release`: the late
+/// release's Signals on the title's queues (their hooks take list_x's locks), `title_textures::forget`
+/// (TEXTURES), `vram::forget` (the arenas). A recording thread holds list_x's state while it asks
+/// `sparse::arena_block` for memory (`STATE`): SCAT1 stood still at 107 s with `STATE` held and no
+/// GPU wait under it.
 unsafe fn mapped_upload_buffer(dev: &ID3D12Device, size: usize) -> Option<(ID3D12Resource, *mut u8, usize)> {
-    let mut r: Option<ID3D12Resource> = None;
     let mut d = buffer_desc(size as u64);
     d.Flags = D3D12_RESOURCE_FLAG_NONE;
-    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut r)
-        .ok()?;
-    let r = r?;
+    let raw = dev.as_raw();
+    let v = &*(super::real::pc_vtable(raw) as *const ID3D12Device_Vtbl);
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+    let mut p: *mut c_void = std::ptr::null_mut();
+    if (v.CreateCommittedResource)(raw, &heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_GENERIC_READ, std::ptr::null(), &ID3D12Resource::IID, &mut p).is_err() || p.is_null() {
+        return None;
+    }
+    let r = ID3D12Resource::from_raw(p);
     let mut p = std::ptr::null_mut();
     r.Map(0, None, Some(&mut p)).ok()?;
     Some((r, p as *mut u8, size))
@@ -1556,7 +1588,7 @@ impl State {
         }
         // (the slot's last list is done: its scatter tables are free again)
         self.slots[idx].table_used = 0;
-        self.slots[idx].old_tables.clear();
+        retire_tables(std::mem::take(&mut self.slots[idx].old_tables));
         let slot = &self.slots[idx];
         let _ = slot.alloc.Reset();
         let _ = slot.list.Reset(&slot.alloc, None);
@@ -2959,6 +2991,8 @@ unsafe fn run_copies(jobs: &mut Vec<(usize, usize, usize)>, staging: *mut u8) {
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     super::real::removed_probe("sparse::before_execute: start");
     before_execute_inner(queue, dirty, page);
+    // (the scatter tables let go under the lock since the last submit, released without it)
+    drop_retired_tables();
     super::real::removed_probe("sparse::before_execute: end");
 }
 
@@ -5068,6 +5102,32 @@ mod tests {
             s.wait_for(s.value);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// `XCL_SPARSE_SCATTER` (SCAT1 stood still with `STATE` held): a scatter table made through an
+    /// adopted device is not adopted itself, so its Map and its last Release run none of XCL's hooks
+    /// (`res_release`: late release, title_textures, vram); tables let go under the lock wait in
+    /// `RETIRED_TABLES` and are released by `drop_retired_tables` (from `before_execute`, lock let go).
+    #[test]
+    fn scatter_tables_are_not_adopted_and_go_outside_the_lock() {
+        use crate::hle::d3d12x::real;
+        unsafe {
+            let dev = lab_device();
+            real::adopt(dev.as_raw(), real::Kind::Device);
+            assert!(real::is_adopted(dev.as_raw()), "the device is adopted (its creators are XCL's hooks)");
+            let (t, p, cap) = mapped_upload_buffer(&dev, 64 << 10).expect("a scatter table");
+            assert_eq!(cap, 64 << 10);
+            assert!(!real::is_adopted(t.as_raw()), "the table is not adopted: no hook on its Map or Release");
+            std::ptr::write_bytes(p, 0xAB, cap);
+            assert_eq!(*p.add(cap - 1), 0xAB, "mapped and writable");
+            let before = RETIRED_TABLES.lock().unwrap().len();
+            let held = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            retire_tables(vec![t]);
+            assert_eq!(RETIRED_TABLES.lock().unwrap().len(), before + 1, "let go under the lock: kept, not released");
+            drop(held);
+            drop_retired_tables();
+            assert!(RETIRED_TABLES.lock().unwrap().is_empty(), "released once the lock is let go");
         }
     }
 }
