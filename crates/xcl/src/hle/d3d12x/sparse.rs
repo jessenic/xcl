@@ -3011,7 +3011,11 @@ impl State {
     unsafe fn drain_quarantined(&mut self) -> bool {
         let mut freed = false;
         while let Some(front) = self.quarantined.front() {
-            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| super::real::probe_completed(f) >= *v));
+            // LOCAL: the PC's value, not the title's hook (`real::probe_completed`): the hook tries for
+            // the state's lock, which this thread holds here, for ~2 ms a fence – a mapping call
+            // that takes thousands of tiles (a retail title's world load) then held the page maps
+            // and this state for 20-30 s and the title's watchdog ended it
+            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| super::real::fence_completed(f) >= *v));
             if !ready {
                 break;
             }

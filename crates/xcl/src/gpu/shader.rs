@@ -218,6 +218,31 @@ pub fn readable(p: usize, len: usize) -> bool {
     if resident_and_readable(p, end) {
         return true;
     }
+    // LOCAL (`XCL_READABLE_PROBE=0`: not): a short range with a page that is not resident (trimmed
+    // from the working set, never touched, or not there) is probed, a byte a page, with
+    // `ReadProcessMemory` – it fails without a fault on memory that cannot be read – instead of
+    // the `VirtualQuery` walk below. With the working set capped, `view_mem::ensure` asked this
+    // of tile after tile under its lock and each walk sized a multi-gigabyte region: four of the
+    // title's recording threads waited behind it for 30 s and the title ended itself.
+    if len <= 64 << 12 {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| !std::env::var("XCL_READABLE_PROBE").is_ok_and(|v| v.trim() == "0")) {
+            use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+            let proc = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+            let mut at = p;
+            loop {
+                let (mut b, mut done) = (0u8, 0usize);
+                if unsafe { ReadProcessMemory(proc, at as *const _, &mut b as *mut u8 as *mut _, 1, &mut done) } == 0 || done != 1 {
+                    return false;
+                }
+                let next = (at & !0xFFF) + 0x1000;
+                if next >= end {
+                    return true;
+                }
+                at = next;
+            }
+        }
+    }
     let mut cur = p;
     while cur < end {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };

@@ -633,7 +633,7 @@ unsafe fn bind_two_pass_stage(
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs_raw = if compute_pass { tp.compute_rs } else { tp.mesh_rs } as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs_raw).ok_or("two-pass root signature")?;
-    let views = [va(io_at), res_va].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    let views = [va(io_at), res_va].into_iter().chain((0..4).map(|k| windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first)));
     if compute_pass {
         list.SetComputeRootSignature(rs);
         for (k, v) in views.enumerate() {
@@ -702,7 +702,7 @@ unsafe fn bind_native_mesh(this: *mut c_void, list: &ID3D12GraphicsCommandList, 
     let rs_raw = tp.mesh_rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs_raw).ok_or("native mesh root signature")?;
     list.SetGraphicsRootSignature(rs);
-    let views = [super::real::uma_va_of(io_at).unwrap_or(first), first].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    let views = [super::real::uma_va_of(io_at).unwrap_or(first), first].into_iter().chain((0..4).map(|k| windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first)));
     for (k, v) in views.enumerate() {
         list.SetGraphicsRootUnorderedAccessView(k as u32, v);
     }
