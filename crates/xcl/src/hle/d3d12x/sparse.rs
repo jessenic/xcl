@@ -317,10 +317,41 @@ fn retire_tables(tables: Vec<ID3D12Resource>) {
     RETIRED_TABLES.lock().unwrap_or_else(|e| e.into_inner()).extend(tables.into_iter().map(|t| t.into_raw() as usize));
 }
 
-/// The retired scatter tables released (not to be called with `STATE` held).
+/// `XCL_SPARSE_SCATTER` (review F4): scatter tables a dispatch may still read after `begin_slot`'s wait
+/// gave up: (sparse fence value of the list that used them, raw pointer holding one reference)
+static HELD_TABLES: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
+
+fn hold_tables(fv: u64, tables: Vec<ID3D12Resource>) {
+    if tables.is_empty() {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 8 || k.is_power_of_two() {
+        crate::xlog_warn!("sparse: {} scatter tables held until the sparse queue passes {fv} (its wait gave up; #{k})", tables.len());
+    }
+    HELD_TABLES.lock().unwrap_or_else(|e| e.into_inner()).extend(tables.into_iter().map(|t| (fv, t.into_raw() as usize)));
+}
+
+/// The retired scatter tables released, and the held ones whose list the sparse queue has passed (not to
+/// be called with `STATE` held).
 fn drop_retired_tables() {
     let gone = std::mem::take(&mut *RETIRED_TABLES.lock().unwrap_or_else(|e| e.into_inner()));
     for p in gone {
+        drop(unsafe { ID3D12Resource::from_raw(p as *mut c_void) });
+    }
+    let mut held = HELD_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_empty() {
+        return;
+    }
+    let done = match FENCE_OBJ.try_lock() {
+        Ok(g) => g.as_ref().map_or(0, |f| unsafe { super::real::fence_completed(f) }),
+        Err(_) => return,
+    };
+    let (free, keep): (Vec<(u64, usize)>, Vec<(u64, usize)>) = held.drain(..).partition(|&(v, _)| done >= v);
+    *held = keep;
+    drop(held);
+    for (_, p) in free {
         drop(unsafe { ID3D12Resource::from_raw(p as *mut c_void) });
     }
 }
@@ -1604,6 +1635,30 @@ impl State {
 
     /// Acquire the next upload command slot, waiting only if that slot's previous submission is
     /// still executing on the GPU, then reset its allocator and list.
+    /// `begin_slot`'s part for the slot's scatter tables (none without `XCL_SPARSE_SCATTER`): when its last
+    /// list (fence value `fv`) is done they are free again (the outgrown ones released outside the lock,
+    /// `retire_tables`). When `wait_for` gave up after 5 s (review F4) a dispatch of that list may still
+    /// read them: the CPU must neither write the table again (a run table rewritten under a dispatch puts
+    /// ring bytes at wrong window offsets) nor release it (a page fault). They are then held until the
+    /// sparse fence passes `fv` (`hold_tables`) and the slot starts with no table (a new one is made).
+    unsafe fn release_slot_tables(&mut self, idx: usize, fv: u64) {
+        let slot = &mut self.slots[idx];
+        if slot.table.is_none() && slot.old_tables.is_empty() {
+            slot.table_used = 0;
+            return;
+        }
+        if fv > 0 && super::real::fence_completed(&self.fence) < fv {
+            let mut busy = std::mem::take(&mut slot.old_tables);
+            busy.extend(slot.table.take().map(|t| t.0));
+            slot.table_used = 0;
+            hold_tables(fv, busy);
+            return;
+        }
+        // (the slot's last list is done: its scatter tables are free again)
+        slot.table_used = 0;
+        retire_tables(std::mem::take(&mut slot.old_tables));
+    }
+
     unsafe fn begin_slot(&mut self) -> usize {
         let idx = self.next_slot;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
@@ -1612,9 +1667,7 @@ impl State {
             self.wait_for(fv);
             self.reclaim_ring();
         }
-        // (the slot's last list is done: its scatter tables are free again)
-        self.slots[idx].table_used = 0;
-        retire_tables(std::mem::take(&mut self.slots[idx].old_tables));
+        self.release_slot_tables(idx, fv);
         let slot = &self.slots[idx];
         let _ = slot.alloc.Reset();
         let _ = slot.list.Reset(&slot.alloc, None);
@@ -5244,6 +5297,43 @@ mod tests {
             let sc = make_scatter(&dev).expect("the scatter pipeline");
             assert!(!real::is_adopted(sc.root.as_raw()), "root signature not adopted");
             assert!(!real::is_adopted(sc.pso.as_raw()), "pipeline not adopted: made by D3D12 itself, not by the title's PSO hook");
+        }
+    }
+
+    /// `XCL_SPARSE_SCATTER` (review F4): when the wait for a slot's last list gave up, its scatter tables
+    /// are not written again nor released: held until the sparse fence passes that list, the slot starting
+    /// with no table; a slot whose list is done keeps its table (written again from 0).
+    #[test]
+    fn scatter_tables_of_a_slot_still_on_the_gpu_are_held() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        let _serial = lab_test_lock();
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            assert!(!s.slots.is_empty());
+            let held_before = HELD_TABLES.lock().unwrap().len();
+            // a slot whose list the queue has passed: its table stays, the outgrown one is retired
+            let (t, p, cap) = mapped_upload_buffer(&s.dev, 64 << 10).expect("table");
+            let (old, _, _) = mapped_upload_buffer(&s.dev, 64 << 10).expect("old table");
+            s.slots[0].table = Some((t, p, cap));
+            s.slots[0].table_used = 4096;
+            s.slots[0].old_tables.push(old);
+            let done = super::super::real::fence_completed(&s.fence);
+            s.release_slot_tables(0, done);
+            assert!(s.slots[0].table.is_some() && s.slots[0].table_used == 0 && s.slots[0].old_tables.is_empty(), "done: kept and reused from 0");
+            drop_retired_tables();
+            // a slot whose list is still on the GPU (the 5 s wait gave up): nothing reused or released
+            let fv = s.value + 1000;
+            s.slots[0].table_used = 4096;
+            s.release_slot_tables(0, fv);
+            assert!(s.slots[0].table.is_none() && s.slots[0].table_used == 0, "busy: the slot starts with no table");
+            assert_eq!(HELD_TABLES.lock().unwrap().len(), held_before + 1, "the busy table is held");
+            drop_retired_tables();
+            assert_eq!(HELD_TABLES.lock().unwrap().len(), held_before + 1, "still held while the queue has not passed its list");
+            s.fence.Signal(fv).expect("the queue passes the list");
+            drop_retired_tables();
+            assert_eq!(HELD_TABLES.lock().unwrap().len(), held_before, "released once the queue has passed it");
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 }
