@@ -197,6 +197,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if let Some(line) = crate::hle::d3d12x::pso_async::code_tick() {
                     crate::xlog_info!("shader code lab: {line}");
                 }
+                // lab: every 10 s, whatever `XCL_TEX_KEY_PAD`: the textures made for views by
+                // address and their pad-only duplicates (xcl-dev/xcl#3000); atomics, no lock
+                if ticks % 5 == 4 {
+                    if let Some(line) = crate::hle::d3d12x::real::tex_key_line() {
+                        crate::xlog_info!("lab tex key: {line}");
+                    }
+                }
                 // lab: every 10 s, how much of each memory window is in the working set
                 // (pages the title or XCL touched and Windows has not trimmed)
                 ticks += 1;

@@ -2661,19 +2661,132 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
     })
 }
 
+/// lab `XCL_TEX_KEY_PAD=1` (after xcl-dev/xcl#3000): `resource_at` also leaves the padding after
+/// the dimension (bytes 4..8 of the desc, before the 8-byte aligned width) out of its key. That
+/// dword holds whatever the title's stack held there: without the switch each new value makes
+/// the same texture at the same address again. Neither the texture nor the PC desc reads it.
+fn tex_key_pad() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_TEX_KEY_PAD").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: lab XCL_TEX_KEY_PAD=1: the textures of views by address are found without the padding after the dimension (bytes 4..8 of the desc)");
+        }
+        on
+    })
+}
+
+/// The PC part of a view-by-address resource desc as `resource_at` keys its textures – the flags
+/// (@0x30) are its last dword, the padding after them is left out – with the padding after the
+/// dimension (bytes 4..8) taken out and given apart.
+fn view_desc_key(mut x: [u8; 0x38]) -> ([u8; 0x38], [u8; 4]) {
+    x[0x34..].fill(0);
+    let pad = [x[4], x[5], x[6], x[7]];
+    x[4..8].fill(0);
+    (x, pad)
+}
+
+/// What `resource_at` did, for the "lab tex key:" line: atomics, so the line never takes the
+/// table's lock.
+pub(crate) struct TexKeyCounts {
+    /// textures made (attempts: one a key and padding without the switch, one a key with it)
+    made: AtomicU64,
+    /// of them, those the device refused
+    failed: AtomicU64,
+    /// of them, those whose key (address and desc) was made before with another padding @4
+    pad_dup_made: AtomicU64,
+    /// paddings not seen before for a key, served the texture already made (`XCL_TEX_KEY_PAD=1`)
+    pad_dup_served: AtomicU64,
+}
+
+static TEX_KEY: TexKeyCounts = TexKeyCounts::new();
+
+impl TexKeyCounts {
+    const fn new() -> Self {
+        Self { made: AtomicU64::new(0), failed: AtomicU64::new(0), pad_dup_made: AtomicU64::new(0), pad_dup_served: AtomicU64::new(0) }
+    }
+
+    /// The line's text after "lab tex key: " (None before the first view by address).
+    fn line(&self, pad_switch: bool) -> Option<String> {
+        let made = self.made.load(Ordering::Relaxed);
+        let served = self.pad_dup_served.load(Ordering::Relaxed);
+        if made == 0 && served == 0 {
+            return None;
+        }
+        Some(format!(
+            "{made} textures made for views by address ({} could not be made), {} of them pad-only duplicates (bytes 4..8 of the desc alone differ from a key made before); {served} pad-only duplicates served by the texture already made; XCL_TEX_KEY_PAD {}",
+            self.failed.load(Ordering::Relaxed),
+            self.pad_dup_made.load(Ordering::Relaxed),
+            if pad_switch { "on" } else { "off" }
+        ))
+    }
+}
+
+/// The "lab tex key:" line's text, every 10 s on the activity thread whatever the switch.
+pub(crate) fn tex_key_line() -> Option<String> {
+    TEX_KEY.line(tex_key_pad())
+}
+
+/// The textures `resource_at` made: by address and desc without its padding, each with the
+/// paddings @4 it was asked with and the texture made for each (0: it could not be made). One
+/// table: the pad-only duplicates are counted with no second one and no other lock.
+#[derive(Default)]
+struct ViewTextures(HashMap<(u64, [u8; 0x38]), Vec<([u8; 4], usize)>>);
+
+impl ViewTextures {
+    /// The texture made for `(va, key)` and the padding `pad`; with `any_pad` (`XCL_TEX_KEY_PAD=1`)
+    /// the one made for the key whatever its padding: a padding not seen before is then kept with
+    /// it and counted as a pad-only duplicate served.
+    fn find(&mut self, va: u64, key: [u8; 0x38], pad: [u8; 4], any_pad: bool, c: &TexKeyCounts) -> Option<usize> {
+        let v = self.0.get_mut(&(va, key))?;
+        if let Some(&(_, r)) = v.iter().find(|e| e.0 == pad) {
+            return Some(r);
+        }
+        if !any_pad {
+            return None;
+        }
+        let r = v.first()?.1;
+        v.push((pad, r));
+        c.pad_dup_served.fetch_add(1, Ordering::Relaxed);
+        Some(r)
+    }
+
+    /// The texture `r` (0: refused) made for `(va, key)` and `pad`: counted as made, and as a
+    /// pad-only duplicate when the key was made before with another padding.
+    fn made(&mut self, va: u64, key: [u8; 0x38], pad: [u8; 4], r: usize, c: &TexKeyCounts) {
+        c.made.fetch_add(1, Ordering::Relaxed);
+        if r == 0 {
+            c.failed.fetch_add(1, Ordering::Relaxed);
+        }
+        let v = self.0.entry((va, key)).or_default();
+        // two threads made it at once: the last one is kept, as before
+        if let Some(e) = v.iter_mut().find(|e| e.0 == pad) {
+            e.1 = r;
+            return;
+        }
+        if !v.is_empty() {
+            c.pad_dup_made.fetch_add(1, Ordering::Relaxed);
+        }
+        v.push((pad, r));
+    }
+}
+
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
 /// per address and desc – titles make views of the same memory again and again.
 unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
-    type Key = (u64, [u8; 0x38]);
-    static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
+    static MADE: Mutex<Option<ViewTextures>> = Mutex::new(None);
     if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return std::ptr::null_mut();
     }
-    // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
-    let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
-    x[0x34..].fill(0);
-    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
+    let (key, pad) = view_desc_key((desc as *const [u8; 0x38]).read_unaligned());
+    let any_pad = tex_key_pad();
+    if let Some(r) = MADE.lock().unwrap().get_or_insert_with(ViewTextures::default).find(va, key, pad, any_pad, &TEX_KEY) {
         return r as *mut c_void;
+    }
+    // the desc as the title gave it without the switch (but the padding after the flags), as keyed with it
+    let mut x = key;
+    if !any_pad {
+        x[4..8].copy_from_slice(&pad);
     }
     let mut r = std::ptr::null_mut();
     let hr = super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r);
@@ -2684,8 +2797,101 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
         }
         r = std::ptr::null_mut();
     }
-    MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
+    MADE.lock().unwrap().get_or_insert_with(ViewTextures::default).made(va, key, pad, r as usize, &TEX_KEY);
     r
+}
+
+#[cfg(test)]
+mod tex_key_tests {
+    use super::{view_desc_key, TexKeyCounts, ViewTextures};
+
+    fn desc(pad: [u8; 4], tail: [u8; 4]) -> [u8; 0x38] {
+        let mut a = [0u8; 0x38];
+        a[0..4].copy_from_slice(&3u32.to_le_bytes()); // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        a[4..8].copy_from_slice(&pad);
+        a[0x10..0x18].copy_from_slice(&256u64.to_le_bytes()); // Width
+        a[0x30..0x34].copy_from_slice(&4u32.to_le_bytes()); // Flags
+        a[0x34..].copy_from_slice(&tail);
+        a
+    }
+
+    /// The key leaves out bytes 4..8 (given back apart) and 0x34.. alone: bytes 0..4 and 8..0x34
+    /// are kept as they are, and a field that matters (the width) keys another texture.
+    #[test]
+    fn the_view_key_leaves_out_only_the_two_paddings() {
+        let mut a = desc([0xde, 0xad, 0xbe, 0xef], [0x11, 0x22, 0x33, 0x44]);
+        for (i, b) in a[8..0x30].iter_mut().enumerate() {
+            *b |= (i as u8) | 0x80;
+        }
+        let (k, pad) = view_desc_key(a);
+        assert_eq!(pad, [0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(k[0..4], a[0..4]);
+        assert_eq!(k[4..8], [0; 4]);
+        assert_eq!(k[8..0x34], a[8..0x34]);
+        assert_eq!(k[0x34..], [0; 4]);
+        let (k2, pad2) = view_desc_key(desc([1, 2, 3, 4], [5, 6, 7, 8]));
+        let (k3, _) = view_desc_key(desc([0; 4], [0; 4]));
+        assert_eq!(k2, k3);
+        assert_eq!(pad2, [1, 2, 3, 4]);
+        let mut c = desc([1, 2, 3, 4], [0; 4]);
+        c[0x10] = 0x80;
+        assert_ne!(view_desc_key(c).0, k2);
+    }
+
+    /// Without the switch a padding not seen for a key makes the texture again (counted as a
+    /// pad-only duplicate); with it, the texture already made is served (counted as served) and
+    /// nothing is made. Another address or desc is no duplicate either way.
+    #[test]
+    fn pad_only_duplicates_are_made_without_the_switch_and_served_with_it() {
+        for any_pad in [false, true] {
+            let c = TexKeyCounts::new();
+            let mut t = ViewTextures::default();
+            assert_eq!(c.line(any_pad), None);
+            let (k, p1) = view_desc_key(desc([1, 0, 0, 0], [9; 4]));
+            let (_, p2) = view_desc_key(desc([2, 0, 0, 0], [0; 4]));
+            assert_eq!(t.find(0x1000, k, p1, any_pad, &c), None);
+            t.made(0x1000, k, p1, 0xa0, &c);
+            assert_eq!(t.find(0x1000, k, p1, any_pad, &c), Some(0xa0));
+            // the same address and desc, another padding @4
+            let second = t.find(0x1000, k, p2, any_pad, &c);
+            if any_pad {
+                assert_eq!(second, Some(0xa0));
+                assert_eq!(t.find(0x1000, k, p2, any_pad, &c), Some(0xa0), "a padding served once is found again, not counted again");
+            } else {
+                assert_eq!(second, None);
+                t.made(0x1000, k, p2, 0xb0, &c);
+                assert_eq!(t.find(0x1000, k, p2, any_pad, &c), Some(0xb0));
+                assert_eq!(t.find(0x1000, k, p1, any_pad, &c), Some(0xa0));
+            }
+            // another address, then a refused texture: no duplicate
+            assert_eq!(t.find(0x2000, k, p1, any_pad, &c), None);
+            t.made(0x2000, k, p1, 0, &c);
+            assert_eq!(t.find(0x2000, k, p1, any_pad, &c), Some(0));
+            let made = if any_pad { 2 } else { 3 };
+            let (dup, served) = if any_pad { (0, 1) } else { (1, 0) };
+            let line = c.line(any_pad).unwrap();
+            assert_eq!(
+                line,
+                format!(
+                    "{made} textures made for views by address (1 could not be made), {dup} of them pad-only duplicates (bytes 4..8 of the desc alone differ from a key made before); {served} pad-only duplicates served by the texture already made; XCL_TEX_KEY_PAD {}",
+                    if any_pad { "on" } else { "off" }
+                )
+            );
+        }
+    }
+
+    /// Two threads that made the same key and padding at once: the last texture is kept (as the
+    /// table did before), and that is no duplicate.
+    #[test]
+    fn a_texture_made_twice_at_once_is_no_pad_only_duplicate() {
+        let c = TexKeyCounts::new();
+        let mut t = ViewTextures::default();
+        let (k, p) = view_desc_key(desc([7, 7, 7, 7], [0; 4]));
+        t.made(0x1000, k, p, 0xa0, &c);
+        t.made(0x1000, k, p, 0xc0, &c);
+        assert_eq!(t.find(0x1000, k, p, false, &c), Some(0xc0));
+        assert!(c.line(false).unwrap().starts_with("2 textures made for views by address (0 could not be made), 0 of them pad-only duplicates"));
+    }
 }
 
 /// device #70 (a retail game): a shader resource view of memory, without a resource object:
