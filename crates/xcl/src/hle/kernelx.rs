@@ -1122,6 +1122,88 @@ impl Away {
     }
 }
 
+/// LOCAL (`XCL_PAGE_BRING=0`: not): the title uses `at`, an address in its own reserved memory that
+/// it mapped a physical page at and that the page has since left – on the console a page stays
+/// mapped at every address it was mapped at; here its data is in one place, and the address it
+/// moved from was decommitted (a retail title's file reads into such an address failed and the
+/// title then faulted there). The page is brought to `at` (as `move_away` does when the title
+/// maps it) and its other address is given up until it is used again. Only between addresses
+/// outside unified memory. True: `at` holds the page now.
+pub unsafe fn bring_page(at: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| !std::env::var("XCL_PAGE_BRING").is_ok_and(|v| v.trim() == "0")) {
+        return false;
+    }
+    let at = at & !(PHYS_PAGE - 1);
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    if u.contains(at) {
+        return false;
+    }
+    // (a fault inside a mapping call holds the lock already: not ours to mend)
+    let Ok(mut g) = AWAY.try_lock() else { return false };
+    let Some(away) = g.as_mut() else { return false };
+    let Some(page) = away.title_page(at) else { return false };
+    let Some(&now) = away.page.get(&page) else { return false };
+    if now == at || u.contains(now) || away.at.contains_key(&at) {
+        return false;
+    }
+    mirrors::page_moved(page);
+    let moved = match move_away(away, now, at, page, false) {
+        Ok(true) => true,
+        // never used where it was: zeros here
+        Ok(false) => {
+            if mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+                false
+            } else {
+                away.at.insert(at, page);
+                away.page.insert(page, at);
+                true
+            }
+        }
+        Err(()) => false,
+    };
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        crate::xlog_info!("LOCAL page bring #{n}: page {page:#x} from {now:#x} to {at:#x}: {}", if moved { "done" } else { "failed" });
+    }
+    moved
+}
+
+/// LOCAL: `bring_page` for the pages of `[p, p + len)` that the page maps say have moved away (no
+/// memory query: a range no page moved from costs a lock and a lookup per 64 KiB).
+pub unsafe fn bring_range(p: usize, len: usize) {
+    let (first, end) = (p & !(PHYS_PAGE - 1), p.saturating_add(len));
+    if crate::gpu::uma::get().is_none_or(|u| u.contains(first)) {
+        return;
+    }
+    let moved: Vec<usize> = {
+        let Ok(g) = AWAY.try_lock() else { return };
+        let Some(away) = g.as_ref() else { return };
+        if away.title.is_empty() {
+            return;
+        }
+        (first..end)
+            .step_by(PHYS_PAGE)
+            .filter(|at| !away.at.contains_key(at) && away.title_page(*at).is_some_and(|pg| away.page.get(&pg).is_some_and(|&now| now != *at)))
+            .collect()
+    };
+    for at in moved {
+        bring_page(at);
+    }
+}
+
+/// LOCAL (diagnostics): what the page maps know about the address `at` (64 KiB page).
+pub fn describe_address(at: usize) -> String {
+    let at = at & !(PHYS_PAGE - 1);
+    let (away_at, title) = match AWAY.lock().unwrap().as_ref() {
+        Some(a) => (a.at.get(&at).copied(), a.title_page(at)),
+        None => (None, None),
+    };
+    let now = title.or(away_at).and_then(page_now);
+    format!("away.at {away_at:x?}, title page {title:x?}, that page is now at {now:x?}, lazy {}", lazy::is_lazy(at))
+}
+
 /// The title released `[base, base + len)`: the pages it mapped there are mapped there no more.
 fn forget_title_mappings(base: usize, len: usize) {
     if let Some(a) = AWAY.lock().unwrap().as_mut() {

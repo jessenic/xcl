@@ -1111,6 +1111,19 @@ impl QueueInner {
                 m.BaseAddress as usize, m.RegionSize, m.State, m.Protect,
                 file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default()
             );
+            // LOCAL: the first page of the destination that is not committed, and what the page maps say
+            let (mut at, end) = (request.destination as usize, (request.destination as usize).saturating_add(request.destination_size as usize));
+            while at < end {
+                let mut r: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                if unsafe { VirtualQuery(at as *const c_void, &mut r, std::mem::size_of_val(&r)) } == 0 {
+                    break;
+                }
+                if r.State != 0x1000 {
+                    crate::xlog_warn!("DirectStorage: failure #{nth}: first page not committed {at:#x} (state {:#x}, region size {:#x}): {}", r.State, r.RegionSize, crate::hle::kernelx::describe_address(at));
+                    break;
+                }
+                at = r.BaseAddress as usize + r.RegionSize;
+            }
         }
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;

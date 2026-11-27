@@ -42,7 +42,19 @@ unsafe fn commit(page: usize) -> bool {
         return false;
     }
     let _trap = crate::hle::d3d12x::watch_trap::guard(page, PAGE);
-    !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null()
+    if VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        // LOCAL: a failed commit kept the page reserved for good, silently: say so and keep it lazy
+        let e = windows_sys::Win32::Foundation::GetLastError();
+        g.insert(page);
+        crate::xlog_warn!("lazy pages: commit of {page:#x} failed (error {e}); it stays lazy");
+        return false;
+    }
+    true
+}
+
+/// LOCAL (diagnostics): is `page`'s 64 KiB page mapped but not committed yet?
+pub fn is_lazy(at: usize) -> bool {
+    LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&(at & !(PAGE - 1)))
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -52,7 +64,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     let page = r.ExceptionInformation[1] & !(PAGE - 1);
     let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page);
-    if lazy && commit(page) || allows(r.ExceptionInformation[0], r.ExceptionInformation[1]) {
+    if lazy && commit(page) || allows(r.ExceptionInformation[0], r.ExceptionInformation[1]) || super::bring_page(page) {
         EXCEPTION_CONTINUE_EXECUTION
     } else {
         EXCEPTION_CONTINUE_SEARCH
@@ -92,13 +104,16 @@ pub fn ensure(p: usize, len: usize) {
     let pages: Vec<usize> = {
         let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
-            return;
+            Vec::new()
+        } else {
+            g.range(p & !(PAGE - 1)..p.saturating_add(len)).copied().collect()
         }
-        g.range(p & !(PAGE - 1)..p.saturating_add(len)).copied().collect()
     };
     for page in pages {
         unsafe { commit(page) };
     }
+    // LOCAL: pages of the range the title mapped here that have since moved to another address
+    unsafe { super::bring_range(p, len) };
 }
 
 #[cfg(test)]
