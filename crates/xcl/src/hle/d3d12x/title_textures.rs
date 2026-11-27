@@ -1288,6 +1288,21 @@ fn hot_looks() -> bool {
     std::env::var("XCL_WATCH_HOT").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// LOCAL: how the walker keeps out of the way of the submitting thread's looks (both sit in
+/// NtGetWriteWatch: 29 of 30 stack samples of the walker and 11 of 15 of the submitting thread,
+/// RTX 5070 Ti, a retail title's world at 2.5 fps): `XCL_WALK_YIELD=1` – it yields while a look
+/// runs, `XCL_WALK_SLEEP_US=n` – it sleeps n microseconds before each 64 MiB step (a block's
+/// first write is then found that much later per step).
+fn walk_pace() -> (bool, u64) {
+    static P: std::sync::OnceLock<(bool, u64)> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        (
+            std::env::var("XCL_WALK_YIELD").is_ok_and(|v| v.trim() == "1"),
+            std::env::var("XCL_WALK_SLEEP_US").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+        )
+    })
+}
+
 const HOT_BLOCK: usize = 2 << 20;
 const _: () = assert!(HOT_BLOCK == super::write_guard::BLOCK);
 
@@ -1592,8 +1607,12 @@ unsafe fn walk() {
                 let stop = (at + STEP).min(end);
                 let mut from = at;
                 // lab (`look_ahead`): out of the way of a look's calls
-                while look_ahead().is_some() && LOOKING.load(Ordering::Acquire) {
+                while (look_ahead().is_some() || walk_pace().0) && LOOKING.load(Ordering::Acquire) {
                     std::thread::yield_now();
+                }
+                // LOCAL (`XCL_WALK_SLEEP_US`): a pause before each 64 MiB step
+                if walk_pace().1 != 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(walk_pace().1));
                 }
                 while from < stop {
                     let (mut n, mut page) = (buf.len(), 0u32);
