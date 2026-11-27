@@ -1183,10 +1183,15 @@ pub unsafe fn bring_range(p: usize, len: usize) {
         if away.title.is_empty() {
             return;
         }
-        (first..end)
-            .step_by(PHYS_PAGE)
-            .filter(|at| !away.at.contains_key(at) && away.title_page(*at).is_some_and(|pg| away.page.get(&pg).is_some_and(|&now| now != *at)))
-            .collect()
+        let left = |at: &usize| !away.at.contains_key(at) && away.title_page(*at).is_some_and(|pg| away.page.get(&pg).is_some_and(|&now| now != *at));
+        // (a caller may give a length of gigabytes: then the addresses the title mapped pages at are
+        // walked, not the range – stepping through such a range stalled the title until its watchdog
+        // ended it)
+        if (end - first) / PHYS_PAGE > away.title.len() {
+            away.title.keys().copied().filter(|at| *at >= first && *at < end).filter(left).collect()
+        } else {
+            (first..end).step_by(PHYS_PAGE).filter(left).collect()
+        }
     };
     for at in moved {
         bring_page(at);
