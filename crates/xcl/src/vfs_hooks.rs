@@ -535,8 +535,15 @@ unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32,
         crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
         // lab: and a block guarded for the hot looks is given back (`d3d12x::write_guard`)
         crate::hle::d3d12x::write_guard::unguard(buf as usize, n as usize);
+        crate::hle::d3d12x::watch_trap::read_start(buf as usize, n as usize, read as usize, ov as usize);
     }
-    orig(h, buf, n, read, ov)
+    let r = orig(h, buf, n, read, ov);
+    if !buf.is_null() {
+        let e = GetLastError();
+        crate::hle::d3d12x::watch_trap::read_end(buf as usize, n as usize, read as usize, ov as usize, r == 0 && e == 997, r != 0);
+        SetLastError(e);
+    }
+    r
 }
 
 unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {

@@ -44,6 +44,7 @@ pub(crate) mod write_guard;
 mod uma_driver;
 pub mod vram;
 mod worker_pool;
+pub mod watch_trap;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

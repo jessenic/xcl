@@ -822,6 +822,8 @@ fn writable(p: usize, n: usize) -> bool {
     let Some(end) = p.checked_add(n) else { return false };
     crate::hle::kernelx::lazy::ensure(p, n);
     crate::hle::d3d12x::write_guard::unguard(p, n);
+    // a read-only block of the watch trap is writable here: the copy into it faults and is let through
+    let _trap = crate::hle::d3d12x::watch_trap::guard(p, n);
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
         return true;
     }

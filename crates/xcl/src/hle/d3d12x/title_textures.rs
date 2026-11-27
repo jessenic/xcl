@@ -1678,6 +1678,10 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
             } else if hot_looks() {
                 start_look_ahead();
                 take_hot(&ranges, &mut buf, &mut dirty, &mut page);
+            } else if super::watch_trap::on() {
+                let mut p = page;
+                super::watch_trap::look(&ranges, &mut dirty, 0x1000, |a, n, d| take_written(a, n, &mut buf, d, &mut p));
+                page = p;
             } else {
                 for &(base, size) in ranges.iter() {
                     take_written(base, size, &mut buf, &mut dirty, &mut page);
@@ -1685,10 +1689,8 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
             }
         });
         dirty.sort_unstable();
-        if ahead_on {
-            // (a page written again after a round took it is found by the look too)
-            dirty.dedup();
-        }
+        // (a page written again after a round took it is found by the look too)
+        dirty.dedup();
         dirty.len()
     });
     let took = look.then(|| (watch_t0.elapsed(), dirty_len));

@@ -92,6 +92,7 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
 unsafe fn write_now(va: usize, words: &[u32]) {
     let bytes = 4 * words.len();
     if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+        let _trap = super::watch_trap::guard(va, bytes);
         use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
@@ -117,6 +118,7 @@ unsafe fn u64_writable_now(va: usize) -> bool {
     }
     // lab: a block guarded for the hot looks is writable (`write_guard`)
     super::write_guard::unguard(va, 8);
+    let _trap = super::watch_trap::guard(va, 8);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
     if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
@@ -150,6 +152,7 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
     }
     crate::hle::kernelx::lazy::ensure(va, bytes);
     super::write_guard::unguard(va, bytes);
+    let _trap = super::watch_trap::guard(va, bytes);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
