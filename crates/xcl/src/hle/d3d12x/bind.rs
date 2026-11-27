@@ -3232,6 +3232,8 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     // lab: lazily placed buffers the tables name get their video memory (`sparse::use_range`)
     if super::sparse::lazy_buffer_mb().0 != 0 {
         if let Some(l) = layout.as_deref() {
+            // (lab XCL_USE_RANGE_HIT=1: each address once)
+            let mut seen = super::sparse::use_range_hit().then(super::sparse::SeenAddrs::new);
             for table in table_addresses(l, &args, u.base()) {
                 if !crate::gpu::shader::readable(table, 32 * 64) {
                     continue;
@@ -3239,7 +3241,11 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
                 for k in 0..64 {
                     let d = ((table + 32 * k) as *const [u32; 4]).read_unaligned();
                     if d[3] >> 30 == 0 && (d[0] | d[1]) != 0 {
-                        super::sparse::use_range(((d[1] as usize & 0xFFFF) << 32) | d[0] as usize, 1);
+                        let va = ((d[1] as usize & 0xFFFF) << 32) | d[0] as usize;
+                        if seen.as_mut().is_some_and(|s| !s.first(va)) {
+                            continue;
+                        }
+                        super::sparse::use_range(va, 1);
                     }
                 }
             }

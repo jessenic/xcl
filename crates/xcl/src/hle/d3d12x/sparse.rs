@@ -2798,10 +2798,95 @@ static LAZY_BUFS: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atom
 static LAZY_BYTES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 fn lazy_bounds(s: &State) {
+    // (lab XCL_USE_RANGE_HIT=1: the index first, so a `use_range` that sees the new bounds sees it)
+    if use_range_hit() {
+        *LAZY_INDEX.write().unwrap_or_else(|e| e.into_inner()) = lazy_index_build(&s.lazy_bufs);
+    }
     let lo = s.lazy_bufs.iter().map(|b| b.1).min().unwrap_or(0);
     let hi = s.lazy_bufs.iter().map(|b| b.1 + b.2).max().unwrap_or(0);
     LAZY_BUFS[0].store(lo, Ordering::Release);
     LAZY_BUFS[1].store(hi, Ordering::Release);
+}
+
+/// lab `XCL_USE_RANGE_HIT=1` (off by default): 0 not read yet, 1 off, 2 on
+static USE_RANGE_HIT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// lab `XCL_USE_RANGE_HIT=1`: `use_range` takes the state only for an address in a lazily placed
+/// buffer without video memory (`LAZY_INDEX`), not for every one between the lowest and the
+/// highest of them (PROF1: ~7000 acquisitions a frame, nearly all finding nothing); `bind`
+/// names each address of a draw's tables once (`SeenAddrs`).
+pub(super) fn use_range_hit() -> bool {
+    match USE_RANGE_HIT.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var("XCL_USE_RANGE_HIT").is_ok_and(|v| v == "1");
+            USE_RANGE_HIT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            if on {
+                crate::xlog_info!("lab XCL_USE_RANGE_HIT=1: use_range takes the sparse state only for an address in a lazily placed buffer without video memory");
+            }
+            on
+        }
+        v => v == 2,
+    }
+}
+
+/// tests: the switch as `on` says (None: read from the environment again)
+#[cfg(test)]
+fn set_use_range_hit(on: Option<bool>) {
+    USE_RANGE_HIT.store(
+        match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// lab `XCL_USE_RANGE_HIT=1`: the lazily placed buffers without video memory, outside `STATE`:
+/// (start, end, the largest end of this one and those before it), sorted by start; made again
+/// with every change of `State::lazy_bufs` (`lazy_bounds`).
+static LAZY_INDEX: std::sync::RwLock<Vec<(usize, usize, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// `LAZY_INDEX` of `bufs` (resource, first tile, bytes from there)
+fn lazy_index_build(bufs: &[(usize, usize, usize)]) -> Vec<(usize, usize, usize)> {
+    let mut v: Vec<(usize, usize)> = bufs.iter().map(|b| (b.1, b.1 + b.2)).collect();
+    v.sort_unstable();
+    let mut hi = 0usize;
+    v.into_iter()
+        .map(|(s, e)| {
+            hi = hi.max(e);
+            (s, e, hi)
+        })
+        .collect()
+}
+
+/// Whether `[va, end)` meets a range of `index` (`lazy_index_build`): the test `use_range` makes
+/// under the lock (`va < start + bytes && start < end`), for any of them. The ranges that start
+/// before `end` are a prefix; one of them reaches past `va` if the largest end among them does.
+fn lazy_index_hits(index: &[(usize, usize, usize)], va: usize, end: usize) -> bool {
+    let n = index.partition_point(|r| r.0 < end);
+    n > 0 && index[n - 1].2 > va
+}
+
+/// lab `XCL_USE_RANGE_HIT=1`: the addresses a draw's tables name, each passed on once. A small
+/// direct-mapped set: an address seen is skipped, one evicted by another may come again (calling
+/// `use_range` twice for an address is harmless: the second call finds nothing left to map).
+pub(super) struct SeenAddrs([usize; 64]);
+
+impl SeenAddrs {
+    pub(super) fn new() -> Self {
+        SeenAddrs([usize::MAX; 64])
+    }
+
+    /// true the first time `va` comes (as far as the set remembers)
+    pub(super) fn first(&mut self, va: usize) -> bool {
+        let k = ((va >> 4) ^ (va >> 12) ^ (va >> 20)) & 63;
+        if self.0[k] == va {
+            return false;
+        }
+        self.0[k] = va;
+        true
+    }
 }
 
 /// lab: (MB placed lazily, MB of them with video memory)
@@ -2816,6 +2901,10 @@ pub fn lazy_buffer_mb() -> (u64, u64) {
 pub unsafe fn use_range(va: usize, len: usize) {
     let (lo, hi) = (LAZY_BUFS[0].load(Ordering::Acquire), LAZY_BUFS[1].load(Ordering::Acquire));
     if va >= hi || va.saturating_add(len.max(1)) <= lo {
+        return;
+    }
+    // lab XCL_USE_RANGE_HIT=1: the state only when a buffer without video memory is there
+    if use_range_hit() && !lazy_index_hits(&LAZY_INDEX.read().unwrap_or_else(|e| e.into_inner()), va, va.saturating_add(len.max(1))) {
         return;
     }
     let mut g = lock_state();
@@ -4194,5 +4283,93 @@ mod tests {
         set_map_nowait(Some(true));
         assert!(map_nowait());
         set_map_nowait(None);
+    }
+
+    /// lab `XCL_USE_RANGE_HIT`: the index answers what the scan under the lock finds, for random
+    /// buffers (overlapping ones too) and random ranges.
+    #[test]
+    fn the_lazy_index_finds_what_the_scan_finds() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..300 {
+            let n = (next(&mut x) % 12) as usize;
+            let bufs: Vec<(usize, usize, usize)> = (0..n)
+                .map(|i| {
+                    let start = (next(&mut x) % 64) as usize * TILE;
+                    let bytes = 1 + (next(&mut x) % (3 * TILE as u64)) as usize;
+                    (0x1000 + i, start, bytes)
+                })
+                .collect();
+            let index = lazy_index_build(&bufs);
+            for _ in 0..200 {
+                let va = (next(&mut x) % (70 * TILE as u64)) as usize;
+                let end = va + 1 + (next(&mut x) % (2 * TILE as u64)) as usize;
+                let scan = bufs.iter().any(|&(_, start, bytes)| !(va >= start + bytes || end <= start));
+                assert_eq!(lazy_index_hits(&index, va, end), scan, "round {round}: [{va:#x}, {end:#x}) in {bufs:x?}");
+            }
+        }
+        assert!(!lazy_index_hits(&[], 0, usize::MAX), "no buffers: no hit");
+    }
+
+    /// lab `XCL_USE_RANGE_HIT`: each address passes once; an address is never skipped the first
+    /// time it comes.
+    #[test]
+    fn seen_addresses_pass_once() {
+        let mut seen = SeenAddrs::new();
+        let addrs = [0x10_0000_0000usize, 0x10_0000_0100, 0x10_0000_0000, 0x10_0001_0000, 0x10_0000_0100, 0x10_0000_0000];
+        let passed: Vec<usize> = addrs.iter().copied().filter(|&a| seen.first(a)).collect();
+        assert_eq!(passed, vec![0x10_0000_0000, 0x10_0000_0100, 0x10_0001_0000]);
+        let mut seen = SeenAddrs::new();
+        let mut x = 7u64;
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let a = (next(&mut x) % 500) as usize * 0x40;
+            if firsts.insert(a) {
+                assert!(seen.first(a), "{a:#x} skipped the first time");
+            } else {
+                let _ = seen.first(a);
+            }
+        }
+    }
+
+    /// `f` on another thread while this one holds the sparse state: whether it finished within
+    /// `ms` (then the state is let go, and the thread joined).
+    fn finishes_within_while_the_state_is_held(ms: u64, f: impl FnOnce() + Send + 'static) -> bool {
+        let held = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        let done = rx.recv_timeout(std::time::Duration::from_millis(ms)).is_ok();
+        drop(held);
+        assert!(t.join().is_ok(), "the thread panicked");
+        done
+    }
+
+    /// lab `XCL_USE_RANGE_HIT=1`: `use_range` of an address between the lazily placed buffers but
+    /// in none of them returns while another thread holds the state; one in a buffer still takes
+    /// the state, as does any address of the envelope with the switch off (the old path).
+    #[test]
+    fn use_range_outside_the_lazy_buffers_does_not_take_the_state() {
+        const A: usize = 0x7e00_0000_0000;
+        let bufs = [(0x1usize, A, TILE), (0x2usize, A + 8 * TILE, 2 * TILE)];
+        let old = (LAZY_BUFS[0].load(Ordering::Acquire), LAZY_BUFS[1].load(Ordering::Acquire));
+        let old_index = std::mem::replace(&mut *LAZY_INDEX.write().unwrap_or_else(|e| e.into_inner()), lazy_index_build(&bufs));
+        LAZY_BUFS[0].store(A, Ordering::Release);
+        LAZY_BUFS[1].store(A + 10 * TILE, Ordering::Release);
+        let outside = A + 4 * TILE;
+        let inside = A + 9 * TILE + 16;
+        set_use_range_hit(Some(true));
+        let on_outside = finishes_within_while_the_state_is_held(500, move || unsafe { use_range(outside, 1) });
+        let on_inside = finishes_within_while_the_state_is_held(300, move || unsafe { use_range(inside, 1) });
+        set_use_range_hit(Some(false));
+        let off_outside = finishes_within_while_the_state_is_held(300, move || unsafe { use_range(outside, 1) });
+        set_use_range_hit(None);
+        LAZY_BUFS[0].store(old.0, Ordering::Release);
+        LAZY_BUFS[1].store(old.1, Ordering::Release);
+        *LAZY_INDEX.write().unwrap_or_else(|e| e.into_inner()) = old_index;
+        assert!(on_outside, "on: an address in no lazy buffer does not wait for the state");
+        assert!(!on_inside, "on: an address in a lazy buffer takes the state (to map it)");
+        assert!(!off_outside, "off: every address of the envelope takes the state, as before");
     }
 }
