@@ -9068,6 +9068,9 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
     hr
 }
 
+/// LOCAL DIAGNOSTIC: microseconds of the parts of a submit `submit_cost` does not itemise, and the count.
+static SUBMIT_PARTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
@@ -9108,9 +9111,12 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // texture a draw named meanwhile sent this thread into `vram::revive` for that same lock
     // (lab run G1: the title stood still from 72 s, its watchdog ended it at 101 s; the stalls of
     // F1 / F2 / T2 look the same, not checked). They are mapped again at the title's next submit.
+    SUBMIT_PARTS[0].fetch_add(submit_t0.elapsed().as_micros() as u64, Ordering::Relaxed); // LOCAL DIAGNOSTIC
+    let t_rev = std::time::Instant::now();
     if !super::title_textures::is_own_work() {
         cs!(ReviveListed, super::title_textures::revive_listed(&mapped));
     }
+    SUBMIT_PARTS[1].fetch_add(t_rev.elapsed().as_micros() as u64, Ordering::Relaxed);
     removed_probe("execute: after revive_listed");
     // textures in title memory the CPU wrote since: uploaded again first
     cs!(Refresh, super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize)));
@@ -9126,22 +9132,44 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         let t1 = std::time::Instant::now();
         super::submit_cost::driver(t1 - t);
         removed_probe("execute: after the PC call");
+        let mut ta = std::time::Instant::now(); // LOCAL DIAGNOSTIC: the parts of "after"
+        let mut part = |i: usize| {
+            SUBMIT_PARTS[i].fetch_add(ta.elapsed().as_micros() as u64, Ordering::Relaxed);
+            ta = std::time::Instant::now();
+        };
         cs!(CopyScratchSubmitted, super::list_x::copy_scratch_submitted(this, chunk));
+        part(2);
         cs!(AllocPoolExecuted, super::alloc_pool::executed(this, chunk));
+        part(3);
         removed_probe("execute: after alloc_pool::executed");
         cs!(SignalWrite64Fences, super::list_x::signal_write64_fences(this, chunk));
+        part(4);
         cs!(ReadbackSparseWrites, super::list_x::readback_sparse_writes(this, chunk));
+        part(5);
         removed_probe("execute: after readback_sparse_writes");
         cs!(CpuWritesAfter, super::list_x::cpu_writes_after(this, chunk));
+        part(6);
         removed_probe("execute: after cpu_writes_after");
         super::submit_cost::after(t1.elapsed());
     });
     drop(cs_waits);
     // the next uploads into textures kept in step start from the states these lists leave
+    let t_end = std::time::Instant::now(); // LOCAL DIAGNOSTIC
     cs!(Submitted, super::title_textures::submitted(&mapped));
     cs!(PresentNoteExecute, super::present::note_execute(this, &mapped));
     removed_probe("execute: end");
     stop_if_device_removed();
+    SUBMIT_PARTS[7].fetch_add(t_end.elapsed().as_micros() as u64, Ordering::Relaxed);
+    {
+        let n = SUBMIT_PARTS[8].fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 2048 == 0 {
+            let v: Vec<f64> = (0..8).map(|i| SUBMIT_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 2048.0 / 1000.0).collect();
+            crate::xlog_info!(
+                "submit parts, average of 2048 (ms): list mapping {:.2}, revive {:.2}, copy scratch {:.2}, alloc pool {:.2}, write64 fences {:.2}, sparse readbacks {:.2}, cpu writes after {:.2}, end {:.2}",
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]
+            );
+        }
+    }
     super::submit_cost::done(submit_t0);
 }
 

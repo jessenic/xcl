@@ -771,8 +771,10 @@ unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSigna
     let res_pso: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
     std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
     let pso = res_pso.map_err(|e| format!("scale pso create: {e}"))?;
-    CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, (rs.clone(), pso.clone()));
-    Ok((rs, pso))
+    // LOCAL (claudetools-gh, #2952 entry 6): the first pair put in the cache wins. With `insert` a
+    // second thread that built its own at the same moment replaced the first one, which was then
+    // freed while lists recorded with it were still to run (a GPU hang at world entry).
+    Ok(CACHE.lock().unwrap().get_or_insert_with(HashMap::new).entry(key).or_insert((rs, pso)).clone())
 }
 
 unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src_raw: usize, src_off: u64, max: u32, stride: u32, mesh_offset: u32, mult: u32) -> Result<ID3D12Resource, String> {
@@ -1412,6 +1414,137 @@ unsafe fn draw_textures(io: &[u32], heap: usize) {
         }
     }
     super::title_textures::drawn(&named);
+}
+
+/// LOCAL (`XCL_SKIN_INPUTS=1`; `=probe`: log only): what the title's ped skinning compute programs
+/// read through the view heap, which no table names: two buffers (heap slots at +0x40 / +0x44 of
+/// the buffer whose V# is in slot 8 of the second table, s5) – kept in view memory
+/// (`view_mem::ensure`) – and one 2-D texture per record (heap slot at +0x8c of each 0x90-byte
+/// record of the buffer in slot 8 of the first table, s4; count: dword 0 of the buffer in its
+/// slot 3) – told to the page budget (`title_textures::drawn`). `heap`: the index of the view
+/// heap's SGPR in `io`.
+unsafe fn skin_inputs(pso: usize, io: &[u32], heap: usize) {
+    const SKINNING: [u64; 10] = [
+        0x1404420b38db8597, 0xcc047f458010c5d2, 0x34207613d17f8b96, 0x94f612c85468fb5b, 0x36353c66e9666102,
+        0x44ca55bfefe67bd5, 0xbd968d88fabf544f, 0x9144739038da8a66, 0x4585e350d1b864e3, 0xb6101d83892d44a5,
+    ];
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("XCL_SKIN_INPUTS").as_deref().map(str::trim) {
+        Ok("1") => 2,
+        Ok("probe") => 1,
+        _ => 0,
+    });
+    if mode == 0 || heap < 2 || heap >= io.len() {
+        return;
+    }
+    let Some((cs, _)) = super::real::pso_shaders(super::pso_async::resolve(pso)).filter(|s| SKINNING.contains(&s.0)) else { return };
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let at = |a: u64| if a >> 32 == 0 { u.base() + a as usize } else { a as usize };
+    // (a buffer in the title's GPU view is read where the CPU has its bytes)
+    let cpu = |p: usize, n: usize| -> Option<Vec<u32>> {
+        let p = if u.window_of(p).is_some() { p } else { super::view_mem::cpu_at(p)? };
+        crate::gpu::shader::readable(p, 4 * n).then(|| (0..n).map(|i| ((p + 4 * i) as *const u32).read_unaligned()).collect())
+    };
+    let va = |d: &[u32]| ((d[1] as usize & 0xFFFF) << 32) | d[0] as usize;
+    let bytes = |d: &[u32]| {
+        let stride = (d[1] >> 16) as usize & 0x3FFF;
+        if stride == 0 { d[2] as usize } else { (d[2] as usize).saturating_mul(stride) }
+    };
+    let (a, b, view) = (at(io[heap - 2] as u64), at(io[heap - 1] as u64), at(io[heap] as u64));
+    let mut line = String::new();
+    // the two buffers
+    if let Some(v) = cpu(b + 0x100, 4).filter(|v| v[3] >> 30 == 0 && (v[0] | v[1]) != 0) {
+        if let Some(slots) = cpu(va(&v) + 0x40, 2) {
+            for slot in slots {
+                let Some(d) = cpu(view + slot as usize * 32, 4).filter(|d| slot < 1 << 22 && d[3] >> 30 == 0) else {
+                    line += &format!(" buf slot {slot:#x}: no V#;");
+                    continue;
+                };
+                let (p, n) = (va(&d), bytes(&d).clamp(4, 64 << 20));
+                line += &format!(" buf slot {slot:#x}: {p:#x}+{n:#x} win {:?}", u.window_of(p));
+                if u.window_of(p).is_none() {
+                    // which of its 64 KiB pages the CPU cannot read (the GPU then reads zeros there)
+                    let pages: Vec<usize> = ((p & !0xFFFF)..p + n).step_by(0x1_0000).collect();
+                    let missing: Vec<usize> = pages.iter().copied().filter(|&q| super::view_mem::cpu_at(q).is_none()).collect();
+                    line += &format!(" pages {} unreadable {}", pages.len(), missing.len());
+                    if let Some(&q) = missing.first() {
+                        static M: AtomicU64 = AtomicU64::new(0);
+                        if M.fetch_add(1, Ordering::Relaxed) < 24 {
+                            let cpu_view = crate::hle::kernelx::mirrors::source(q);
+                            crate::xlog_info!("lab: skin inputs: {cs:016x} buffer {p:#x}+{n:#x}: page {q:#x} unreadable; CPU view {cpu_view:x?}: {}", cpu_view.map(crate::hle::kernelx::describe_address).unwrap_or_default());
+                        }
+                    }
+                }
+                line += ";";
+                if mode == 2 && p != 0 {
+                    super::view_mem::ensure(p, n);
+                }
+            }
+        } else {
+            line += " record buffer unreadable;";
+        }
+    } else {
+        line += " no record V#;";
+    }
+    // the textures
+    let count = cpu(a + 0x60, 4).filter(|v| v[3] >> 30 == 0).and_then(|v| cpu(va(&v), 1)).map_or(0, |c| c[0].min(64) as usize);
+    let (mut named, mut evicted) = (Vec::new(), 0);
+    if let Some(v) = cpu(a + 0x100, 4).filter(|v| v[3] >> 30 == 0 && (v[0] | v[1]) != 0) {
+        for i in 0..count {
+            let Some(slot) = cpu(va(&v) + i * 0x90 + 0x8c, 1).map(|s| s[0]).filter(|&s| s != 0 && s < 1 << 22) else { continue };
+            let Some(t) = cpu(view + slot as usize * 32, 4).filter(|t| t[3] >> 28 >= 8) else { continue };
+            if let Some(res) = super::console_heap::index_resource(t[0]) {
+                if !named.contains(&res) {
+                    evicted += super::vram::is_evicted(res) as u32;
+                    named.push(res);
+                }
+            }
+        }
+    }
+    if mode == 2 && super::vram::tracking() {
+        super::title_textures::drawn(&named);
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    // every buffer V# of both tables' first 32 slots: where it lives (the outputs are A's slots 24 / 25)
+    if n < 24 || (n % 4096 == 0 && n < 1 << 20) {
+        let mut all = String::new();
+        for (name, t) in [("A", a), ("B", b)] {
+            for k in 0..32usize {
+                let Some(d) = cpu(t + 32 * k, 4).filter(|d| d[3] >> 30 == 0 && (d[0] | d[1]) != 0) else { continue };
+                let (p, len) = (va(&d), bytes(&d));
+                let place = match u.window_of(p) {
+                    Some(w) => format!("win {w}{}", if u.is_sparse(p) { " sparse" } else { "" }),
+                    None => format!("view, cpu {}", if super::view_mem::cpu_at(p).is_some() { "ok" } else { "none" }),
+                };
+                all += &format!(" {name}{k}: {p:#x}+{len:#x} ({place});");
+            }
+        }
+        crate::xlog_info!("lab: skin tables #{n} {cs:016x}:{all}");
+    }
+    // the outputs (A's slots 24 / 25): how many of their tiles have video memory now
+    {
+        let mut out = String::new();
+        let mut missing = 0;
+        for k in [24usize, 25] {
+            let Some(d) = cpu(a + 32 * k, 4).filter(|d| d[3] >> 30 == 0 && (d[0] | d[1]) != 0) else { continue };
+            let (p, len) = (va(&d), bytes(&d));
+            if !u.is_sparse(p) {
+                continue;
+            }
+            let (all, mapped, kept, parked) = super::sparse::tile_counts(p, len);
+            missing += all - mapped.min(all);
+            out += &format!(" A{k} {p:#x}+{len:#x}: {all} tiles, {mapped} mapped, {kept} kept, {parked} parked;");
+        }
+        static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+        static LINES: AtomicU64 = AtomicU64::new(0);
+        if LAST.swap(missing as u64, Ordering::Relaxed) != missing as u64 && LINES.fetch_add(1, Ordering::Relaxed) < 400 {
+            crate::xlog_info!("lab: skin out #{n} {cs:016x}:{out} ({missing} without video memory)");
+        }
+    }
+    if n < 48 || n.is_power_of_two() || evicted > 0 && n % 64 == 0 || line.contains("unreadable ") && !line.contains("unreadable 0") && n % 256 == 0 {
+        crate::xlog_info!("lab: skin inputs #{n} {cs:016x}: tables {a:#x} {b:#x}, heap {view:#x};{line} {count} records, {} textures named, {evicted} evicted", named.len());
+    }
 }
 
 /// lab: `XCL_PS_PROBE=t` (seconds of uptime; `XCL_PS_PROBE_HASH`, default e1e597d212161b7e: the
@@ -3274,6 +3407,9 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     heap_sgpr(this, &mut io, layout.is_some());
     if gfx && io.len() > user {
         draw_textures(&io, user);
+    }
+    if !gfx && io.len() > user {
+        skin_inputs(pso, &io, user);
     }
     // page budget: the textures in the bound descriptor tables are sampled
     if let Some(l) = layout.as_ref().filter(|_| super::vram::tracking()) {

@@ -243,6 +243,11 @@ fn source(va: usize) -> Option<usize> {
     crate::gpu::shader::readable(a, TILE).then_some(a)
 }
 
+/// LOCAL: where the CPU reads the byte at `va` (the page's source plus the offset in it).
+pub fn cpu_at(va: usize) -> Option<usize> {
+    source(va & !(TILE - 1)).map(|p| p + (va & (TILE - 1)))
+}
+
 /// A sampled signature of a page (a word every 256 bytes and its last one), read from a copy
 /// made without faulting: the title may decommit the page meanwhile (a run ended in memcpy here).
 unsafe fn signature(src: usize) -> u64 {

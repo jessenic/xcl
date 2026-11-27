@@ -2767,6 +2767,23 @@ fn shared_take(tile: (u32, u32)) -> bool {
     }
 }
 
+/// LOCAL (diagnostics): of the 64 KiB tiles of `[va, va + len)`: (all, mapped, kept, parked) –
+/// a tile in none of the three has no video memory: GPU writes there are dropped, reads give 0.
+pub fn tile_counts(va: usize, len: usize) -> (usize, usize, usize, usize) {
+    let g = lock_state();
+    let Some(s) = g.as_ref() else { return (0, 0, 0, 0) };
+    let (mut all, mut mapped, mut kept, mut parked) = (0, 0, 0, 0);
+    let mut t = va & !(TILE - 1);
+    while t < va + len {
+        all += 1;
+        mapped += s.mapped.contains_key(&t) as usize;
+        kept += s.kept.contains_key(&t) as usize;
+        parked += s.parked.contains_key(&t) as usize;
+        t += TILE;
+    }
+    (all, mapped, kept, parked)
+}
+
 /// LOCAL (`XCL_PAGE_SHARE=1`): the title maps the physical page it had at `old` at `at`
 /// (`kernelx::move_away`; XCL keeps a page's CPU bytes at the address mapped last). On the console
 /// the page's bytes are the same wherever it is mapped, so what the GPU wrote or was sent at `old`
@@ -2781,14 +2798,27 @@ pub unsafe fn share_page(old: usize, at: usize) -> bool {
     let (old, at) = (old & !(TILE - 1), at & !(TILE - 1));
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return false };
-    if old == at || s.mapped.contains_key(&at) || s.parked.contains_key(&at) || s.kept.contains_key(&at) {
+    if old == at || s.mapped.contains_key(&at) {
         return false;
     }
     let Some(wi) = s.window_index(at) else { return false };
+    let Some(pool) = s.mapped.get(&old).map(|e| e.pool) else { return false };
+    // what the window still shows at `at` from an earlier mapping there (parked, or kept for a buffer)
+    let there = s.parked.remove(&at).or_else(|| s.kept.remove(&at));
+    let back = there == Some(pool);
+    if let Some(q) = there.filter(|&q| q != pool) {
+        // another page's tile: it leaves the window here (the mapping below replaces it) and goes
+        // back at the next flush unless a buffer or another address still uses it
+        if !s.pinned.contains_key(&q) && !shared_take(q) {
+            s.released.push(q);
+        }
+    }
     let Some(entry) = s.mapped.remove(&old) else { return false };
-    let pool = entry.pool;
-    let (b, r) = (s.windows[wi].0, s.windows[wi].1.clone());
-    s.map_tiles(&r, b, &[(at, pool)]);
+    if !back {
+        // (a page that comes back to an address that still shows its tile needs no mapping)
+        let (b, r) = (s.windows[wi].0, s.windows[wi].1.clone());
+        s.map_tiles(&r, b, &[(at, pool)]);
+    }
     s.mapped.insert(at, entry);
     s.runs = None;
     // the old address: still shown for a buffer placed there, else unmapped at the next flush
@@ -2797,7 +2827,10 @@ pub unsafe fn share_page(old: usize, at: usize) -> bool {
     } else {
         s.parked.insert(old, pool);
     }
-    *SHARED.lock().unwrap().get_or_insert_with(FxHashMap::default).entry(pool).or_insert(0) += 1;
+    // one more address shows the tile – unless the page came back to one that was counted already
+    if !back {
+        *SHARED.lock().unwrap().get_or_insert_with(FxHashMap::default).entry(pool).or_insert(0) += 1;
+    }
     MAPPED_GEN.fetch_add(1, Ordering::Release);
     s.signal();
     let n = SHARES.fetch_add(1, Ordering::Relaxed) + 1;
