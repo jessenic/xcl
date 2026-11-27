@@ -374,17 +374,30 @@ unsafe fn make_scatter(dev: &ID3D12Device) -> Result<Scatter, String> {
     let mut blob = None;
     D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &mut blob, None).map_err(|e| format!("root signature: {e}"))?;
     let blob = blob.ok_or("no root signature blob")?;
-    let root: ID3D12RootSignature = dev
-        .CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize()))
-        .map_err(|e| format!("root signature: {e}"))?;
+    // (review F3) the device's original creators (`real::pc_vtable`): the device is adopted by the time
+    // this runs, and its hooks (dev_create_root_signature, dev_create_compute_pso) treat a PSO as the
+    // title's: a failed finish there gives a stand-in shader and success, and the scatter would then
+    // write nothing without a word. Here a failure is an error: logged, and the uploads go by copies.
+    let raw = dev.as_raw();
+    let v = &*(super::real::pc_vtable(raw) as *const ID3D12Device_Vtbl);
+    let mut p: *mut c_void = std::ptr::null_mut();
+    let hr = (v.CreateRootSignature)(raw, 0, blob.GetBufferPointer(), blob.GetBufferSize(), &ID3D12RootSignature::IID, &mut p);
+    if hr.is_err() || p.is_null() {
+        return Err(format!("root signature: {:#x}", hr.0 as u32));
+    }
+    let root = ID3D12RootSignature::from_raw(p);
     let mut pd = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
         CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
         ..Default::default()
     };
-    let pso = dev.CreateComputePipelineState(&pd);
+    let mut p: *mut c_void = std::ptr::null_mut();
+    let hr = (v.CreateComputePipelineState)(raw, &pd, &ID3D12PipelineState::IID, &mut p);
     std::mem::ManuallyDrop::drop(&mut pd.pRootSignature);
-    Ok(Scatter { root, pso: pso.map_err(|e| format!("pipeline: {e}"))? })
+    if hr.is_err() || p.is_null() {
+        return Err(format!("pipeline: {:#x}", hr.0 as u32));
+    }
+    Ok(Scatter { root, pso: ID3D12PipelineState::from_raw(p) })
 }
 
 /// An upload buffer of `size` bytes, mapped.
@@ -5210,6 +5223,27 @@ mod tests {
             drop(held);
             drop_retired_tables();
             assert!(RETIRED_TABLES.lock().unwrap().is_empty(), "released once the lock is let go");
+        }
+    }
+
+    /// `XCL_SPARSE_SCATTER` (review F3): the scatter's root signature and pipeline made through an
+    /// adopted device are not adopted (the device's original creators): no title PSO hook can hand
+    /// back a stand-in shader for it.
+    #[test]
+    fn the_scatter_pipeline_is_made_without_the_device_hooks() {
+        use crate::hle::d3d12x::real;
+        let _serial = lab_test_lock();
+        unsafe {
+            if crate::gpu::recomp::dxc::create_instance().is_none() {
+                println!("no DXC – skipping");
+                return;
+            }
+            let dev = lab_device();
+            real::adopt(dev.as_raw(), real::Kind::Device);
+            assert!(real::is_adopted(dev.as_raw()), "the device is adopted (its creators are XCL's hooks)");
+            let sc = make_scatter(&dev).expect("the scatter pipeline");
+            assert!(!real::is_adopted(sc.root.as_raw()), "root signature not adopted");
+            assert!(!real::is_adopted(sc.pso.as_raw()), "pipeline not adopted: made by D3D12 itself, not by the title's PSO hook");
         }
     }
 }
