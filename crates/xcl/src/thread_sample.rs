@@ -36,6 +36,10 @@ const FRAMES: usize = 8;
 const COPY_BYTES: usize = 16 << 10;
 /// a thread is stopped at least once every this many samples, unchanged or not
 const MAX_UNCHANGED: u32 = 20;
+/// cycles a waiting thread may use between two samples and still count as not having run: stopping it
+/// (SuspendThread runs a kernel APC on it, ResumeThread wakes it) charges it some cycles of its own, so
+/// an exact `== 0` would stop every waiter at every sample
+const WAKE_NOISE_CYCLES: u64 = 1_000_000;
 /// samples between two looks at the thread list / at the thread names / at the modules
 const REFRESH_THREADS: u32 = 100;
 const REFRESH_NAMES: u32 = 200;
@@ -407,10 +411,11 @@ pub(crate) fn run<W: Write>(c: Config, out: &mut Out<W>) -> Stats {
                 let mut cy = 0u64;
                 let have_cy = QueryThreadCycleTime(t.h, &mut cy) != 0;
                 let ran = cy.wrapping_sub(t.cycles);
-                if have_cy && ran == 0 && t.waiting && t.unchanged_in_row < MAX_UNCHANGED {
+                if have_cy && ran < WAKE_NOISE_CYCLES && t.waiting && t.unchanged_in_row < MAX_UNCHANGED {
                     t.unchanged_in_row += 1;
                     st.unchanged += 1;
-                    rows.push((tid, UNCHANGED, 0, [0; FRAMES], 0));
+                    t.cycles = cy;
+                    rows.push((tid, UNCHANGED, ran, [0; FRAMES], 0));
                     continue;
                 }
                 #[repr(align(16))]
@@ -719,6 +724,7 @@ mod tests {
         let mut spin_with_caller = 0;
         let mut spin_cycles = 0u64;
         let (mut wait_stopped, mut wait_in_ntdll, mut wait_unchanged) = (0, 0, 0);
+        let mut wait_noise_max = 0u64;
         for (_, _, _, es) in &f.samples {
             assert!(es.iter().all(|e| e.0 != me));
             for e in es {
@@ -736,14 +742,17 @@ mod tests {
                             wait_stopped += 1;
                             wait_in_ntdll += usize::from(inside(e.3[0], &ntdll));
                         }
-                        UNCHANGED => wait_unchanged += 1,
+                        UNCHANGED => {
+                            wait_unchanged += 1;
+                            wait_noise_max = wait_noise_max.max(e.2);
+                        }
                         _ => {}
                     }
                 }
             }
         }
         eprintln!(
-            "spinner: {spin_stopped} stopped, {spin_in_own} in this binary, {spin_with_caller} with a caller, {spin_cycles} cycles; waiter: {wait_stopped} stopped ({wait_in_ntdll} in ntdll), {wait_unchanged} unchanged"
+            "spinner: {spin_stopped} stopped, {spin_in_own} in this binary, {spin_with_caller} with a caller, {spin_cycles} cycles; waiter: {wait_stopped} stopped ({wait_in_ntdll} in ntdll), {wait_unchanged} unchanged (at most {wait_noise_max} cycles between two)"
         );
         // the spinner runs all along: stopped at every sample (its cycles move), in spin()
         assert!(spin_stopped >= 140, "the spinner was stopped at nearly every sample");
