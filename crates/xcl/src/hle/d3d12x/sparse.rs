@@ -2096,6 +2096,32 @@ pub unsafe fn settle_readbacks_try() {
     }
 }
 
+/// lab `XCL_FENCE_DIRECT=2`: at one of XCL's own fence probes (`real::probe_completed`), what the
+/// title hook's settle did there, without its spin and its wait: with copies back pending and the
+/// state free, those the GPU has finished land now (`Drain::Finished`). One `try_lock`: nothing when
+/// another thread or the caller itself holds the state (`drain_quarantined`); never a wait for a
+/// copy still running (the hook waited for one whose title work was done: the next probe, the
+/// title's own fence calls or the readback thread land it).
+pub unsafe fn land_finished_nowait() {
+    if RB_PENDING.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let Ok(mut g) = STATE.try_lock() else { return };
+    let Some(s) = g.as_mut() else { return };
+    let before = s.rb_jobs.len();
+    s.drain_readbacks(Drain::Finished);
+    let landed = before - s.rb_jobs.len();
+    if landed > 0 {
+        let k = PROBE_LANDINGS.fetch_add(1, Ordering::Relaxed) + 1;
+        if k <= 4 || k.is_power_of_two() {
+            crate::xlog_info!("lab XCL_FENCE_DIRECT=2: probe landing #{k}: {landed} copies back landed");
+        }
+    }
+}
+
+/// lab `XCL_FENCE_DIRECT=2`: fence probes that landed copies back
+static PROBE_LANDINGS: AtomicU64 = AtomicU64::new(0);
+
 /// The thread that moves finished copies back into the title's memory, so it sees what its
 /// lists wrote without submitting again (started with the first copy back).
 fn start_readback_thread() {
@@ -4403,6 +4429,70 @@ mod tests {
                 took[i] = t.elapsed();
             }
             println!("fence_completed x 20000 on an adopted fence: off {:?}, on {:?}", took[0], took[1]);
+        }
+    }
+
+    /// lab `XCL_FENCE_DIRECT=2`: a GPU write into title memory whose copy back has finished is in
+    /// the CPU's view after one of XCL's own fence probes, as with the title hook's settle (switch
+    /// unset): what a texture upload from that memory at the next look reads. v1 left it to the
+    /// readback thread (printed, not asserted: that thread may land it meanwhile).
+    #[test]
+    fn a_v2_fence_probe_lands_finished_copies_back_as_the_hook_did() {
+        use crate::hle::d3d12x::real;
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            assert!(s.rbq.is_some(), "copies back run on their own queue (asynchronously)");
+            assert!(!VirtualAlloc(base as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            s.commit_range(base, TILE);
+            let dev = s.dev.clone();
+            let reserved = s.windows[0].1.clone();
+            let title: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            // XCL's probe goes to an adopted fence (the title's hook on it), as alloc_pool's do in the game
+            let probe: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("probe fence");
+            real::adopt(probe.as_raw(), real::Kind::Fence);
+            let pending_before = RB_PENDING.load(Ordering::Acquire);
+            let _restore = LabRestore(|| real::set_fence_direct_mode(None), 0);
+            let prev = STATE.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let mut landed = Vec::new();
+            for (round, mode) in [0u8, 2, 1].into_iter().enumerate() {
+                let tag = 0x5100_0000 | ((round as u32) << 16);
+                let up = lab_upload(&dev, 64, |i| tag | i);
+                std::ptr::write_bytes(base as *mut u8, 0, 256);
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+                list.CopyBufferRegion(&reserved, 0, &up, 0, 256);
+                list.Close().expect("close");
+                title.Wait(&s.fence, s.value).expect("wait for the tile mapping");
+                title.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+                s.after_execute(&title, &[(base, 256)]);
+                // the title's work and its copy back are done on the GPU; nothing landed yet
+                let (done, done_v) = {
+                    let j = s.rb_jobs.back().expect("a copy back pending");
+                    (s.rb_job_fences(j).expect("its fences").1, j.done_v)
+                };
+                assert!(wait_fence(&done, done_v), "the copy back finishes");
+                assert_eq!(*(base as *const u32), 0, "round {round}: nothing lands before a probe");
+                *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+                real::set_fence_direct_mode(Some(mode));
+                let c0 = PROBE_LANDINGS.load(Ordering::Relaxed);
+                let _ = real::probe_completed(&probe);
+                if mode == 2 {
+                    println!("v2 probe landings: {}", PROBE_LANDINGS.load(Ordering::Relaxed) - c0);
+                }
+                s = STATE.lock().unwrap_or_else(|e| e.into_inner()).take().expect("the state back");
+                let ok = (0..64u32).all(|i| *(base as *const u32).add(i as usize) == tag | i);
+                landed.push(ok);
+                // (what is left lands before the next round)
+                s.drain_readbacks(Drain::Finished);
+            }
+            *STATE.lock().unwrap_or_else(|e| e.into_inner()) = prev;
+            println!("copy back landed by a probe: switch unset (hook) {}, v2 {}, v1 {} (v1: only if the readback thread got there)", landed[0], landed[1], landed[2]);
+            assert!(landed[0], "switch unset: the title hook's settle lands the finished copy back");
+            assert!(landed[1], "v2: the probe lands the finished copy back, as the hook did");
+            assert_eq!(RB_PENDING.load(Ordering::Acquire), pending_before, "every copy back landed in the end");
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 }

@@ -8553,50 +8553,68 @@ pub(super) fn set_fence_fast(on: Option<bool>) {
     );
 }
 
-/// lab `XCL_FENCE_DIRECT=1` (off by default): 0 not read yet, 1 off, 2 on
+/// lab `XCL_FENCE_DIRECT=1|2` (off by default): 0 not read yet, 1 off, 2 v1, 3 v2
 static FENCE_DIRECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// lab `XCL_FENCE_DIRECT=1`: XCL's own probes of a fence (`probe_completed`) read the PC's
-/// value (`fence_completed`), not the title's hooked GetCompletedValue.
-pub(super) fn fence_direct() -> bool {
+/// lab `XCL_FENCE_DIRECT`: how XCL's own probes of a fence (`probe_completed`) read it. 0 (unset):
+/// the COM call, as before. 1 (v1): the PC's value (`fence_completed`), not the title's hooked
+/// GetCompletedValue. 2 (v2): the PC's value, then the copies back the GPU has finished land
+/// (`sparse::land_finished_nowait`: one try of the sparse lock, no spin, no wait).
+pub(super) fn fence_direct_mode() -> u8 {
     match FENCE_DIRECT.load(Ordering::Relaxed) {
         0 => {
-            let on = std::env::var("XCL_FENCE_DIRECT").is_ok_and(|v| v == "1");
-            FENCE_DIRECT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            if on {
+            let mode = match std::env::var("XCL_FENCE_DIRECT").as_deref() {
+                Ok("1") => 1,
+                Ok("2") => 2,
+                _ => 0,
+            };
+            FENCE_DIRECT.store(mode + 1, Ordering::Relaxed);
+            if mode == 1 {
                 crate::xlog_info!("lab XCL_FENCE_DIRECT=1: XCL's own fence probes read the PC's value, without the title hook's settle of copies back");
+            } else if mode == 2 {
+                crate::xlog_info!("lab XCL_FENCE_DIRECT=2: XCL's own fence probes read the PC's value and land the copies back the GPU finished, with one try of the sparse lock and no wait");
             }
-            on
+            mode
         }
-        v => v == 2,
+        v => v - 1,
     }
 }
 
-/// tests: the switch as `on` says (None: read from the environment again)
+/// Whether XCL's own probes bypass the title's hook (`XCL_FENCE_DIRECT` 1 or 2)
+pub(super) fn fence_direct() -> bool {
+    fence_direct_mode() != 0
+}
+
+/// tests: the switch as `on` says (None: read from the environment again; Some(true): v1)
 #[cfg(test)]
 pub(super) fn set_fence_direct(on: Option<bool>) {
-    FENCE_DIRECT.store(
-        match on {
-            None => 0,
-            Some(false) => 1,
-            Some(true) => 2,
-        },
-        Ordering::Relaxed,
-    );
+    set_fence_direct_mode(on.map(|v| if v { 1 } else { 0 }));
+}
+
+/// tests: the mode (0 off, 1 v1, 2 v2; None: read from the environment again)
+#[cfg(test)]
+pub(super) fn set_fence_direct_mode(mode: Option<u8>) {
+    FENCE_DIRECT.store(mode.map_or(0, |m| m + 1), Ordering::Relaxed);
 }
 
 /// The completed value of `fence` for one of XCL's own probes (alloc_pool, sparse quarantine,
 /// list_x internal waits, vram): the COM call as before (on an adopted fence that is the title's
-/// hook, `fence_get_completed_value`), or with `XCL_FENCE_DIRECT=1` the PC's value. The hook
-/// adds `sparse::settle_readbacks_try`, which spins ~2 ms for the sparse state's lock while
-/// another thread holds it, and always does when its own caller holds it (`drain_quarantined`).
-/// The value read is the same; what the probe leaves out is an early landing of copies back,
-/// which the title's own fence calls, `fence_wait_fired` and the readback thread still do.
+/// hook, `fence_get_completed_value`), or with `XCL_FENCE_DIRECT` the PC's value. The hook adds
+/// `sparse::settle_readbacks_try`, which spins ~2 ms for the sparse state's lock while another
+/// thread holds it, and always does when its own caller holds it (`drain_quarantined`). The
+/// value read is the same. v1 leaves out the hook's landing of copies back: with ~480 probes a
+/// frame, that landing was what put the GPU's writes into the CPU's view before the next look
+/// (FIX2: isolated green texels with v1, none without it in FIX3). v2 keeps the landing of the
+/// finished copies, without the spin and without the hook's wait for a copy still running.
 pub(super) unsafe fn probe_completed(fence: &ID3D12Fence) -> u64 {
-    if fence_direct() {
-        fence_completed(fence)
-    } else {
-        fence.GetCompletedValue()
+    match fence_direct_mode() {
+        0 => fence.GetCompletedValue(),
+        1 => fence_completed(fence),
+        _ => {
+            let v = fence_completed(fence);
+            super::sparse::land_finished_nowait();
+            v
+        }
     }
 }
 
