@@ -8511,12 +8511,46 @@ pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
     const PC_GET_COMPLETED_VALUE: usize = 8;
     let _cs = super::call_stats::time(super::call_stats::C::FenceCompleted);
     let p = fence.as_raw();
-    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_adopted(p) {
+    // lab XCL_FENCE_FAST=1: `fence` is a live object, so its vtable pointer is readable: whether
+    // it is adopted without `is_adopted`'s VirtualQuery (PROF1: ~133 000 calls a frame)
+    let adopted = if fence_fast() { is_ext(*(p as *const usize)) } else { is_adopted(p) };
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if adopted {
         std::mem::transmute(orig_fn(p, slot_of(p, "GetCompletedValue")))
     } else {
         std::mem::transmute(*(*(p as *const *const usize)).add(PC_GET_COMPLETED_VALUE))
     };
     f(p)
+}
+
+/// lab `XCL_FENCE_FAST=1` (off by default): 0 not read yet, 1 off, 2 on
+static FENCE_FAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// lab `XCL_FENCE_FAST=1`: `fence_completed` tells an adopted fence by its vtable alone.
+fn fence_fast() -> bool {
+    match FENCE_FAST.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var("XCL_FENCE_FAST").is_ok_and(|v| v == "1");
+            FENCE_FAST.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            if on {
+                crate::xlog_info!("lab XCL_FENCE_FAST=1: fence_completed tells an adopted fence by its vtable, without a VirtualQuery");
+            }
+            on
+        }
+        v => v == 2,
+    }
+}
+
+/// tests: the switch as `on` says (None: read from the environment again)
+#[cfg(test)]
+pub(super) fn set_fence_fast(on: Option<bool>) {
+    FENCE_FAST.store(
+        match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
 }
 
 /// lab `XCL_FENCE_DIRECT=1` (off by default): 0 not read yet, 1 off, 2 on

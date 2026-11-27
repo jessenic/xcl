@@ -4372,4 +4372,31 @@ mod tests {
         assert!(!on_inside, "on: an address in a lazy buffer takes the state (to map it)");
         assert!(!off_outside, "off: every address of the envelope takes the state, as before");
     }
+
+    /// lab `XCL_FENCE_FAST=1`: `fence_completed` reads the same value of an adopted and of a
+    /// plain fence with the switch on and off.
+    #[test]
+    fn a_fast_fence_completed_reads_the_same_values() {
+        use crate::hle::d3d12x::real;
+        unsafe {
+            let dev = lab_device();
+            let plain: ID3D12Fence = dev.CreateFence(3, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let adopted: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            adopted.Signal(11).expect("CPU signal");
+            real::adopt(adopted.as_raw(), real::Kind::Fence);
+            let _restore = LabRestore(|| real::set_fence_fast(None), 0);
+            let mut took = [std::time::Duration::ZERO; 2];
+            for (i, on) in [false, true].into_iter().enumerate() {
+                real::set_fence_fast(Some(on));
+                assert_eq!(real::fence_completed(&plain), 3, "plain fence, switch {on}");
+                assert_eq!(real::fence_completed(&adopted), 11, "adopted fence, switch {on}");
+                let t = std::time::Instant::now();
+                for _ in 0..20_000 {
+                    std::hint::black_box(real::fence_completed(&adopted));
+                }
+                took[i] = t.elapsed();
+            }
+            println!("fence_completed x 20000 on an adopted fence: off {:?}, on {:?}", took[0], took[1]);
+        }
+    }
 }
