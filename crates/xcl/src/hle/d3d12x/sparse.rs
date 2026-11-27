@@ -1119,7 +1119,10 @@ impl State {
         while t < end {
             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
                 // still mapped there: no new mapping, what it held is cleared
-                if let Some(tile) = self.parked.remove(&t).or_else(|| self.kept.remove(&t)) {
+                // LOCAL (`XCL_PAGE_SHARE`): a tile another address shows too stays that address's:
+                // this one gets a tile of its own below
+                let old_tile = self.parked.remove(&t).or_else(|| self.kept.remove(&t)).filter(|&tile| !shared_take(tile));
+                if let Some(tile) = old_tile {
                     self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
                     self.runs = None;
                     self.to_zero.push((t, TILE));
@@ -2054,6 +2057,71 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     readback_released(g, &[(va, len)]);
 }
 
+/// LOCAL (`XCL_PAGE_SHARE=1`): pool tiles shown at more than one window address: how many more.
+static SHARED: Mutex<Option<FxHashMap<(u32, u32), u32>>> = Mutex::new(None);
+static SHARES: AtomicU64 = AtomicU64::new(0);
+
+fn page_share() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PAGE_SHARE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// One of the addresses of shared pool tile `tile` goes: true if it was shared (the tile stays).
+fn shared_take(tile: (u32, u32)) -> bool {
+    let mut g = SHARED.lock().unwrap();
+    let Some(m) = g.as_mut() else { return false };
+    match m.get_mut(&tile) {
+        Some(c) => {
+            *c -= 1;
+            if *c == 0 {
+                m.remove(&tile);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// LOCAL (`XCL_PAGE_SHARE=1`): the title maps the physical page it had at `old` at `at`
+/// (`kernelx::move_away`; XCL keeps a page's CPU bytes at the address mapped last). On the console
+/// the page's bytes are the same wherever it is mapped, so what the GPU wrote or was sent at `old`
+/// has to be there at `at`, and what the CPU writes at `at` has to reach buffers the title placed
+/// at `old`. The window tile at `at` takes the pool tile of `old` (with what was sent of it); the
+/// tile at `old` stays mapped while a placed buffer uses it (`kept`), else it is unmapped without
+/// the pool tile going back. Called before `committed(at)`. False: nothing shared (as before).
+pub unsafe fn share_page(old: usize, at: usize) -> bool {
+    if !page_share() {
+        return false;
+    }
+    let (old, at) = (old & !(TILE - 1), at & !(TILE - 1));
+    let mut g = lock_state();
+    let Some(s) = g.as_mut() else { return false };
+    if old == at || s.mapped.contains_key(&at) || s.parked.contains_key(&at) || s.kept.contains_key(&at) {
+        return false;
+    }
+    let Some(wi) = s.window_index(at) else { return false };
+    let Some(entry) = s.mapped.remove(&old) else { return false };
+    let pool = entry.pool;
+    let (b, r) = (s.windows[wi].0, s.windows[wi].1.clone());
+    s.map_tiles(&r, b, &[(at, pool)]);
+    s.mapped.insert(at, entry);
+    s.runs = None;
+    // the old address: still shown for a buffer placed there, else unmapped at the next flush
+    if s.pinned.contains_key(&pool) {
+        s.kept.insert(old, pool);
+    } else {
+        s.parked.insert(old, pool);
+    }
+    *SHARED.lock().unwrap().get_or_insert_with(FxHashMap::default).entry(pool).or_insert(0) += 1;
+    MAPPED_GEN.fetch_add(1, Ordering::Release);
+    s.signal();
+    let n = SHARES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_info!("sparse windows: {n} pages keep their video memory at a second address (XCL_PAGE_SHARE); the latest: {old:#x} -> {at:#x}, the old address {}", if s.pinned.contains_key(&pool) { "stays for a placed buffer" } else { "goes" });
+    }
+    true
+}
+
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
 /// lie outside the range are not committed (holes); the range's pages are.
 pub unsafe fn committed(a: usize, n: usize) {
@@ -2261,6 +2329,10 @@ impl State {
             }
             if let Some(wi) = self.window_index(t) {
                 by_window.entry(wi).or_default().push(t);
+            }
+            // LOCAL (`XCL_PAGE_SHARE`): another address shows this pool tile too: it stays
+            if shared_take(tile) {
+                continue;
             }
             tiles.push(tile);
         }
