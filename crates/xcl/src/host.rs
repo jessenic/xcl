@@ -128,6 +128,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
+                // (lab, never waits for a lock: what a stuck sparse queue or lock would show)
+                crate::xlog_info!("{}", crate::hle::d3d12x::sparse::fence_line());
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
                     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};

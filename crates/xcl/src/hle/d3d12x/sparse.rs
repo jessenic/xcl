@@ -197,6 +197,187 @@ struct UploadSlot {
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence_val: u64,
+    /// `XCL_SPARSE_SCATTER`: the run table of the slot's dispatches (upload buffer, mapped bytes,
+    /// capacity), the bytes of it taken since `begin_slot`, and tables outgrown meanwhile (the
+    /// open list still reads them)
+    table: Option<(ID3D12Resource, *mut u8, usize)>,
+    table_used: usize,
+    old_tables: Vec<ID3D12Resource>,
+}
+
+/// Lab, `XCL_SPARSE_SCATTER=1` (off unless set): the changed runs of an upload slot reach each
+/// window by one compute dispatch (`sparse_scatter.hlsl`: a group a run) instead of one
+/// CopyBufferRegion each. A retail title's world made ~53 000 of those copies a frame on the
+/// sparse queue (PIX: 99 ms of GPU time), most of a page or less. The same bytes land: only the
+/// runs, none of the unchanged bytes between them (the GPU may have written those). A call
+/// with a run not 16-byte aligned, or without the pipeline, copies as before.
+fn scatter_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_SPARSE_SCATTER").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: lab XCL_SPARSE_SCATTER=1: sparse CPU writes reach the windows by one dispatch a slot and window, not a copy a run");
+        }
+        on
+    })
+}
+
+struct Scatter {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+}
+
+/// (device, its scatter pipeline: None while it is being built, Some(None) when it could not be)
+static SCATTER: Mutex<Option<(usize, Option<Option<std::sync::Arc<Scatter>>>)>> = Mutex::new(None);
+/// CopyBufferRegion of CPU writes recorded, scatter dispatches recorded, runs they carried
+static UPLOAD_CMDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Start building the scatter pipeline of `dev` on a thread of its own (once a device), when
+/// the sparse state is made (`new_state`): its first build took 19 s in a retail title's
+/// start (the compile threads were busy) – on the submitting thread, under `STATE`, everything
+/// waited (run SC1). Until it is there, the uploads go by copies (`scatter_ready`).
+fn start_scatter_build(dev: &ID3D12Device) {
+    let key = dev.as_raw() as usize;
+    {
+        let mut g = SCATTER.lock().unwrap();
+        if g.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        *g = Some((key, None));
+    }
+    // (the device as a raw reference the thread owns: it lives as long as the build)
+    let raw = dev.clone().into_raw() as usize;
+    let spawned = std::thread::Builder::new().name("xcl-sparse-scatter".into()).spawn(move || unsafe {
+        let dev = ID3D12Device::from_raw(raw as *mut c_void);
+        let t0 = std::time::Instant::now();
+        let made = make_scatter(&dev);
+        match &made {
+            Ok(_) => crate::xlog_info!("D3D12.X: sparse scatter pipeline made in {} ms (off the submitting threads)", t0.elapsed().as_millis()),
+            Err(e) => crate::xlog_warn!("D3D12.X: XCL_SPARSE_SCATTER: no scatter pipeline ({e}): the sparse writes go by copies"),
+        }
+        let s = made.ok().map(std::sync::Arc::new);
+        let mut g = SCATTER.lock().unwrap();
+        if g.as_ref().is_some_and(|(k, _)| *k == key) {
+            *g = Some((key, Some(s)));
+        }
+    });
+    if spawned.is_err() {
+        crate::xlog_warn!("D3D12.X: XCL_SPARSE_SCATTER: no thread for the scatter pipeline: the sparse writes go by copies");
+        *SCATTER.lock().unwrap() = Some((key, Some(None)));
+    }
+}
+
+/// The scatter pipeline of `dev` if it is built; never waits (starts the build if none).
+fn scatter_ready(dev: &ID3D12Device) -> Option<std::sync::Arc<Scatter>> {
+    let key = dev.as_raw() as usize;
+    let ready = {
+        let g = SCATTER.lock().unwrap();
+        match g.as_ref() {
+            Some((k, s)) if *k == key => Some(s.clone().flatten()),
+            _ => None,
+        }
+    };
+    match ready {
+        Some(s) => s,
+        None => {
+            start_scatter_build(dev);
+            None
+        }
+    }
+}
+
+/// `scatter_ready`, waiting for the build (tests; up to 120 s).
+#[cfg_attr(not(test), allow(dead_code))]
+fn scatter_pipeline(dev: &ID3D12Device) -> Option<std::sync::Arc<Scatter>> {
+    let key = dev.as_raw() as usize;
+    start_scatter_build(dev);
+    let t0 = std::time::Instant::now();
+    loop {
+        if let Some((k, Some(s))) = SCATTER.lock().unwrap().as_ref() {
+            if *k == key {
+                return s.clone();
+            }
+        }
+        if t0.elapsed() > std::time::Duration::from_secs(120) {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// (diagnostic, the activity line) the sparse fence of the last state made, the last value
+/// signalled on it, and the value a CPU wait under `STATE` waits for (0: none)
+static FENCE_OBJ: Mutex<Option<ID3D12Fence>> = Mutex::new(None);
+static FENCE_SIGNALLED: AtomicU64 = AtomicU64::new(0);
+static CPU_WAITING_FOR: AtomicU64 = AtomicU64::new(0);
+
+/// A line on the sparse queue's progress that never waits for a lock: its fence (reached /
+/// signalled), a CPU wait under the state's lock in progress, whether that lock is held now.
+pub fn fence_line() -> String {
+    let reached = match FENCE_OBJ.try_lock() {
+        Ok(g) => g.as_ref().map(|f| unsafe { super::real::fence_completed(f) }),
+        Err(_) => None,
+    };
+    let held = matches!(STATE.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+    let waiting = CPU_WAITING_FOR.load(Ordering::Relaxed);
+    format!(
+        "sparse fence: reached {}, signalled {}; CPU wait under the state's lock: {}; state lock {}",
+        reached.map_or("?".to_string(), |v| v.to_string()),
+        FENCE_SIGNALLED.load(Ordering::Relaxed),
+        if waiting == 0 { "none".to_string() } else { format!("for {waiting}") },
+        if held { "held" } else { "free" }
+    )
+}
+
+unsafe fn make_scatter(dev: &ID3D12Device) -> Result<Scatter, String> {
+    let dxil = crate::gpu::recomp::dxc::compile(include_str!("sparse_scatter.hlsl"), "main", "cs_6_0", &[])?;
+    let srv = |reg| D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+        Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: reg, RegisterSpace: 0 } },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let params = [
+        srv(0),
+        srv(1),
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 } },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 { Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 1 } },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+    ];
+    let desc = D3D12_ROOT_SIGNATURE_DESC { NumParameters: params.len() as u32, pParameters: params.as_ptr(), ..Default::default() };
+    let mut blob = None;
+    D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &mut blob, None).map_err(|e| format!("root signature: {e}"))?;
+    let blob = blob.ok_or("no root signature blob")?;
+    let root: ID3D12RootSignature = dev
+        .CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize()))
+        .map_err(|e| format!("root signature: {e}"))?;
+    let mut pd = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+        ..Default::default()
+    };
+    let pso = dev.CreateComputePipelineState(&pd);
+    std::mem::ManuallyDrop::drop(&mut pd.pRootSignature);
+    Ok(Scatter { root, pso: pso.map_err(|e| format!("pipeline: {e}"))? })
+}
+
+/// An upload buffer of `size` bytes, mapped.
+unsafe fn mapped_upload_buffer(dev: &ID3D12Device, size: usize) -> Option<(ID3D12Resource, *mut u8, usize)> {
+    let mut r: Option<ID3D12Resource> = None;
+    let mut d = buffer_desc(size as u64);
+    d.Flags = D3D12_RESOURCE_FLAG_NONE;
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut r)
+        .ok()?;
+    let r = r?;
+    let mut p = std::ptr::null_mut();
+    r.Map(0, None, Some(&mut p)).ok()?;
+    Some((r, p as *mut u8, size))
 }
 
 /// A copy back on `State::rbq`: its list, its readback buffer, the `rb_fence` value it waits
@@ -851,6 +1032,11 @@ fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
 unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -> windows::core::Result<State> {
     let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+    *FENCE_OBJ.lock().unwrap() = Some(fence.clone());
+    FENCE_SIGNALLED.store(0, Ordering::Relaxed);
+    if scatter_on() {
+        start_scatter_build(dev);
+    }
     let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
     let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
     let rbq = (|| -> windows::core::Result<(ID3D12CommandQueue, ID3D12Fence)> {
@@ -866,7 +1052,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         list.Close()?;
         let _ = list.SetName(windows::core::w!("xcl sparse upload list"));
         let _ = alloc.SetName(windows::core::w!("xcl sparse upload allocator"));
-        slots.push(UploadSlot { alloc, list, fence_val: 0 });
+        slots.push(UploadSlot { alloc, list, fence_val: 0, table: None, table_used: 0, old_tables: Vec::new() });
     }
     let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
     let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
@@ -1269,6 +1455,7 @@ impl State {
     unsafe fn signal(&mut self) {
         self.value += 1;
         let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
+        FENCE_SIGNALLED.store(self.value, Ordering::Relaxed);
     }
 
     #[inline]
@@ -1280,6 +1467,14 @@ impl State {
         // behind: that one sets the event later, and the next wait would return at once with the
         // queue not there (10 such "after 5 s" lines within 100 ms in one run, each followed by a
         // Reset of an allocator the GPU was still in). So: until the fence says so, or 5 s.
+        CPU_WAITING_FOR.store(target, Ordering::Relaxed);
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                CPU_WAITING_FOR.store(0, Ordering::Relaxed);
+            }
+        }
+        let _done = Done;
         let t0 = std::time::Instant::now();
         loop {
             let _ = super::call_stats::cs!(FenceSetEvent, self.fence.SetEventOnCompletion(target, self.event));
@@ -1359,6 +1554,9 @@ impl State {
             self.wait_for(fv);
             self.reclaim_ring();
         }
+        // (the slot's last list is done: its scatter tables are free again)
+        self.slots[idx].table_used = 0;
+        self.slots[idx].old_tables.clear();
         let slot = &self.slots[idx];
         let _ = slot.alloc.Reset();
         let _ = slot.list.Reset(&slot.alloc, None);
@@ -1867,15 +2065,25 @@ impl State {
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
     /// the 64 MiB ring staging buffer (zero CPU stall on the common path).
     unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) {
+        self.upload_dirty_with(runs, scatter_on());
+    }
+
+    /// `upload_dirty`; `scatter`: by one dispatch a slot and window (`XCL_SPARSE_SCATTER`) when
+    /// every run is 16-byte aligned and the pipeline exists, else a CopyBufferRegion a run.
+    unsafe fn upload_dirty_with(&mut self, runs: &[(usize, usize)], scatter: bool) {
         if runs.is_empty() {
             return;
         }
+        let sc = if scatter && runs.iter().all(|&(a, n)| a % 16 == 0 && n % 16 == 0) { scatter_ready(&self.dev) } else { None };
         let Some(p) = self.staging_ptr() else { return };
         let mut open_slot: Option<usize> = None;
         let mut last_wi: Option<usize> = None;
         // the copies into the ring (source address, ring offset, bytes), done before their slot is
         // submitted, by the worker threads when there are many
         let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
+        // (scatter) the open slot's runs for window `pend_wi`: staging offset, window offset, bytes, 0
+        let mut pend: Vec<[u32; 4]> = Vec::new();
+        let mut pend_wi = 0usize;
         for &(a, n) in runs {
             let mut done = 0usize;
             while done < n {
@@ -1897,6 +2105,9 @@ impl State {
                     self.reclaim_ring();
                     if (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
                         if let Some(slot_idx) = open_slot.take() {
+                            if let Some(sc) = &sc {
+                                self.scatter_flush(slot_idx, sc, pend_wi, &mut pend);
+                            }
                             run_copies(&mut jobs, p);
                             self.submit_slot(slot_idx);
                             self.reclaim_ring();
@@ -1918,16 +2129,84 @@ impl State {
                 };
                 let dst_off = (aligned as usize) % STAGING;
                 jobs.push((cur, dst_off, chunk));
-                let staging_res = &self.staging.as_ref().unwrap().0;
-                super::call_stats::cs!(RecCopyBuffer, self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64));
+                if let Some(sc) = &sc {
+                    if !pend.is_empty() && pend_wi != wi {
+                        self.scatter_flush(slot_idx, sc, pend_wi, &mut pend);
+                    }
+                    pend_wi = wi;
+                    pend.push([dst_off as u32, (cur - b) as u32, chunk as u32, 0]);
+                } else {
+                    let staging_res = &self.staging.as_ref().unwrap().0;
+                    super::call_stats::cs!(RecCopyBuffer, self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64));
+                    UPLOAD_CMDS[0].fetch_add(1, Ordering::Relaxed);
+                }
                 self.ring_write = aligned + chunk as u64;
                 done += chunk;
             }
         }
         if let Some(slot_idx) = open_slot {
+            if let Some(sc) = &sc {
+                self.scatter_flush(slot_idx, sc, pend_wi, &mut pend);
+            }
             run_copies(&mut jobs, p);
             self.submit_slot(slot_idx);
         }
+    }
+
+    /// (`XCL_SPARSE_SCATTER`) Record the dispatch that puts `pend`'s runs into window `wi` on the
+    /// open slot `idx`: the run table goes into the slot's table buffer (a bigger one if it does
+    /// not fit; the outgrown one stays alive until the slot is reused). Empties `pend`.
+    unsafe fn scatter_flush(&mut self, idx: usize, sc: &Scatter, wi: usize, pend: &mut Vec<[u32; 4]>) {
+        if pend.is_empty() {
+            return;
+        }
+        let bytes = pend.len() * 16;
+        let fits = self.slots[idx].table.as_ref().is_some_and(|t| self.slots[idx].table_used + bytes <= t.2);
+        if !fits {
+            match mapped_upload_buffer(&self.dev, bytes.next_power_of_two().max(64 << 10)) {
+                Some(t) => {
+                    if let Some(old) = self.slots[idx].table.replace(t) {
+                        self.slots[idx].old_tables.push(old.0);
+                    }
+                    self.slots[idx].table_used = 0;
+                }
+                None => {
+                    // no table: these runs go by copies
+                    let staging_res = self.staging.as_ref().unwrap().0.clone();
+                    for r in pend.iter() {
+                        self.slots[idx].list.CopyBufferRegion(&self.windows[wi].1, r[1] as u64, &staging_res, r[0] as u64, r[2] as u64);
+                        UPLOAD_CMDS[0].fetch_add(1, Ordering::Relaxed);
+                    }
+                    pend.clear();
+                    return;
+                }
+            }
+        }
+        let at = self.slots[idx].table_used;
+        let (table_res, table_ptr) = {
+            let t = self.slots[idx].table.as_ref().unwrap();
+            (t.0.clone(), t.1)
+        };
+        std::ptr::copy_nonoverlapping(pend.as_ptr() as *const u8, table_ptr.add(at), bytes);
+        let staging_va = self.staging.as_ref().unwrap().0.GetGPUVirtualAddress();
+        let window_va = self.windows[wi].1.GetGPUVirtualAddress();
+        let list = &self.slots[idx].list;
+        list.SetComputeRootSignature(&sc.root);
+        list.SetPipelineState(&sc.pso);
+        list.SetComputeRootShaderResourceView(0, staging_va);
+        list.SetComputeRootShaderResourceView(1, table_res.GetGPUVirtualAddress() + at as u64);
+        list.SetComputeRootUnorderedAccessView(2, window_va);
+        let mut first = 0usize;
+        while first < pend.len() {
+            let n = (pend.len() - first).min(65535);
+            list.SetComputeRoot32BitConstant(3, first as u32, 0);
+            list.Dispatch(n as u32, 1, 1);
+            UPLOAD_CMDS[1].fetch_add(1, Ordering::Relaxed);
+            first += n;
+        }
+        UPLOAD_CMDS[2].fetch_add(pend.len() as u64, Ordering::Relaxed);
+        self.slots[idx].table_used = at + bytes;
+        pend.clear();
     }
 }
 
@@ -2787,7 +3066,15 @@ unsafe fn before_execute_inner(queue: &ID3D12CommandQueue, dirty: &[usize], page
         let b = BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
         let us = MICROS.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed) + t0.elapsed().as_micros() as u64;
         if n.is_power_of_two() && n >= 16 {
-            crate::xlog_info!("sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped", b >> 20, us / 1000, s.mapped.len());
+            crate::xlog_info!(
+                "sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped; GPU commands for them: {} copies, {} scatter dispatches carrying {} runs",
+                b >> 20,
+                us / 1000,
+                s.mapped.len(),
+                UPLOAD_CMDS[0].load(Ordering::Relaxed),
+                UPLOAD_CMDS[1].load(Ordering::Relaxed),
+                UPLOAD_CMDS[2].load(Ordering::Relaxed)
+            );
             let ms = |x: &AtomicU64| x.load(Ordering::Relaxed) / 1000;
             crate::xlog_info!(
                 "sparse windows timing: write-watch {} ms ({} dirty pages), lock wait {} ms, chunk scan {} ms, upload {} ms ({} runs)",
@@ -3842,6 +4129,221 @@ mod tests {
         // (lab: the state as `ensure` makes it – `new_state` – so its fields stay in one place)
         let s = new_state(&dev, vec![(base, reserved)]).expect("sparse state");
         (base, s)
+    }
+
+    /// The window's first `len` bytes, read back on the state's queue (after its uploads).
+    unsafe fn read_window(s: &State, len: usize) -> Vec<u8> {
+        let mut d = buffer_desc(len as u64);
+        d.Flags = D3D12_RESOURCE_FLAG_NONE;
+        let mut rb: Option<ID3D12Resource> = None;
+        s.dev
+            .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb)
+            .expect("readback buffer");
+        let rb = rb.expect("readback buffer");
+        let alloc: ID3D12CommandAllocator = s.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+        let list: ID3D12GraphicsCommandList = s.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+        list.CopyBufferRegion(&rb, 0, &s.windows[0].1, 0, len as u64);
+        list.Close().expect("close");
+        s.queue.ExecuteCommandLists(&[Some(list.cast().expect("command list"))]);
+        let f: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+        s.queue.Signal(&f, 1).expect("signal");
+        let t0 = std::time::Instant::now();
+        while f.GetCompletedValue() < 1 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "readback did not complete");
+            std::thread::yield_now();
+        }
+        let mut p = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).expect("map");
+        let out = std::slice::from_raw_parts(p as *const u8, len).to_vec();
+        rb.Unmap(0, None);
+        out
+    }
+
+    /// `len` bytes of buffer `res`, read back on `queue` (after what it waits for).
+    unsafe fn read_buffer(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D12Resource, len: usize) -> Vec<u8> {
+        let mut d = buffer_desc(len as u64);
+        d.Flags = D3D12_RESOURCE_FLAG_NONE;
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb)
+            .expect("readback buffer");
+        let rb = rb.expect("readback buffer");
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+        list.CopyBufferRegion(&rb, 0, res, 0, len as u64);
+        list.Close().expect("close");
+        queue.ExecuteCommandLists(&[Some(list.cast().expect("command list"))]);
+        let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+        queue.Signal(&f, 1).expect("signal");
+        let t0 = std::time::Instant::now();
+        while f.GetCompletedValue() < 1 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(120), "readback did not complete");
+            std::thread::yield_now();
+        }
+        let mut p = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).expect("map");
+        let out = std::slice::from_raw_parts(p as *const u8, len).to_vec();
+        rb.Unmap(0, None);
+        out
+    }
+
+    /// `XCL_SPARSE_SCATTER=1` on a tiled shadow window as the game sets it up
+    /// (`shadow_window_tiled`: tiles mapped by `before_execute` when the CPU first writes them),
+    /// through the real `before_execute` with a title queue, on WARP with the debug layer and
+    /// GPU-based validation: after each submit the window holds the CPU's bytes on every mapped
+    /// tile (whole pages, one 64-byte chunk of some pages, pages over a tile boundary), the
+    /// dispatches ran, and the debug layer reports no error or corruption. The debug layer and
+    /// the switch are process-wide: it runs only with `XCL_TEST_GPU_VALIDATION=1`, alone
+    /// (`-- --exact`), in a process of its own.
+    #[test]
+    fn gpu_validation_sparse_scatter_on_a_tiled_shadow_window() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::MEM_RESERVE;
+        if std::env::var("XCL_TEST_GPU_VALIDATION").map_or(true, |v| v.trim() != "1") {
+            println!("XCL_TEST_GPU_VALIDATION=1 not set (this test runs alone): skipping");
+            return;
+        }
+        std::env::set_var("XCL_SPARSE_SCATTER", "1");
+        unsafe {
+            if crate::gpu::recomp::dxc::create_instance().is_none() {
+                println!("no DXC – skipping");
+                return;
+            }
+            assert!(scatter_on(), "the switch as the test set it");
+            let mut dbg: Option<ID3D12Debug1> = None;
+            windows::Win32::Graphics::Direct3D12::D3D12GetDebugInterface(&mut dbg).expect("debug interface");
+            let dbg = dbg.expect("ID3D12Debug1");
+            dbg.EnableDebugLayer();
+            dbg.SetEnableGPUBasedValidation(true);
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            let dev = dev.expect("D3D12 device");
+            let info: Option<ID3D12InfoQueue> = dev.cast().ok();
+            println!("debug layer on, GPU-based validation on, WARP; info queue: {}", info.is_some());
+            const TILES: usize = 64;
+            let size = TILES * TILE;
+            let base = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert!(base != 0 && base % TILE == 0, "CPU view");
+            let mut buf: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&buffer_desc(size as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut buf).expect("reserved buffer");
+            let buf = buf.expect("reserved buffer");
+            assert!(shadow_window_tiled(&dev, base, size, &buf), "the tiled shadow window");
+            assert!(scatter_pipeline(&dev).is_some(), "the scatter pipeline");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            let mem = std::slice::from_raw_parts_mut(base as *mut u8, size);
+            let before = UPLOAD_CMDS[1].load(Ordering::Relaxed);
+            for round in 0..3usize {
+                let mut dirty: Vec<usize> = Vec::new();
+                for p in 0..size / PAGE {
+                    let write = match round {
+                        0 => p < 8 * PAGES_PER_TILE,
+                        1 => p < 16 * PAGES_PER_TILE && p % 3 == 0,
+                        _ => (20 * PAGES_PER_TILE - 2..22 * PAGES_PER_TILE + 2).contains(&p) || p % 97 == 5,
+                    };
+                    if !write {
+                        continue;
+                    }
+                    let chunks: Vec<usize> = if round == 1 { vec![(p * 7 + 3) % CHUNKS] } else { (0..CHUNKS).collect() };
+                    for k in chunks {
+                        for i in 0..CHUNK {
+                            mem[p * PAGE + k * CHUNK + i] = ((p * 31 + k * 7 + i + round * 101) as u8) | 1;
+                        }
+                    }
+                    dirty.push(base + p * PAGE);
+                }
+                before_execute(&queue, &dirty, PAGE);
+                println!("round {round}: {} written pages sent; {}", dirty.len(), fence_line());
+                let got = read_buffer(&dev, &queue, &buf, size);
+                let mapped: Vec<usize> = {
+                    let g = STATE.lock().unwrap();
+                    let s = g.as_ref().expect("the sparse state");
+                    (0..TILES).filter(|t| s.mapped.contains_key(&(base + t * TILE))).collect()
+                };
+                assert!(!mapped.is_empty(), "round {round}: no tile was mapped");
+                for t in mapped {
+                    assert!(got[t * TILE..(t + 1) * TILE] == mem[t * TILE..(t + 1) * TILE], "round {round}: tile {t} of the window differs from the CPU view");
+                }
+            }
+            assert!(UPLOAD_CMDS[1].load(Ordering::Relaxed) > before, "the scatter dispatches ran");
+            if let Some(info) = info {
+                let mut errors = 0;
+                for index in 0..info.GetNumStoredMessagesAllowedByRetrievalFilter() {
+                    let mut size = 0;
+                    if info.GetMessage(index, None, &mut size).is_err() {
+                        continue;
+                    }
+                    let mut buffer = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+                    let msg = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if info.GetMessage(index, Some(msg), &mut size).is_err() {
+                        continue;
+                    }
+                    if matches!((*msg).Severity, D3D12_MESSAGE_SEVERITY_ERROR | D3D12_MESSAGE_SEVERITY_CORRUPTION) {
+                        errors += 1;
+                        let text = std::ffi::CStr::from_ptr((*msg).pDescription as *const std::ffi::c_char).to_string_lossy();
+                        println!("D3D12 debug message #{errors}: {text}");
+                    }
+                }
+                println!("D3D12 debug errors or corruption messages: {errors}");
+                assert_eq!(errors, 0, "the debug layer / GPU-based validation reported errors (printed above)");
+            }
+        }
+    }
+
+    /// `XCL_SPARSE_SCATTER`: the runs reach the window as with a CopyBufferRegion each – their
+    /// bytes, and none of the bytes between them – tiny, page- and tile-crossing, large runs, and
+    /// more than 65 535 of them (two dispatches).
+    #[test]
+    fn gpu_sparse_scatter_lands_the_bytes_the_copies_land() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            if crate::gpu::recomp::dxc::create_instance().is_none() {
+                println!("no DXC – skipping");
+                return;
+            }
+            const TILES: usize = 50;
+            let len = TILES * TILE;
+            let (base, mut s) = test_state_with_reserved(TILES);
+            s.commit_range(base, len);
+            s.wait_for(s.value);
+            assert!(!VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null(), "CPU view");
+            assert!(scatter_pipeline(&s.dev).is_some(), "the scatter pipeline");
+            let mem = std::slice::from_raw_parts_mut(base as *mut u8, len);
+            let mut runs: Vec<(usize, usize)> = vec![(base + 0x40, 16), (base + 0x1FC0, 0x80), (base + TILE - 0x100, 0x300), (base + 3 * TILE + 0x1230, 100 << 10)];
+            // 70 000 runs of 16 bytes, 32 apart, from tile 6 on
+            runs.extend((0..70_000usize).map(|k| (base + 6 * TILE + k * 32, 16)));
+            let mut got = Vec::new();
+            for scatter in [false, true] {
+                // A everywhere (copies), then B in the CPU view and only the runs sent
+                for (i, b) in mem.iter_mut().enumerate() {
+                    *b = (i * 7 + 1) as u8;
+                }
+                s.upload_dirty_with(&[(base, len)], false);
+                s.wait_for(s.value);
+                for (i, b) in mem.iter_mut().enumerate() {
+                    *b = (i * 13 + 5) as u8 ^ 0x5A;
+                }
+                let before = UPLOAD_CMDS[1].load(Ordering::Relaxed);
+                s.upload_dirty_with(&runs, scatter);
+                s.wait_for(s.value);
+                if scatter {
+                    assert!(UPLOAD_CMDS[1].load(Ordering::Relaxed) - before >= 2, "the scatter dispatches were recorded");
+                }
+                got.push(read_window(&s, len));
+            }
+            let mut want: Vec<u8> = (0..len).map(|i| (i * 7 + 1) as u8).collect();
+            for &(a, n) in &runs {
+                for i in a - base..a - base + n {
+                    want[i] = (i * 13 + 5) as u8 ^ 0x5A;
+                }
+            }
+            assert!(got[0] == want, "copies: the window holds the runs' new bytes and the old ones elsewhere");
+            assert!(got[1] == want, "scatter: the same bytes as the copies");
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
     }
 
     /// `flush_parked` must keep unmapped pool tiles out of `free` (and `take_tile` must not reuse
