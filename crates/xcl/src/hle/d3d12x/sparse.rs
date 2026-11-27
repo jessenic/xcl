@@ -2680,6 +2680,64 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     }
 }
 
+/// lab `XCL_RT_WATCH` (`rt_watch`): what `[va, va + len)` holds in video memory, copied into a
+/// vector of its own – the CPU's view and the chunks sent so far are not touched (unlike
+/// `readback_now`). Some((bytes, n)): `n` bytes came from tiles with video memory, the rest
+/// reads 0 (tiles without any: on the GPU they read 0 and drop writes). None: `va` is not in a
+/// window of the state (the GPU works on the CPU's memory there, or on none), `len` is 0 or over
+/// the readback buffer, or the queue was not there after 5 s. The copy is not ordered after the
+/// title's queues: a structure being rebuilt at that moment can come half old, half new.
+pub unsafe fn peek_gpu(va: usize, len: usize) -> Option<(Vec<u8>, usize)> {
+    if len == 0 || len > READBACK_STAGING {
+        return None;
+    }
+    let _one = READBACK.lock().unwrap();
+    let mut g = lock_state();
+    if g.as_ref().is_none_or(|s| s.window_index(va).is_none()) {
+        return None;
+    }
+    // (a copy given up earlier: its list and the buffer are still in use)
+    let last = g.as_ref()?.rb_last_fence;
+    if last != 0 && super::real::fence_completed(&g.as_ref()?.fence) < last {
+        let (again, there) = wait_released(g, last);
+        g = again;
+        if !there {
+            return None;
+        }
+    }
+    let s = g.as_mut()?;
+    if s.window_index(va).is_none() {
+        return None;
+    }
+    let (rb, p) = s.readback_buf()?;
+    let (_, parts) = s.readback_submit(&rb, va, va + len);
+    let mut out = vec![0u8; len];
+    if parts.is_empty() {
+        return Some((out, 0));
+    }
+    let value = s.value;
+    let (_again, there) = wait_released(g, value);
+    if !there {
+        return None;
+    }
+    // (`_again` holds the state and `READBACK` is held: no other copy back reuses the buffer meanwhile)
+    let from_vram: usize = parts.iter().map(|q| q.2).sum();
+    let buf = std::slice::from_raw_parts(p as *const u8, READBACK_STAGING);
+    place_parts(&mut out, va, buf, &parts);
+    Some((out, from_vram))
+}
+
+/// `peek_gpu`: the parts (address, offset in `buf`, bytes) copied into `out`, which starts at `va`
+/// (parts outside `out` or `buf` are left out).
+fn place_parts(out: &mut [u8], va: usize, buf: &[u8], parts: &[(usize, usize, usize)]) {
+    for &(at, off, n) in parts {
+        let (Some(o), Some(src)) = (at.checked_sub(va), buf.get(off..off.saturating_add(n))) else { continue };
+        if let Some(dst) = out.get_mut(o..o.saturating_add(n)) {
+            dst.copy_from_slice(src);
+        }
+    }
+}
+
 /// lab `XCL_SPARSE_MAP_NOWAIT=1`: Maps of ranges without video memory, no copy back made
 static MAPS_WITHOUT_VRAM: AtomicU64 = AtomicU64::new(0);
 
@@ -5466,5 +5524,17 @@ mod tests {
         let _serial = lab_test_lock();
         assert!(fence_line_if(false).is_none(), "off: no line, no lock tried");
         assert!(fence_line_if(true).is_some_and(|l| l.starts_with("sparse fence: ")), "on: the line");
+    }
+
+    #[test]
+    fn a_peek_places_each_part_at_its_address_and_leaves_the_rest_zero() {
+        // lab XCL_RT_WATCH: parts (address, offset in the readback buffer, bytes) of a 64-byte peek at 0x1000
+        let buf: Vec<u8> = (0..=255u8).collect();
+        let mut out = vec![0u8; 64];
+        place_parts(&mut out, 0x1000, &buf, &[(0x1000, 10, 4), (0x1020, 100, 8), (0x0FF0, 0, 4), (0x103C, 200, 8), (0x1004, 250, 16)]);
+        assert_eq!(&out[0..4], &[10, 11, 12, 13]);
+        assert_eq!(&out[0x20..0x28], &[100, 101, 102, 103, 104, 105, 106, 107]);
+        assert!(out[4..0x20].iter().all(|&b| b == 0), "a part past the buffer's end is left out");
+        assert!(out[0x28..].iter().all(|&b| b == 0), "parts before the start or past the end are left out");
     }
 }

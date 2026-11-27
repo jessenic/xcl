@@ -116,6 +116,8 @@ fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     super::real::removed_probe("present: start");
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
+    // lab XCL_RT_WATCH: its lines every N frames
+    super::rt_watch::tick(frames);
     super::targets::frame_end();
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)

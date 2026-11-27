@@ -475,8 +475,12 @@ pub unsafe fn alias_pair(va: usize, res: *mut c_void) {
     if dd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || (dd.Width, dd.Height, dd.DepthOrArraySize, dd.MipLevels) != (sd.Width, sd.Height, sd.DepthOrArraySize, sd.MipLevels) {
         return;
     }
-    // both reserved on the pages of the address: one memory already
-    if va % 0x1_0000 == 0 {
+    // both reserved on the pages of the address: taken as one memory already – but at such an
+    // address the R9G9B9E5 view read zeros while the R32_UINT UAV held the title's packed words
+    // (claudetools-gh's measurement on xcl-dev/xcl#505: a retail title's half-res DoF input, and
+    // with it a view-dependent black scene). LOCAL: paired as well (`XCL_ALIAS_ALIGNED=0`: not).
+    static ALIGNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if va % 0x1_0000 == 0 && !*ALIGNED.get_or_init(|| !std::env::var("XCL_ALIAS_ALIGNED").is_ok_and(|v| v.trim() == "0")) {
         return;
     }
     let mut dev: Option<ID3D12Device> = None;

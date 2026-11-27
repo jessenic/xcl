@@ -1625,6 +1625,16 @@ pub fn outside_buffer_address(va: usize) -> Option<usize> {
     OUTSIDE_BUFFERS.lock().unwrap().iter().find(|&&(a, n, _)| va >= a && va < a + n).map(|&(a, _, p)| p + (va - a))
 }
 
+/// lab: bytes from title address `va` to the end of the buffer of `place_outside_buffer` that holds
+/// it (`view_mem`: the end of the title's allocation, `XCL_VIEW_FULL_RANGE=1`); such buffers are at
+/// 0x14_0000_0000 and up, as `bind`'s root addresses check.
+pub fn outside_buffer_left(va: usize) -> Option<usize> {
+    if va >> 32 < 0x14 {
+        return None;
+    }
+    OUTSIDE_BUFFERS.lock().unwrap().iter().find(|&&(a, n, _)| va >= a && va < a + n).map(|&(a, n, _)| a + n - va)
+}
+
 fn uma_shadowed() -> bool {
     crate::gpu::uma::get().is_some_and(|u| u.shadowed())
 }
@@ -2561,6 +2571,8 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
         let va = v.Anonymous.RaytracingAccelerationStructure.Location;
         let in_uma = va != 0 && crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
+        // lab XCL_RT_WATCH: the structures views name
+        super::rt_watch::note_structure(va, in_uma);
         if in_uma {
             let w = crate::gpu::desc::bvh_words(va, true);
             return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
@@ -3414,6 +3426,12 @@ unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *con
     // console code writes into pipeline objects (D3D12.X inline code): give it a console-shaped one
     if hr >= 0 && super::console_list::enabled() && !ppv.is_null() && !(*ppv).is_null() {
         *ppv = super::console_list::wrap_pso(*ppv, LAST_COMPUTE_TRANSLATED.with(|c| c.get()), LAST_COMPUTE_RS.with(|c| c.replace(0)));
+    }
+    // lab XCL_RT_WATCH: the pipeline the title holds, by its program's record
+    if hr >= 0 && super::rt_watch::enabled() && !ppv.is_null() && !(*ppv).is_null() && crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        if let Some(cs) = shader_bytes(&(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS) {
+            super::rt_watch::note_pipeline(crate::gpu::shader::fnv64(cs), *ppv as usize);
+        }
     }
     hr
 }

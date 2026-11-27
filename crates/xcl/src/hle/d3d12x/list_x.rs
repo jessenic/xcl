@@ -3348,6 +3348,10 @@ pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: 
 
 /// command list #78 DispatchX(x, y, z, flags)
 pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    // lab XCL_RT_WATCH: the flags and x a watched pipeline is dispatched with
+    if super::rt_watch::enabled() {
+        super::rt_watch::dispatch_x(super::bind::bound_pso(this), x, flags);
+    }
     super::bind::dispatch_flags(this, x, y, z, flags);
 }
 
@@ -4782,6 +4786,10 @@ unsafe fn alias_flush(list: *mut c_void, res: usize) {
     if n <= 8 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: alias copy #{n}: {res:#x} → {:#x}, {} subresources", info.dst, info.src_fp.len());
     }
+    // LOCAL: the copy writes a title texture: its CPU view (zeros) is not uploaded over it again
+    // and the page budget keeps it (as a title's own copy; from the same #505 comment – without
+    // it the pair was copied and the texels still read zero)
+    super::title_textures::note_gpu_write(info.dst);
     let copy = |d: &D3D12_TEXTURE_COPY_LOCATION, s: &D3D12_TEXTURE_COPY_LOCATION| {
         pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION)(list, d, 0, 0, 0, s, std::ptr::null());
     };

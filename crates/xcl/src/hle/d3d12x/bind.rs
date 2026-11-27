@@ -247,6 +247,11 @@ pub(super) fn want_bound(this: *mut c_void) {
     super::pso_async::want(with(this, |s| s.pso));
 }
 
+/// lab `XCL_RT_WATCH`: the pipeline `this` has bound.
+pub(super) fn bound_pso(this: *mut c_void) -> usize {
+    with(this, |s| s.pso)
+}
+
 /// lab (`XCL_SKIP_LOG=1`): one line the first time a pipeline's draw or dispatch is skipped at
 /// a place in this file (the source line), with its console shaders' hashes when they are known
 /// and the uptime: which programs a run lost at world entry, to compare between runs.
@@ -292,6 +297,7 @@ pub(super) fn skip_note_pso(pso: usize, line: u32, what: &str) {
 /// A put-off dispatch that could not be recorded.
 pub(super) fn dispatch_dropped() {
     count(DISPATCHES_SKIPPED);
+    super::rt_watch::dropped();
 }
 
 /// `to` goes on in the arena `from` took its pieces from (`from` takes no more).
@@ -2454,7 +2460,9 @@ fn dispatch_groups(pso: usize, dims: [u32; 3], flags: u32) -> Option<([u32; 3], 
 fn thread_dimensions() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("XCL_DISPATCHX_THREADS").is_ok_and(|v| v.trim() == "1");
+        // LOCAL: `XCL_DISPATCHX_FLAGS=1` (the name of lab patch 0029, whose code this tree already
+        // has from #2610) turns the same thing on
+        let on = ["XCL_DISPATCHX_THREADS", "XCL_DISPATCHX_FLAGS"].iter().any(|k| std::env::var(k).is_ok_and(|v| v.trim() == "1"));
         crate::xlog_info!("D3D12.X: DispatchX thread dimensions (0x20) {}", if on { "launched as whole groups (XCL_DISPATCHX_THREADS=1)" } else { "launched as group counts (lab: XCL_DISPATCHX_THREADS=1 converts them)" });
         on
     })
@@ -2469,12 +2477,21 @@ fn lab_dispatch_flags(flags: u32, on: bool) -> u32 {
 pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
     super::targets::note_dispatch();
     let pso = with(this, |s| s.pso);
+    // lab XCL_RT_WATCH: the record of a watched pipeline (None when off)
+    let watched = super::rt_watch::watched(pso);
+    if let Some(r) = watched {
+        if let (Some(layout), args) = with(this, |s| (s.layout.clone(), s.args.clone())) {
+            super::rt_watch::note_args(r, &layout.params, &args);
+        }
+    }
     if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
+        super::rt_watch::seen(watched, super::rt_watch::Outcome::PutOff);
         return super::pso_async::need_by_submit(pso);
     }
     let pso = super::pso_async::resolve_wait(pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
+        super::rt_watch::seen(watched, super::rt_watch::Outcome::Untranslated);
         // a console pipeline without a translation (including a background build that
         // failed): nothing to run (its root arguments were not given to the PC list either)
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2492,6 +2509,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
         }
         skip_note(this, line!());
         count(DISPATCHES_SKIPPED);
+        super::rt_watch::seen(watched, super::rt_watch::Outcome::Failed);
         return;
     };
     if flags != 0 {
@@ -2506,10 +2524,14 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
     let done = translated_dispatch(this, list, pso, groups[0], groups[1], groups[2]);
     with(this, |s| s.limits = [0; 3]);
     match done {
-        Ok(()) => count(DISPATCHES),
+        Ok(()) => {
+            count(DISPATCHES);
+            super::rt_watch::seen(watched, super::rt_watch::Outcome::Launched);
+        }
         Err(e) => {
             skip_note(this, line!());
             count(DISPATCHES_SKIPPED);
+            super::rt_watch::seen(watched, super::rt_watch::Outcome::Failed);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: Dispatch with a translated pipeline skipped: {e}");
