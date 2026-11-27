@@ -1472,6 +1472,10 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     away.page.remove(&page);
     std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE);
     if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
+        // LOCAL (`XCL_PAGE_SHARE=1`): the page's video memory goes with it
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(old)) {
+            crate::hle::d3d12x::sparse::share_page(old, at);
+        }
         crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
     }
     release_at(old);
