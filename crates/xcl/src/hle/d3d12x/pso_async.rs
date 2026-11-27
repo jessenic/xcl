@@ -49,6 +49,9 @@ struct Pending {
     given: std::sync::atomic::AtomicBool,
     /// lab: `code::now_ms` when its real pipeline was built
     built_ms: std::sync::atomic::AtomicU64,
+    /// lab: its last build left no driver blob for the next one (`real::BuildNote::blobless`):
+    /// built again, it is compiled in full
+    blobless: std::sync::atomic::AtomicBool,
 }
 
 /// Builds a real pipeline as often as asked (`submit_lazy_again`).
@@ -412,6 +415,11 @@ pub fn submit_lazy_again(standin: usize, compute: bool, again: Again, key: u64) 
 }
 
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, again: Option<Again>) {
+    // (lab `code`: the build note of this build only, not of what ran on the thread before it)
+    let job: Job = Box::new(move || {
+        let _ = super::real::take_build_note();
+        job()
+    });
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -434,6 +442,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, agai
         in_use: Default::default(),
         given: Default::default(),
         built_ms: Default::default(),
+        blobless: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1137,6 +1146,11 @@ mod used_tests {
 /// `XCL_PSO_UNUSED_S=<n>`: a real pipeline nothing has used n seconds after it was built (built
 /// ahead of its use because an earlier run used it) is given back whatever the budget: built
 /// pipelines cost memory in the driver (~0.6 GB for a retail title's 4500).
+/// `XCL_PSO_KEEP_BLOBLESS=1`: ... except one whose build left no driver blob for the next one
+/// (`real::BuildNote::blobless`): built again at a bind, it is compiled in full on the binding
+/// thread (4 - 7 s each for a retail title's mesh pipelines). The budget may still give it back.
+/// A build again that takes 1 s or more is logged (`built again at bind:`), and the line counts
+/// the pipelines given back without a blob.
 mod code {
     use super::*;
     use std::sync::atomic::AtomicU64;
@@ -1171,6 +1185,47 @@ mod code {
         *C.get_or_init(|| var("XCL_PSO_CODE_CAP_MB").map(|mb| (mb as usize) << 20))
     }
 
+    /// `XCL_PSO_KEEP_BLOBLESS=1`
+    fn keep_blobless() -> bool {
+        static K: OnceLock<bool> = OnceLock::new();
+        *K.get_or_init(|| var("XCL_PSO_KEEP_BLOBLESS") == Some(1))
+    }
+
+    /// A build again of this long or more is logged.
+    const SLOW_REBUILD: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Whether a built pipeline nothing has used is given back for `XCL_PSO_UNUSED_S` (`unused`
+    /// in ms, None: off), `since_built` ms after its build: one that can be built again, and
+    /// with `keep_blobless` not one whose build left no driver blob.
+    fn given_back_unused(unused: Option<u64>, since_built: u64, can_again: bool, blobless: bool, keep_blobless: bool) -> bool {
+        unused.is_some_and(|ms| since_built >= ms) && can_again && !(keep_blobless && blobless)
+    }
+
+    /// Whether the pipeline built by the build `note` is noted as without a blob: its build said
+    /// so, or (`again`: a build again) its slowest compile took `SLOW_REBUILD` or more without
+    /// a driver blob.
+    fn blobless_after(note: &super::super::real::BuildNote, again: bool) -> bool {
+        note.blobless || (again && note.slowest.as_ref().is_some_and(|s| !s.3 && s.2 >= SLOW_REBUILD))
+    }
+
+    /// The line of a build again that took `took` (None under `SLOW_REBUILD`): the slowest driver
+    /// compile of `note`, the thread (`thread`: id and name).
+    fn rebuild_line(took: std::time::Duration, note: &super::super::real::BuildNote, thread: (u32, Option<&str>)) -> Option<String> {
+        if took < SLOW_REBUILD {
+            return None;
+        }
+        let compile = match &note.slowest {
+            Some((kind, record, t, _)) => format!("{kind}, record {record:016x}, {} ms (slowest driver compile {} ms)", took.as_millis(), t.as_millis()),
+            None => format!("no driver compile on this thread, {} ms", took.as_millis()),
+        };
+        let blob = match &note.slowest {
+            Some((_, _, _, true)) => "yes",
+            Some(_) => "no",
+            None => "?",
+        };
+        Some(format!("built again at bind: {compile}, thread {} ({}), blob {blob}", thread.0, thread.1.unwrap_or("unnamed")))
+    }
+
     fn graphics_too() -> bool {
         static G: OnceLock<bool> = OnceLock::new();
         *G.get_or_init(|| var("XCL_PSO_CODE_GFX") == Some(1))
@@ -1193,6 +1248,8 @@ mod code {
     }
 
     static GIVEN_BACK: AtomicUsize = AtomicUsize::new(0);
+    /// of those, given back without a driver blob for their build again (`Pending::blobless`)
+    static GIVEN_BACK_BLOBLESS: AtomicUsize = AtomicUsize::new(0);
     static REBUILT: AtomicUsize = AtomicUsize::new(0);
     static REBUILD_US: AtomicU64 = AtomicU64::new(0);
     static EVER_USED: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
@@ -1209,8 +1266,9 @@ mod code {
 
     /// `real` was built for `p`: its code is measured once.
     pub fn built(p: &Pending, real: usize) {
-        p.given.store(false, Ordering::Release);
+        let again = p.given.swap(false, Ordering::AcqRel);
         p.built_ms.store(now_ms(), Ordering::Relaxed);
+        p.blobless.store(blobless_after(&super::super::real::take_build_note(), again), Ordering::Relaxed);
         if !enabled() || cfg!(test) || p.code.load(Ordering::Relaxed) != 0 {
             return;
         }
@@ -1287,10 +1345,17 @@ mod code {
             return None;
         }
         *p.job.lock().unwrap() = Some(Box::new(move || {
+            let _ = super::super::real::take_build_note();
             let t = std::time::Instant::now();
             let r = again();
+            let took = t.elapsed();
             REBUILT.fetch_add(1, Ordering::Relaxed);
-            REBUILD_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            REBUILD_US.fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+            let thread = std::thread::current();
+            let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+            if let Some(line) = rebuild_line(took, &super::super::real::build_note(), (id, thread.name())) {
+                crate::xlog_warn!("shader code lab: {line}");
+            }
             r
         }));
         p.sent.store(false, Ordering::Release);
@@ -1299,6 +1364,9 @@ mod code {
         unused(p);
         *done = false;
         GIVEN_BACK.fetch_add(1, Ordering::Relaxed);
+        if p.blobless.load(Ordering::Relaxed) {
+            GIVEN_BACK_BLOBLESS.fetch_add(1, Ordering::Relaxed);
+        }
         Some(real)
     }
 
@@ -1331,7 +1399,8 @@ mod code {
                 let (k, code) = (if p.compute { 0 } else { 1 }, p.code.load(Ordering::Relaxed));
                 add(&mut st.built[k], code);
                 if !p.in_use.load(Ordering::Relaxed) {
-                    if unused.is_some_and(|ms| now.saturating_sub(p.built_ms.load(Ordering::Relaxed)) >= ms) && p.again.is_some() {
+                    let since_built = now.saturating_sub(p.built_ms.load(Ordering::Relaxed));
+                    if given_back_unused(unused, since_built, p.again.is_some(), p.blobless.load(Ordering::Relaxed), keep_blobless()) {
                         never.push(p.clone());
                     }
                     continue;
@@ -1371,6 +1440,12 @@ mod code {
         if !enabled() {
             return None;
         }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        if keep_blobless() {
+            ONCE.call_once(|| {
+                crate::xlog_info!("shader code lab: XCL_PSO_KEEP_BLOBLESS=1: a pipeline whose build left no driver blob is not given back for XCL_PSO_UNUSED_S (the XCL_PSO_CODE_MB budget still may)");
+            });
+        }
         let (now, frame) = (now_ms(), frame());
         let (st, idle) = scan(budget(), idle_ms(), graphics_too(), now, frame);
         let mut given = (0usize, 0usize);
@@ -1400,7 +1475,7 @@ mod code {
         }
         let mb = |b: usize| b as f64 / (1 << 20) as f64;
         Some(format!(
-            "in use {} pipelines / {:.0} MB (compute {} / {:.0}, graphics {} / {:.0}; of 1 MB or more {} / {:.0}; two-pass compute passes {:.0}), used in the last 10 s {:.0} + {:.0} MB; built {} / {:.0} + {} / {:.0} MB; ever used {:.0} + {:.0} MB; given back now {} / {:.0} MB, released now {} / {:.0} MB, waiting for release {:.0} MB; so far given back {}, built again {} in {} ms, held back by the cap {}, released but still referenced {}",
+            "in use {} pipelines / {:.0} MB (compute {} / {:.0}, graphics {} / {:.0}; of 1 MB or more {} / {:.0}; two-pass compute passes {:.0}), used in the last 10 s {:.0} + {:.0} MB; built {} / {:.0} + {} / {:.0} MB; ever used {:.0} + {:.0} MB; given back now {} / {:.0} MB, released now {} / {:.0} MB, waiting for release {:.0} MB; so far given back {}, built again {} in {} ms, held back by the cap {}, released but still referenced {}, given back without a blob {}",
             st.in_use[0].0 + st.in_use[1].0,
             mb(st.in_use[0].1 + st.in_use[1].1),
             st.in_use[0].0,
@@ -1427,7 +1502,8 @@ mod code {
             REBUILT.load(Ordering::Relaxed),
             REBUILD_US.load(Ordering::Relaxed) / 1000,
             HELD_BACK.load(Ordering::Relaxed),
-            STILL_HELD.load(Ordering::Relaxed)
+            STILL_HELD.load(Ordering::Relaxed),
+            GIVEN_BACK_BLOBLESS.load(Ordering::Relaxed)
         ))
     }
 
@@ -1480,6 +1556,77 @@ mod code {
             for pso in [old, new, once] {
                 let _ = released(pso);
             }
+        }
+
+        /// `XCL_PSO_UNUSED_S` gives back a pipeline that can be built again once its delay is
+        /// over; with `XCL_PSO_KEEP_BLOBLESS=1` not one whose build left no driver blob.
+        #[test]
+        fn the_unused_delay_keeps_a_pipeline_without_a_blob_only_with_the_switch() {
+            // (unused, since built, can be built again, without a blob, switch) -> given back
+            let cases = [
+                (None, 99_000, true, false, false, false),
+                (Some(30_000), 29_999, true, false, false, false),
+                (Some(30_000), 30_000, true, false, false, true),
+                (Some(30_000), 30_000, false, false, false, false),
+                (Some(30_000), 30_000, true, true, false, true),
+                (Some(30_000), 30_000, true, true, true, false),
+                (Some(30_000), 30_000, true, false, true, true),
+            ];
+            for (unused, since, again, blobless, keep, want) in cases {
+                assert_eq!(given_back_unused(unused, since, again, blobless, keep), want, "{unused:?} {since} {again} {blobless} {keep}");
+            }
+            // the switch is off unless set to 1
+            assert_eq!(keep_blobless(), std::env::var("XCL_PSO_KEEP_BLOBLESS").ok().and_then(|v| v.trim().parse::<u64>().ok()) == Some(1));
+        }
+
+        /// A pipeline counts as without a blob when its build said so, or when its build again
+        /// took 1 s or more in the driver without a blob; a quick one or one with a blob does not.
+        #[test]
+        fn a_pipeline_is_without_a_blob_when_its_build_says_so_or_a_slow_build_again_had_none() {
+            use super::super::super::real::BuildNote;
+            let slow = |blob: bool, ms: u64| BuildNote { slowest: Some(("MS".to_string(), 0xAB, std::time::Duration::from_millis(ms), blob)), blobless: false };
+            assert!(!blobless_after(&BuildNote::default(), false));
+            assert!(!blobless_after(&BuildNote::default(), true));
+            assert!(blobless_after(&BuildNote { slowest: None, blobless: true }, false));
+            assert!(!blobless_after(&slow(false, 5000), false), "a first build is compiled without a blob");
+            assert!(blobless_after(&slow(false, 5000), true));
+            assert!(!blobless_after(&slow(true, 5000), true));
+            assert!(!blobless_after(&slow(false, 999), true));
+        }
+
+        /// The `built again at bind:` line: only from 1 s, with the slowest compile's kind,
+        /// record, the time, the thread and whether a blob was supplied.
+        #[test]
+        fn a_slow_build_again_is_logged_with_its_compile_thread_and_blob() {
+            use super::super::super::real::BuildNote;
+            let note = BuildNote { slowest: Some(("MS without topology".to_string(), 0x1234_5678, std::time::Duration::from_millis(4199), false)), blobless: true };
+            assert_eq!(rebuild_line(std::time::Duration::from_millis(999), &note, (7, Some("t"))), None);
+            assert_eq!(
+                rebuild_line(std::time::Duration::from_millis(4210), &note, (25412, None)).as_deref(),
+                Some("built again at bind: MS without topology, record 0000000012345678, 4210 ms (slowest driver compile 4199 ms), thread 25412 (unnamed), blob no")
+            );
+            let with = BuildNote { slowest: Some(("MS".to_string(), 1, std::time::Duration::from_millis(1500), true)), blobless: false };
+            assert!(rebuild_line(std::time::Duration::from_secs(2), &with, (3, Some("xcl-pso-0"))).unwrap().ends_with("thread 3 (xcl-pso-0), blob yes"));
+            assert!(rebuild_line(std::time::Duration::from_secs(1), &BuildNote::default(), (3, None)).unwrap().contains("no driver compile on this thread, 1000 ms"));
+        }
+
+        /// A pipeline given back while its build left no blob is counted; its build again (no
+        /// driver compile here) clears the mark.
+        #[test]
+        fn a_pipeline_given_back_without_a_blob_is_counted() {
+            let pso = 0x7E57_C0B1usize;
+            submit_lazy_again(pso, false, Arc::new(|| 0xB10B), 0);
+            assert_eq!(resolve_wait_for(pso, None), 0xB10B);
+            let p = entry(pso).unwrap();
+            assert!(!p.blobless.load(Ordering::Relaxed), "no driver compile: not without a blob");
+            p.blobless.store(true, Ordering::Relaxed);
+            let before = GIVEN_BACK_BLOBLESS.load(Ordering::Relaxed);
+            assert_eq!(give_back(&p), Some(0xB10B));
+            assert_eq!(GIVEN_BACK_BLOBLESS.load(Ordering::Relaxed), before + 1);
+            assert!(p.given.load(Ordering::Acquire));
+            assert_eq!(resolve_wait_for(pso, None), 0xB10B, "built again at the next bind");
+            assert!(!p.given.load(Ordering::Acquire) && !p.blobless.load(Ordering::Relaxed));
+            let _ = released(pso);
         }
     }
 }
