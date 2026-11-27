@@ -877,6 +877,11 @@ struct MapCopy {
 
 unsafe impl Send for MapCopy {}
 
+/// lab `XCL_SPARSE_MAP_NOWAIT` (review F5): the Map copy queue's fence and the last value signalled on it,
+/// readable without `MAP_COPY` (a leaf lock, held only to clone) by `unmap_tiles`, under `STATE`
+static MAP_COPY_FENCE: Mutex<Option<ID3D12Fence>> = Mutex::new(None);
+static MAP_COPY_SIGNALLED: AtomicU64 = AtomicU64::new(0);
+
 /// The Map copy queue (`MapCopy`), made at the first Map with the switch on. Taken right after
 /// `READBACK`, before `STATE`.
 static MAP_COPY: Mutex<Option<MapCopy>> = Mutex::new(None);
@@ -896,6 +901,8 @@ impl MapCopy {
             return None;
         }
         let fence = ID3D12Fence::from_raw(p);
+        *MAP_COPY_FENCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(fence.clone());
+        MAP_COPY_SIGNALLED.store(0, Ordering::Release);
         let mut p: *mut c_void = std::ptr::null_mut();
         if (v.CreateCommandAllocator)(d, D3D12_COMMAND_LIST_TYPE_COPY, &ID3D12CommandAllocator::IID, &mut p).is_err() || p.is_null() {
             return None;
@@ -1449,6 +1456,19 @@ impl State {
             return;
         }
         super::real::removed_probe("sparse: before unmap_tiles");
+        // lab XCL_SPARSE_MAP_NOWAIT (review F5): the Map copies run on a queue of their own, not in
+        // the title's known queues, so neither the quarantine marks nor this unmap waited for them: a
+        // tile could lose its mapping (and later its pool heap) under a copy still queued. The
+        // sparse queue now waits, on the GPU, for every Map copy submitted so far (each waits only for
+        // a signal already on this queue: no cycle). Pool tiles freed after this unmap, and heaps
+        // retired after them, follow it.
+        let mv = MAP_COPY_SIGNALLED.load(Ordering::Acquire);
+        if mv > 0 {
+            let f = MAP_COPY_FENCE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(f) = f {
+                let _ = super::call_stats::cs!(QueueWait, self.queue.Wait(&f, mv));
+            }
+        }
         let mut xs: Vec<u32> = tiles.iter().map(|&a| ((a - res_base) / TILE) as u32).collect();
         xs.sort_unstable();
         let mut coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = Vec::with_capacity(xs.len());
@@ -1977,7 +1997,9 @@ impl State {
         let Ok(l) = m.list.cast::<ID3D12CommandList>() else { return None };
         m.queue.ExecuteCommandLists(&[Some(l)]);
         m.value += 1;
-        let _ = super::call_stats::cs!(QueueSignal, m.queue.Signal(&m.fence, m.value));
+        if super::call_stats::cs!(QueueSignal, m.queue.Signal(&m.fence, m.value)).is_ok() {
+            MAP_COPY_SIGNALLED.store(m.value, Ordering::Release);
+        }
         Some((cur, parts))
     }
 
@@ -5332,6 +5354,47 @@ mod tests {
             s.fence.Signal(fv).expect("the queue passes the list");
             drop_retired_tables();
             assert_eq!(HELD_TABLES.lock().unwrap().len(), held_before, "released once the queue has passed it");
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// `XCL_SPARSE_MAP_NOWAIT` (review F5): an unmap on the sparse queue waits, on the GPU, for the Map
+    /// copies submitted before it: a tile does not lose its mapping under a copy still queued.
+    #[test]
+    fn an_unmap_waits_for_the_map_copies_before_it() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        let _serial = lab_test_lock();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                MAP_COPY_SIGNALLED.store(0, Ordering::Release);
+                *MAP_COPY_FENCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        let _reset = Reset;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            assert!(!VirtualAlloc(base as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            s.commit_range(base, TILE);
+            s.wait_for(s.value);
+            let reserved = s.windows[0].1.clone();
+            let mut m = MapCopy::new(&s.dev).expect("Map copy queue");
+            // the Map copy held on its queue by a gate
+            let gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate");
+            m.queue.Wait(&gate, 1).expect("gate the copy queue");
+            let (_, parts) = s.map_copy_submit(&mut m, base, base + 1024).expect("ordered");
+            assert!(!parts.is_empty());
+            assert_eq!(MAP_COPY_SIGNALLED.load(Ordering::Acquire), m.value, "the last Map copy's value is known outside MAP_COPY");
+            // the title decommits the tile: its unmap on the sparse queue
+            s.unmap_tiles(&reserved, base, &[base]);
+            s.signal();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(super::super::real::fence_completed(&s.fence) < s.value, "the unmap does not run while the Map copy is queued");
+            gate.Signal(1).expect("open the gate");
+            assert!(wait_fence(&m.fence, m.value), "the Map copy runs");
+            assert!(wait_fence(&s.fence, s.value), "then the unmap");
+            drop(m);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
