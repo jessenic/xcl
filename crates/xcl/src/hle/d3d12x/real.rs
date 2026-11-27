@@ -4439,10 +4439,60 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let started = std::time::Instant::now();
     let r = build();
     let took = started.elapsed();
+    BUILD_NOTE.with(|n| n.borrow_mut().compiled(kind, record, took));
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
     }
     (r, took)
+}
+
+/// Lab (`pso_async::code`): the driver compiles of the pipeline build on this thread, from
+/// one `take_build_note` to the next.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct BuildNote {
+    /// the slowest compile: (kind, console record (0: none), time in the driver, whether a
+    /// driver blob was supplied)
+    pub slowest: Option<(String, u64, std::time::Duration, bool)>,
+    /// a pipeline of the build was compiled without a blob and none is kept for its next build
+    /// (`note_kept`): built again, it is compiled in full
+    pub blobless: bool,
+}
+
+impl BuildNote {
+    fn compiled(&mut self, kind: &str, record: Option<(u64, bool)>, took: std::time::Duration) {
+        if self.slowest.as_ref().map_or(true, |s| took > s.2) {
+            let (record, blob) = record.unwrap_or((0, false));
+            self.slowest = Some((kind.to_string(), record, took, blob));
+        }
+    }
+}
+
+thread_local! {
+    static BUILD_NOTE: std::cell::RefCell<BuildNote> = const { std::cell::RefCell::new(BuildNote { slowest: None, blobless: false }) };
+}
+
+/// Lab: what this thread's driver compiles did since the last call (the note starts again).
+pub(crate) fn take_build_note() -> BuildNote {
+    BUILD_NOTE.with(|n| std::mem::take(&mut *n.borrow_mut()))
+}
+
+/// Lab: what this thread's driver compiles did since the last `take_build_note` (kept).
+pub(crate) fn build_note() -> BuildNote {
+    BUILD_NOTE.with(|n| n.borrow().clone())
+}
+
+/// A pipeline (`made`: built; `reused`: from a driver blob) of `bytes` of DXIL, `min` or more
+/// (smaller ones keep no blob and compile in milliseconds), left no blob for its next build
+/// (`kept`: one is kept now).
+fn left_no_blob(made: bool, reused: bool, bytes: usize, min: usize, kept: bool) -> bool {
+    made && !reused && bytes >= min && !kept
+}
+
+/// `left_no_blob`, noted for the build on this thread (`BuildNote::blobless`).
+fn note_kept(made: bool, reused: bool, bytes: usize, min: usize, kept: bool) {
+    if left_no_blob(made, reused, bytes, min, kept) {
+        BUILD_NOTE.with(|n| n.borrow_mut().blobless = true);
+    }
 }
 
 /// How a logged driver compile went through the huge-pipeline gate.
@@ -4886,6 +4936,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     } else if reused && from_disk {
         driver_cache::note(true, None);
     }
+    note_kept(hr >= 0, reused, dxil.len(), COMPUTE_BLOB_MIN_DXIL, compute_blob(key).is_some());
     (hr, in_driver, reused)
 }
 
@@ -5763,6 +5814,7 @@ mod mesh_blob_tests {
             }
             let mut calls = Vec::new();
             let mut pso: *mut c_void = std::ptr::null_mut();
+            let _ = take_build_note();
             let (hr, reused) = unsafe {
                 create_mesh_pso(&out, key, (cached.clone(), false), None, 0, "test MS", 0, &mut pso, |desc| {
                     let d = &*(desc as *const D3D12_PIPELINE_STATE_STREAM_DESC);
@@ -5781,7 +5833,96 @@ mod mesh_blob_tests {
             let want = if cached.is_some() { vec![(true, true), (true, false), (false, false)] } else { vec![(true, false), (false, false)] };
             assert_eq!(calls, want);
             assert!(mesh_blob(key).is_none(), "no blob kept for a pipeline made without the topology");
+            assert!(take_build_note().blobless, "the build is noted as one without a blob for its next build");
         }
+    }
+
+    /// Subobjects of `ty` in the stream a create call got.
+    unsafe fn count_in(desc: *const c_void, ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) -> (usize, bool) {
+        let d = &*(desc as *const D3D12_PIPELINE_STATE_STREAM_DESC);
+        let subs = stream_subobjects(std::slice::from_raw_parts(d.pPipelineStateSubobjectStream as *const u8, d.SizeInBytes)).unwrap();
+        let blob = subs.iter().any(|(t, p)| *t == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO.0 as u32 && p[8..16] != [0; 8]);
+        (subs.iter().filter(|(t, _)| *t == ty.0 as u32).count(), blob)
+    }
+
+    /// A stream that names its topology already (`two_pass_mesh_stream`, every translated mesh
+    /// pipeline) gets no second one: with a runtime that refuses a subobject type twice, the
+    /// first build is the one with the CACHED_PSO subobject (a blob kept for the next build),
+    /// and a build with the blob is made from it at once – not compiled in full without one.
+    #[test]
+    fn a_stream_with_its_topology_gets_no_second_one() {
+        let (ms, ps) = (b"ms".to_vec(), b"ps".to_vec());
+        let mut out = stream(0x1000, &ms, Some(&ps), &state());
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+        let passthrough = two_pass_mesh_stream(0x1000 as *mut c_void, &ms, Some(&ps));
+        let key = (0x7E57_0000_0000_0004u64, 2);
+        forget_mesh_blob(key);
+        for s in [&out, &passthrough] {
+            for cached in [None, Some(std::sync::Arc::new(vec![1u8, 2, 3]))] {
+                let mut calls = Vec::new();
+                let mut pso: *mut c_void = std::ptr::null_mut();
+                let _ = take_build_note();
+                let (hr, reused) = unsafe {
+                    create_mesh_pso(s, key, (cached.clone(), false), None, 0, "test MS", 0, &mut pso, |desc| {
+                        let (topologies, blob) = count_in(desc, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY);
+                        let (cached_psos, _) = count_in(desc, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO);
+                        calls.push((topologies, cached_psos, blob));
+                        // the runtime: a subobject type twice is an invalid stream
+                        if topologies > 1 || cached_psos > 1 {
+                            E_INVALIDARG
+                        } else {
+                            0
+                        }
+                    })
+                };
+                assert_eq!((hr, reused), (0, cached.is_some()));
+                assert_eq!(calls, vec![(1, 1, cached.is_some())], "one build, with one topology and the CACHED_PSO subobject");
+                let note = take_build_note();
+                assert_eq!(note.slowest.as_ref().map(|n| (n.0.as_str(), n.3)), Some(("test MS", cached.is_some())), "no build without the topology");
+                // (the test's driver gives no pipeline object, so no blob: noted as without one)
+                assert_eq!(note.blobless, cached.is_none());
+            }
+        }
+        forget_mesh_blob(key);
+    }
+
+    /// A pipeline leaves no blob for its next build only when it was compiled (not made from a
+    /// blob), is big enough to keep one, and none was kept.
+    #[test]
+    fn left_no_blob_only_for_a_big_compiled_pipeline_without_a_kept_blob() {
+        let min = COMPUTE_BLOB_MIN_DXIL;
+        assert!(left_no_blob(true, false, min, min, false));
+        assert!(!left_no_blob(true, false, min, min, true), "a blob kept");
+        assert!(!left_no_blob(true, true, min, min, false), "made from a blob");
+        assert!(!left_no_blob(true, false, min - 1, min, false), "too small to keep one");
+        assert!(!left_no_blob(false, false, min, min, false), "not built");
+    }
+
+    /// The build note keeps the slowest driver compile of this thread (its kind, record, time
+    /// and whether a blob was supplied) and whether a pipeline left no blob, until it is taken.
+    #[test]
+    fn the_build_note_keeps_the_slowest_compile_until_taken() {
+        let _ = take_build_note();
+        let mut n = BuildNote::default();
+        n.compiled("MS", Some((0xAB, false)), std::time::Duration::from_millis(5));
+        n.compiled("compute pass", Some((0xAB, true)), std::time::Duration::from_millis(2));
+        n.compiled("MS retry", None, std::time::Duration::from_millis(9));
+        assert_eq!(n.slowest, Some(("MS retry".to_string(), 0, std::time::Duration::from_millis(9), false)));
+        let (r, _) = driver_compile_identified("test compile", 1, false, Some((0x5EED, true)), || {
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            7
+        });
+        assert_eq!(r, 7);
+        let _ = driver_compile_identified("test quick", 1, false, Some((0x0F, false)), || 0);
+        note_kept(true, false, 0, 0, false);
+        let mut seen = build_note();
+        assert_eq!(seen, build_note(), "build_note keeps the note");
+        let took = seen.slowest.as_ref().map(|s| s.2).unwrap();
+        assert!(took >= std::time::Duration::from_millis(3));
+        seen.slowest.as_mut().unwrap().2 = std::time::Duration::ZERO;
+        assert_eq!(seen, BuildNote { slowest: Some(("test compile".to_string(), 0x5EED, std::time::Duration::ZERO, true)), blobless: true });
+        assert_eq!(take_build_note().slowest.map(|s| s.1), Some(0x5EED));
+        assert_eq!(take_build_note(), BuildNote::default(), "taken: it starts again");
     }
 
     /// GPU: a mesh pipeline built a second time is made from the driver's blob of the first
@@ -5824,9 +5965,6 @@ void main(out vertices V v[3], out indices uint3 t[1]) {
         s.dsv = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
         s.depth.DepthEnable = false.into();
         s.rast.CullMode = D3D12_CULL_MODE_NONE;
-        let out = stream(rs.as_raw() as usize, &ms, Some(&ps), &s);
-        let key = unsafe { mesh_blob_key(&out, &[]) };
-        forget_mesh_blob(key);
         let dev2: ID3D12Device2 = dev.cast().expect("ID3D12Device2");
         // the driver's CreatePipelineState, not XCL's hook (which empties a title's CACHED_PSO):
         // D3D12CreateDevice gives every test the one device of the adapter, adopted by others
@@ -5839,39 +5977,51 @@ void main(out vertices V v[3], out indices uint3 t[1]) {
             }
         };
         let iid = pc_iid(Kind::PipelineState);
-        let mut supplied = Vec::new();
-        // one build: whether the driver call had a blob in its CACHED_PSO, the pipeline released
-        let mut build = || unsafe {
-            let mut pso: *mut c_void = std::ptr::null_mut();
-            let ppv: *mut *mut c_void = &mut pso;
-            let r = create_mesh_pso(&out, key, cached_mesh_blob(key, None), None, 0, "test MS", 0, ppv, |desc| {
-                let d = &*(desc as *const D3D12_PIPELINE_STATE_STREAM_DESC);
-                let subs = std::slice::from_raw_parts(d.pPipelineStateSubobjectStream as *const u8, d.SizeInBytes);
-                let blob = |(ty, p): &(u32, &[u8])| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO.0 as u32 && p[8..16] != [0; 8];
-                supplied.push(stream_subobjects(subs).unwrap().iter().any(blob));
-                create_pso(raw, desc, &iid, ppv)
-            });
-            let made = !pso.is_null();
-            if made {
-                drop(ID3D12PipelineState::from_raw(pso));
+        // the stream without its topology, then with it (as `two_pass_mesh_stream` makes every
+        // translated one): the same builds from the driver's blob
+        for topology in [false, true] {
+            let mut out = stream(rs.as_raw() as usize, &ms, Some(&ps), &s);
+            if topology {
+                out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
             }
-            (r.0, r.1, made)
-        };
-        // first build: compiled, its blob kept
-        let (hr, reused, made) = build();
-        assert!(hr >= 0 && !reused && made, "first build {hr:#x}");
-        let Some(first) = mesh_blob(key) else { panic!("the driver gave no blob of the mesh pipeline") };
-        // second build: from the blob
-        let (hr, reused, made) = build();
-        assert!(hr >= 0 && reused && made, "second build {hr:#x}, reused {reused}");
-        // a blob the driver refuses: dropped, compiled again without it, the new blob kept
-        put_mesh_blob(key, std::sync::Arc::new(vec![0xAB; 64]));
-        let (hr, reused, made) = build();
-        assert!(hr >= 0 && !reused && made, "build after a refused blob {hr:#x}");
-        drop(build);
-        assert_eq!(supplied, vec![false, true, true, false], "a blob in each driver call");
-        assert!(mesh_blob(key).is_some_and(|b| b.len() == first.len() && b[..] != [0xAB; 64][..]), "the driver's blob kept again");
-        forget_mesh_blob(key);
+            let key = unsafe { mesh_blob_key(&out, &[]) };
+            forget_mesh_blob(key);
+            let mut supplied = Vec::new();
+            // one build: whether the driver call had a blob in its CACHED_PSO, the pipeline released
+            let mut build = || unsafe {
+                let mut pso: *mut c_void = std::ptr::null_mut();
+                let ppv: *mut *mut c_void = &mut pso;
+                let r = create_mesh_pso(&out, key, cached_mesh_blob(key, None), None, 0, "test MS", 0, ppv, |desc| {
+                    let d = &*(desc as *const D3D12_PIPELINE_STATE_STREAM_DESC);
+                    let subs = std::slice::from_raw_parts(d.pPipelineStateSubobjectStream as *const u8, d.SizeInBytes);
+                    let blob = |(ty, p): &(u32, &[u8])| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO.0 as u32 && p[8..16] != [0; 8];
+                    supplied.push(stream_subobjects(subs).unwrap().iter().any(blob));
+                    create_pso(raw, desc, &iid, ppv)
+                });
+                let made = !pso.is_null();
+                if made {
+                    drop(ID3D12PipelineState::from_raw(pso));
+                }
+                (r.0, r.1, made)
+            };
+            // first build: compiled, its blob kept
+            let _ = take_build_note();
+            let (hr, reused, made) = build();
+            assert!(hr >= 0 && !reused && made, "first build {hr:#x} (topology in the stream: {topology})");
+            let Some(first) = mesh_blob(key) else { panic!("the driver gave no blob of the mesh pipeline (topology in the stream: {topology})") };
+            assert!(!take_build_note().blobless, "a blob kept: not noted as without one");
+            // second build: from the blob
+            let (hr, reused, made) = build();
+            assert!(hr >= 0 && reused && made, "second build {hr:#x}, reused {reused} (topology in the stream: {topology})");
+            // a blob the driver refuses: dropped, compiled again without it, the new blob kept
+            put_mesh_blob(key, std::sync::Arc::new(vec![0xAB; 64]));
+            let (hr, reused, made) = build();
+            assert!(hr >= 0 && !reused && made, "build after a refused blob {hr:#x} (topology in the stream: {topology})");
+            drop(build);
+            assert_eq!(supplied, vec![false, true, true, false], "a blob in each driver call (topology in the stream: {topology})");
+            assert!(mesh_blob(key).is_some_and(|b| b.len() == first.len() && b[..] != [0xAB; 64][..]), "the driver's blob kept again");
+            forget_mesh_blob(key);
+        }
     }
 }
 
@@ -5982,6 +6132,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     } else if build.reused && from_disk {
         driver_cache::note(true, None);
     }
+    note_kept(hr >= 0, build.reused, bytes, COMPUTE_BLOB_MIN_DXIL, graphics_blob(gkey).is_some());
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
@@ -6898,10 +7049,17 @@ unsafe fn create_mesh_pso(
     // topology) and a CACHED_PSO subobject (empty without a blob). Without the topology
     // (`topology` false) it is the stream as before: #724 saw retail mesh streams refused with
     // the title's topology subobject.
+    // A stream that names its topology already (`two_pass_mesh_stream` does) gets no second
+    // one: the runtime refuses a stream with a subobject type twice (E_INVALIDARG, before the
+    // driver), so every translated mesh pipeline fell to the build without a blob and was
+    // compiled in full each time it was built again.
+    let has_topology = stream_subobjects(&stream.0).is_some_and(|subs| subs.iter().any(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32));
     let with = |b: Option<&[u8]>, topology: bool| {
         let mut s = StreamOut(stream.0.clone(), stream.1);
         if topology {
-            s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+            if !has_topology {
+                s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+            }
             let state = b.map_or_else(D3D12_CACHED_PIPELINE_STATE::default, |b| D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() });
             s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &state);
         }
@@ -6924,8 +7082,9 @@ unsafe fn create_mesh_pso(
     }
     let mut topology = true;
     if hr == E_INVALIDARG {
-        // as before: no topology, and no blob kept (a later build with the topology would not
-        // match it); other errors (E_OUTOFMEMORY: `with_switch_fallback`) are not retried here
+        // as before: no topology (none added) and no CACHED_PSO, and no blob kept (a later
+        // build with them would not match it: `note_kept` marks the pipeline as without a blob);
+        // other errors (E_OUTOFMEMORY: `with_switch_fallback`) are not retried here
         let (retried, t) = build(&format!("{kind} without topology"), &with(None, false), false);
         hr = retried;
         took += t;
@@ -6939,6 +7098,7 @@ unsafe fn create_mesh_pso(
     } else if reused && from_disk {
         driver_cache::note_mesh_hit();
     }
+    note_kept(hr >= 0, reused, bytes, keep_min, mesh_blob(key).is_some());
     (hr, reused)
 }
 
@@ -7047,6 +7207,9 @@ unsafe fn finish_two_pass(
         }
     } else if creused && cfrom_disk {
         driver_cache::note(true, None);
+    }
+    if shared.is_none() {
+        note_kept(hc >= 0 && !compute.is_null(), creused, tp.cs.len(), COMPUTE_BLOB_MIN_DXIL, compute_blob(ckey).is_some());
     }
     drop(_slot);
     if hc < 0 || compute.is_null() {
