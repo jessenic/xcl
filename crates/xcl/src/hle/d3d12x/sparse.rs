@@ -362,6 +362,12 @@ static FENCE_OBJ: Mutex<Option<ID3D12Fence>> = Mutex::new(None);
 static FENCE_SIGNALLED: AtomicU64 = AtomicU64::new(0);
 static CPU_WAITING_FOR: AtomicU64 = AtomicU64::new(0);
 
+/// `fence_line` for the activity thread, only when `on` (`XCL_CALL_STATS`; review F7): without it the
+/// activity thread neither writes the line nor tries the sparse lock, as before the line existed.
+pub fn fence_line_if(on: bool) -> Option<String> {
+    on.then(fence_line)
+}
+
 /// A line on the sparse queue's progress that never waits for a lock: its fence (reached /
 /// signalled), a CPU wait under the state's lock in progress, whether that lock is held now.
 pub fn fence_line() -> String {
@@ -5398,5 +5404,14 @@ mod tests {
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
+    }
+
+    /// Review F7: the activity thread's sparse fence line (and its try of the sparse lock) only with
+    /// `XCL_CALL_STATS`; without it, none.
+    #[test]
+    fn the_fence_line_is_written_only_with_call_stats() {
+        let _serial = lab_test_lock();
+        assert!(fence_line_if(false).is_none(), "off: no line, no lock tried");
+        assert!(fence_line_if(true).is_some_and(|l| l.starts_with("sparse fence: ")), "on: the line");
     }
 }
