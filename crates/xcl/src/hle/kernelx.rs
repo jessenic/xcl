@@ -1147,6 +1147,15 @@ pub unsafe fn bring_page(at: usize) -> bool {
     if now == at || u.contains(now) || away.at.contains_key(&at) {
         return false;
     }
+    // only an address that is reserved and not committed: one the title has committed again since
+    // (a fault there is a write guard's or a protection's, not a missing page) holds other data,
+    // and bringing the page over it lost both – the title stalled and ended itself
+    {
+        let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if mem::VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != mem::MEM_RESERVE {
+            return false;
+        }
+    }
     mirrors::page_moved(page);
     let moved = match move_away(away, now, at, page, false) {
         Ok(true) => true,
