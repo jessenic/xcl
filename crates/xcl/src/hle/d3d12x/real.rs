@@ -765,6 +765,18 @@ fn module_of(addr: usize) -> usize {
     h as usize
 }
 
+/// The PC's own vtable of `obj`: an adopted object's original one, else its own. What XCL
+/// calls through it does not go through its hooks (lab `XCL_SPARSE_MAP_NOWAIT`: the Map copy
+/// queue is made with the device's original creators, so the title's queue bookkeeping never
+/// sees it).
+pub(super) unsafe fn pc_vtable(obj: *mut c_void) -> *const usize {
+    if is_adopted(obj) {
+        *vt(obj).sub(1) as *const usize
+    } else {
+        vt(obj)
+    }
+}
+
 /// Whether `obj` is an object XCL adopted (its vtable is one of XCL's).
 pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
     !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))

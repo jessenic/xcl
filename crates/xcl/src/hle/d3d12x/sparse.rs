@@ -555,6 +555,111 @@ fn sparse_cool() -> bool {
 /// never under it.
 static READBACK: Mutex<()> = Mutex::new(());
 
+/// lab `XCL_SPARSE_MAP_NOWAIT=1` (off by default): 0 not read yet, 1 off, 2 on
+static MAP_NOWAIT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// lab `XCL_SPARSE_MAP_NOWAIT=1`: a title's Map of sparse memory (`readback_now`) copies back
+/// on a copy queue of its own, ordered after the state's queue on the GPU (`map_copy_released`),
+/// instead of on the state's queue, whose copy waits for the GPU's 3D engine (the title's lists)
+/// to get to it; and a Map of a range none of whose tiles has video memory copies nothing back.
+/// Not a skip of the copy when the asynchronous copies back cover the range: those only cover
+/// what the title's copies, fills and value writes wrote (`list_x` note_write), not its shaders'
+/// writes, which only the Map's copy brings back.
+pub(super) fn map_nowait() -> bool {
+    match MAP_NOWAIT.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var("XCL_SPARSE_MAP_NOWAIT").is_ok_and(|v| v == "1");
+            MAP_NOWAIT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            if on {
+                crate::xlog_info!("lab XCL_SPARSE_MAP_NOWAIT=1: a Map's copy back runs on a copy queue ordered after the sparse queue; a Map of a range without video memory copies nothing");
+            }
+            on
+        }
+        v => v == 2,
+    }
+}
+
+/// tests: the switch as `on` says (None: read from the environment again)
+#[cfg(test)]
+fn set_map_nowait(on: Option<bool>) {
+    MAP_NOWAIT.store(
+        match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// lab `XCL_SPARSE_MAP_NOWAIT=1`: the copy queue of a Map's copy back, its fence and last
+/// value, its list and its readback buffer (`READBACK_STAGING` bytes, mapped at `ptr`), for the
+/// device `dev`. Made with the device's original creators (`real::pc_vtable`): the queue is not
+/// adopted, so its submits do not go through the title's ExecuteCommandLists hook nor into
+/// `list_x`'s queues (a title DMA list without a queue must never be given this one).
+struct MapCopy {
+    dev: usize,
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    value: u64,
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    buf: ID3D12Resource,
+    ptr: *mut u8,
+}
+
+unsafe impl Send for MapCopy {}
+
+/// The Map copy queue (`MapCopy`), made at the first Map with the switch on. Taken right after
+/// `READBACK`, before `STATE`.
+static MAP_COPY: Mutex<Option<MapCopy>> = Mutex::new(None);
+
+impl MapCopy {
+    unsafe fn new(dev: &ID3D12Device) -> Option<MapCopy> {
+        let d = dev.as_raw();
+        let v = &*(super::real::pc_vtable(d) as *const ID3D12Device_Vtbl);
+        let desc = D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() };
+        let mut p: *mut c_void = std::ptr::null_mut();
+        if (v.CreateCommandQueue)(d, &desc, &ID3D12CommandQueue::IID, &mut p).is_err() || p.is_null() {
+            return None;
+        }
+        let queue = ID3D12CommandQueue::from_raw(p);
+        let mut p: *mut c_void = std::ptr::null_mut();
+        if (v.CreateFence)(d, 0, D3D12_FENCE_FLAG_NONE, &ID3D12Fence::IID, &mut p).is_err() || p.is_null() {
+            return None;
+        }
+        let fence = ID3D12Fence::from_raw(p);
+        let mut p: *mut c_void = std::ptr::null_mut();
+        if (v.CreateCommandAllocator)(d, D3D12_COMMAND_LIST_TYPE_COPY, &ID3D12CommandAllocator::IID, &mut p).is_err() || p.is_null() {
+            return None;
+        }
+        let alloc = ID3D12CommandAllocator::from_raw(p);
+        let mut p: *mut c_void = std::ptr::null_mut();
+        if (v.CreateCommandList)(d, 0, D3D12_COMMAND_LIST_TYPE_COPY, alloc.as_raw(), std::ptr::null_mut(), &ID3D12GraphicsCommandList::IID, &mut p).is_err() || p.is_null() {
+            return None;
+        }
+        let list = ID3D12GraphicsCommandList::from_raw(p);
+        list.Close().ok()?;
+        let _ = queue.SetName(windows::core::w!("xcl sparse map copy queue"));
+        let _ = list.SetName(windows::core::w!("xcl sparse map copy list"));
+        // (the readback buffer as `readback_buf` makes the state's, with the original creator too)
+        let mut bd = buffer_desc(READBACK_STAGING as u64);
+        bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let mut p: *mut c_void = std::ptr::null_mut();
+        if (v.CreateCommittedResource)(d, &heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, std::ptr::null(), &ID3D12Resource::IID, &mut p).is_err() || p.is_null() {
+            return None;
+        }
+        let buf = ID3D12Resource::from_raw(p);
+        let mut mp: *mut c_void = std::ptr::null_mut();
+        super::call_stats::cs!(Map, buf.Map(0, None, Some(&mut mp))).ok()?;
+        if mp.is_null() {
+            return None;
+        }
+        Some(MapCopy { dev: d as usize, queue, fence, value: 0, alloc, list, buf, ptr: mp as *mut u8 })
+    }
+}
+
 /// Wait, 5 s at most, until `fence` has reached `target` (true: it has; a removed device counts).
 /// Not for a holder of `STATE`: `wait_released`.
 unsafe fn wait_fence(fence: &ID3D12Fence, target: u64) -> bool {
@@ -1502,6 +1607,71 @@ impl State {
         (cur, parts)
     }
 
+    /// Whether a tile of `[va, va + len)` has video memory (`mapped`)
+    fn any_mapped(&self, va: usize, len: usize) -> bool {
+        let end = va.saturating_add(len);
+        let mut t = va & !(TILE - 1);
+        while t < end {
+            if self.mapped.contains_key(&t) {
+                return true;
+            }
+            t += TILE;
+        }
+        false
+    }
+
+    /// `readback_submit` on the Map copy queue `m` (lab `XCL_SPARSE_MAP_NOWAIT=1`): what
+    /// `[from, end)` has in sparse VRAM into `m`'s buffer, as much as fits, the same parts as
+    /// `readback_submit` makes. The copy queue first waits, on the GPU, for a signal of the state's
+    /// queue after all that was submitted to it so far (the Map's CPU writes uploaded, tiles mapped
+    /// and cleared): the copy reads what the one on the state's queue would read, but does not wait
+    /// behind the title's lists for the 3D engine. Later work on the state's queue is not ordered
+    /// after it (nor needs to be: a copy back is a snapshot of VRAM after the Map was called).
+    /// None: the copy queue could not be ordered after the state's queue (nothing submitted;
+    /// the caller copies on the state's queue instead).
+    unsafe fn map_copy_submit(&mut self, m: &mut MapCopy, from: usize, end: usize) -> Option<(usize, Vec<(usize, usize, usize)>)> {
+        let mut parts: Vec<(usize, usize, usize)> = Vec::new();
+        let mut used = 0usize;
+        let mut cur = from;
+        while cur < end && used < READBACK_STAGING {
+            let tile = cur & !(TILE - 1);
+            let Some(wi) = self.window_index(cur) else {
+                cur = end;
+                break;
+            };
+            let b = self.windows[wi].0;
+            let to_tile_end = (tile + TILE) - cur;
+            if !self.mapped.contains_key(&tile) {
+                cur += (end - cur).min(to_tile_end);
+                continue;
+            }
+            let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
+            let chunk = (end - cur).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
+            if parts.is_empty() {
+                let _ = m.alloc.Reset();
+                let _ = m.list.Reset(&m.alloc, None);
+            }
+            super::call_stats::cs!(RecCopyBuffer, m.list.CopyBufferRegion(&m.buf, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64));
+            parts.push((cur, used, chunk));
+            used += chunk;
+            cur += chunk;
+        }
+        if parts.is_empty() {
+            return Some((cur, parts));
+        }
+        let closed = m.list.Close().is_ok();
+        // everything on the state's queue so far comes first
+        self.signal();
+        if !closed || super::call_stats::cs!(QueueWait, m.queue.Wait(&self.fence, self.value)).is_err() {
+            return None;
+        }
+        let Ok(l) = m.list.cast::<ID3D12CommandList>() else { return None };
+        m.queue.ExecuteCommandLists(&[Some(l)]);
+        m.value += 1;
+        let _ = super::call_stats::cs!(QueueSignal, m.queue.Signal(&m.fence, m.value));
+        Some((cur, parts))
+    }
+
     /// A copy back's list and a readback buffer of at least `need` bytes (reused when one fits)
     unsafe fn rb_job(&mut self, need: usize) -> Option<RbJob> {
         if let Some(i) = self.rb_pool.iter().enumerate().filter(|(_, j)| j.cap >= need).min_by_key(|(_, j)| j.cap).map(|(i, _)| i) {
@@ -2003,6 +2173,8 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         return;
     }
     let _one = READBACK.lock().unwrap();
+    // lab XCL_SPARSE_MAP_NOWAIT=1: the Map copy queue (taken after READBACK, before STATE)
+    let mut mc = map_nowait().then(|| MAP_COPY.lock().unwrap_or_else(|e| e.into_inner()));
     let mut g = lock_state();
     if g.as_ref().is_none_or(|s| s.window_index(va).is_none()) {
         return;
@@ -2012,6 +2184,13 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     g = again;
     let Some(mut s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
+        return;
+    }
+    // lab XCL_SPARSE_MAP_NOWAIT=1: no tile of the range has video memory, so the copy below
+    // would copy nothing (`readback_submit` and `copy_back` skip such tiles); the earlier copies
+    // back are landed above as without the switch
+    if mc.is_some() && !s.any_mapped(va, len) {
+        note_map_without_vram(va, len);
         return;
     }
     // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`, a part at a
@@ -2051,7 +2230,72 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
-    readback_released(g, &[(va, len)]);
+    match mc.as_deref_mut() {
+        Some(mc) => map_copy_released(g, mc, va, len),
+        None => readback_released(g, &[(va, len)]),
+    }
+}
+
+/// lab `XCL_SPARSE_MAP_NOWAIT=1`: Maps of ranges without video memory, no copy back made
+static MAPS_WITHOUT_VRAM: AtomicU64 = AtomicU64::new(0);
+
+fn note_map_without_vram(va: usize, len: usize) {
+    let k = MAPS_WITHOUT_VRAM.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 8 || k.is_power_of_two() {
+        crate::xlog_info!("lab XCL_SPARSE_MAP_NOWAIT=1: Map #{k} of {va:#x} ({len} bytes) has no tile with video memory: no copy back");
+    }
+}
+
+/// `readback_released` of `[va, va + len)` on the Map copy queue (lab `XCL_SPARSE_MAP_NOWAIT=1`,
+/// `State::map_copy_submit`), each part waited for with `STATE` released and copied into the
+/// pages still committed then, as there. Where the copy queue cannot be made or ordered, the
+/// rest goes on the state's queue (`readback_released`). The caller holds `READBACK` and
+/// `MAP_COPY` (`mc`).
+unsafe fn map_copy_released(mut g: MutexGuard<'static, Option<State>>, mc: &mut Option<MapCopy>, va: usize, len: usize) {
+    let end = va + len;
+    let mut at = va;
+    while at < end {
+        let Some(s) = g.as_mut() else { return };
+        let dev = s.dev.as_raw() as usize;
+        if mc.as_ref().is_none_or(|m| m.dev != dev) {
+            *mc = MapCopy::new(&s.dev);
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_info!("lab XCL_SPARSE_MAP_NOWAIT=1: Map copy queue {}", if mc.is_some() { "made" } else { "not made: copies back on the sparse queue" });
+            }
+        }
+        let Some(m) = mc.as_mut() else {
+            return readback_released(g, &[(at, end - at)]);
+        };
+        // (a copy given up earlier: its list and buffer are still in use)
+        if m.value != 0 && super::real::fence_completed(&m.fence) < m.value {
+            let (f, v) = (m.fence.clone(), m.value);
+            drop(g);
+            let reached = wait_fence(&f, v);
+            g = lock_state();
+            if !reached {
+                return;
+            }
+            continue;
+        }
+        let Some((next, parts)) = s.map_copy_submit(m, at, end) else {
+            return readback_released(g, &[(at, end - at)]);
+        };
+        at = next;
+        if parts.is_empty() {
+            continue;
+        }
+        let (f, v) = (m.fence.clone(), m.value);
+        drop(g);
+        let reached = wait_fence(&f, v);
+        g = lock_state();
+        if !reached {
+            return;
+        }
+        if let Some(s) = g.as_mut().filter(|s| s.dev.as_raw() as usize == m.dev) {
+            s.copy_back(m.ptr, &parts);
+        }
+    }
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
@@ -3846,5 +4090,109 @@ mod tests {
             assert!(took_on < std::time::Duration::from_millis(1), "on: the probe does not wait for the sparse state's lock ({took_on:?})");
             println!("fence probe with the state held and a copy back pending: off {took_off:?}, on {took_on:?}");
         }
+    }
+
+    /// An upload buffer of `words` dwords, `f(i)` in dword `i`.
+    unsafe fn lab_upload(dev: &ID3D12Device, words: usize, f: impl Fn(u32) -> u32) -> ID3D12Resource {
+        let mut up: Option<ID3D12Resource> = None;
+        let mut d = buffer_desc((words * 4) as u64);
+        d.Flags = D3D12_RESOURCE_FLAG_NONE;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut up)
+            .expect("upload buffer");
+        let up = up.expect("upload buffer");
+        let mut p: *mut c_void = std::ptr::null_mut();
+        up.Map(0, None, Some(&mut p)).expect("Map");
+        for i in 0..words {
+            *(p as *mut u32).add(i) = f(i as u32);
+        }
+        up
+    }
+
+    /// lab `XCL_SPARSE_MAP_NOWAIT=1`: a Map's copy back on the Map copy queue reads what the copy
+    /// on the state's queue reads (same parts, same bytes; the tile without video memory left
+    /// out by both), and only once all that was on the state's queue before it is done.
+    #[test]
+    fn a_map_copy_on_the_copy_queue_reads_what_the_state_queue_copy_reads() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            // tile 0: committed, with video memory; tile 1: neither
+            assert!(!VirtualAlloc(base as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            s.commit_range(base, TILE);
+            assert!(s.any_mapped(base, 1) && s.any_mapped(base + TILE - 1, 2) && s.any_mapped(base, 2 * TILE));
+            assert!(!s.any_mapped(base + TILE, TILE), "tile 1 has no video memory");
+            let reserved = s.windows[0].1.clone();
+            let dev = s.dev.clone();
+
+            // the title's GPU writes 0..1024 of tile 0, and is done
+            let up = lab_upload(&dev, 512, |i| if i < 256 { 0xA000_0000 | i } else { 0xB000_0000 | i });
+            let title: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            list.CopyBufferRegion(&reserved, 0, &up, 0, 1024);
+            list.Close().expect("close");
+            title.Wait(&s.fence, s.value).expect("wait for the tile mapping");
+            title.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            let own: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("own fence");
+            title.Signal(&own, 1).expect("own signal");
+            assert!(wait_fence(&own, 1), "the title's copy finishes");
+            std::ptr::write_bytes(base as *mut u8, 0, 1024);
+
+            // switch off: the copy on the state's queue (`readback_released`'s steps)
+            let (rb, p) = s.readback_buf().expect("readback buffer");
+            let (next_off, parts_off) = s.readback_submit(&rb, base, base + 2 * TILE);
+            s.wait_for(s.value);
+            s.copy_back(p, &parts_off);
+            let off: Vec<u32> = (0..256).map(|i| *(base as *const u32).add(i)).collect();
+            assert_eq!(off[0], 0xA000_0000);
+            assert_eq!(off[255], 0xA000_00FF);
+            std::ptr::write_bytes(base as *mut u8, 0, 1024);
+
+            // switch on: the same range on the Map copy queue
+            let mut m = MapCopy::new(&dev).expect("Map copy queue");
+            assert!(!super::super::real::is_adopted(m.queue.as_raw()), "the copy queue is not adopted");
+            let (next_on, parts_on) = s.map_copy_submit(&mut m, base, base + 2 * TILE).expect("ordered after the state's queue");
+            assert!(wait_fence(&m.fence, m.value), "the Map copy finishes");
+            s.copy_back(m.ptr, &parts_on);
+            let on: Vec<u32> = (0..256).map(|i| *(base as *const u32).add(i)).collect();
+            assert_eq!((next_on, &parts_on), (next_off, &parts_off), "the same parts");
+            assert_eq!(on, off, "the same bytes, switch on and off");
+
+            // ordering: work on the state's queue held by a gate (a CPU write being uploaded) comes
+            // first; the Map copy reads it once the gate opens, not before
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate");
+            let alloc2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+            let list2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc2, None).expect("list");
+            list2.CopyBufferRegion(&reserved, 0, &up, 1024, 1024);
+            list2.Close().expect("close");
+            s.queue.Wait(&gate, 1).expect("gate the state's queue");
+            s.queue.ExecuteCommandLists(&[Some(list2.cast::<ID3D12CommandList>().unwrap())]);
+            let (_, parts) = s.map_copy_submit(&mut m, base, base + 1024).expect("ordered after the state's queue");
+            assert_eq!(parts, vec![(base, 0, 1024)]);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(super::super::real::fence_completed(&m.fence) < m.value, "the Map copy does not run before the state's queue gets past the gate");
+            gate.Signal(1).expect("open the gate");
+            assert!(wait_fence(&m.fence, m.value), "the Map copy finishes after the gate");
+            s.copy_back(m.ptr, &parts);
+            for i in 0..256u32 {
+                assert_eq!(*(base as *const u32).add(i as usize), 0xB000_0000 | (256 + i), "dword {i}: the upload ahead of the copy on the state's queue");
+            }
+            s.wait_for(s.value);
+            drop(m);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// lab `XCL_SPARSE_MAP_NOWAIT`: off unless the environment says 1 (the tests run with it unset).
+    #[test]
+    fn the_map_switch_is_off_unless_set() {
+        set_map_nowait(None);
+        if std::env::var_os("XCL_SPARSE_MAP_NOWAIT").is_none() {
+            assert!(!map_nowait(), "off by default");
+        }
+        set_map_nowait(Some(true));
+        assert!(map_nowait());
+        set_map_nowait(None);
     }
 }
