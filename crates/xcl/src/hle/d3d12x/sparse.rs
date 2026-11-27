@@ -2225,7 +2225,7 @@ impl State {
     unsafe fn drain_quarantined(&mut self) -> bool {
         let mut freed = false;
         while let Some(front) = self.quarantined.front() {
-            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v));
+            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| super::real::probe_completed(f) >= *v));
             if !ready {
                 break;
             }
@@ -3788,6 +3788,63 @@ mod tests {
             }
             let decommit = t.elapsed();
             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
+        }
+    }
+
+    /// A D3D12 device for the lab switch tests (WARP if there is no GPU).
+    unsafe fn lab_device() -> ID3D12Device {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+        }
+        dev.expect("D3D12 device")
+    }
+
+    /// Puts a lab switch back to "read from the environment" and `RB_PENDING` back, also when
+    /// a test panics.
+    struct LabRestore(fn(), usize);
+
+    impl Drop for LabRestore {
+        fn drop(&mut self) {
+            (self.0)();
+            RB_PENDING.fetch_sub(self.1, Ordering::Release);
+        }
+    }
+
+    /// lab `XCL_FENCE_DIRECT=1`: XCL's own probe of an adopted fence reads the same value with
+    /// the switch on and off. Off it is the COM call, the title's hook: with copies back pending
+    /// and the sparse state held (here by this thread, as `drain_quarantined` holds it), the hook
+    /// tries the lock for ~2 ms. On it reads the PC's value and does not wait for that lock.
+    #[test]
+    fn a_direct_fence_probe_reads_the_same_value_without_the_hooks_wait() {
+        use crate::hle::d3d12x::real;
+        unsafe {
+            let dev = lab_device();
+            let fence: ID3D12Fence = dev.CreateFence(5, D3D12_FENCE_FLAG_NONE).expect("fence");
+            fence.Signal(9).expect("CPU signal");
+            real::adopt(fence.as_raw(), real::Kind::Fence);
+            assert!(real::is_adopted(fence.as_raw()), "the fence is adopted (the title's hooks)");
+            RB_PENDING.fetch_add(1, Ordering::Release);
+            let _restore = LabRestore(|| real::set_fence_direct(None), 1);
+            let held = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            real::set_fence_direct(Some(false));
+            let t = std::time::Instant::now();
+            let off = real::probe_completed(&fence);
+            let took_off = t.elapsed();
+            real::set_fence_direct(Some(true));
+            let t = std::time::Instant::now();
+            let on = real::probe_completed(&fence);
+            let took_on = t.elapsed();
+            drop(held);
+            assert_eq!((off, on), (9, 9), "the same completed value, switch off and on");
+            assert_eq!(fence.GetCompletedValue(), 9, "the COM call agrees");
+            assert!(took_off >= std::time::Duration::from_millis(2), "off: the probe is the title's hook, which tries the lock ~2 ms ({took_off:?})");
+            assert!(took_on < std::time::Duration::from_millis(1), "on: the probe does not wait for the sparse state's lock ({took_on:?})");
+            println!("fence probe with the state held and a copy back pending: off {took_off:?}, on {took_on:?}");
         }
     }
 }

@@ -1282,7 +1282,7 @@ static INTERNAL_WAITS: Mutex<Option<HashMap<usize, Vec<InternalWait>>>> = Mutex:
 pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D12Fence, value: u64) {
     let mut g = INTERNAL_WAITS.lock().unwrap();
     let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
-    waits.retain(|w| unsafe { w.fence.GetCompletedValue() } < w.value);
+    waits.retain(|w| unsafe { super::real::probe_completed(&w.fence) } < w.value);
     waits.push(InternalWait { what, fence: fence.clone(), value, at: Instant::now() });
 }
 
@@ -1294,7 +1294,7 @@ fn internal_waits_summary() -> String {
             .flat_map(|m| m.iter())
             .flat_map(|(&q, waits)| waits.iter().map(move |w| (q, w)))
             .filter_map(|(q, w)| {
-                let done = unsafe { w.fence.GetCompletedValue() };
+                let done = unsafe { super::real::probe_completed(&w.fence) };
                 (done < w.value).then(|| (q, format!("{} >= {:#x} (done {done:#x}, {} ms)", w.what, w.value, w.at.elapsed().as_millis())))
             })
             .collect()

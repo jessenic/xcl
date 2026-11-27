@@ -171,7 +171,7 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     for &l in lists {
         let l = l as usize;
         let Some(last) = s.last_submit.get(&l) else { continue };
-        if last.fence.GetCompletedValue() >= last.value {
+        if super::real::probe_completed(&last.fence) >= last.value {
             continue;
         }
         let same_recording = s.recordings.get(&l).copied().unwrap_or(0) == last.recording;
@@ -194,7 +194,7 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
 /// submitted again before that; `title_list` records the title's next recording elsewhere).
 pub fn in_flight(list: usize) -> bool {
     let g = STATE.lock().unwrap();
-    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
+    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { super::real::probe_completed(&l.fence) } < l.value)
 }
 
 /// `lists` were just submitted to `queue`.
@@ -235,7 +235,7 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
     let g = STATE.lock().unwrap();
     let Some(s) = g.as_ref() else { return false };
     let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
-    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v));
+    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| super::real::probe_completed(f) < *v));
     busy
 }
 

@@ -8507,6 +8507,53 @@ pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
     f(p)
 }
 
+/// lab `XCL_FENCE_DIRECT=1` (off by default): 0 not read yet, 1 off, 2 on
+static FENCE_DIRECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// lab `XCL_FENCE_DIRECT=1`: XCL's own probes of a fence (`probe_completed`) read the PC's
+/// value (`fence_completed`), not the title's hooked GetCompletedValue.
+pub(super) fn fence_direct() -> bool {
+    match FENCE_DIRECT.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var("XCL_FENCE_DIRECT").is_ok_and(|v| v == "1");
+            FENCE_DIRECT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            if on {
+                crate::xlog_info!("lab XCL_FENCE_DIRECT=1: XCL's own fence probes read the PC's value, without the title hook's settle of copies back");
+            }
+            on
+        }
+        v => v == 2,
+    }
+}
+
+/// tests: the switch as `on` says (None: read from the environment again)
+#[cfg(test)]
+pub(super) fn set_fence_direct(on: Option<bool>) {
+    FENCE_DIRECT.store(
+        match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// The completed value of `fence` for one of XCL's own probes (alloc_pool, sparse quarantine,
+/// list_x internal waits, vram): the COM call as before (on an adopted fence that is the title's
+/// hook, `fence_get_completed_value`), or with `XCL_FENCE_DIRECT=1` the PC's value. The hook
+/// adds `sparse::settle_readbacks_try`, which spins ~2 ms for the sparse state's lock while
+/// another thread holds it, and always does when its own caller holds it (`drain_quarantined`).
+/// The value read is the same; what the probe leaves out is an early landing of copies back,
+/// which the title's own fence calls, `fence_wait_fired` and the readback thread still do.
+pub(super) unsafe fn probe_completed(fence: &ID3D12Fence) -> u64 {
+    if fence_direct() {
+        fence_completed(fence)
+    } else {
+        fence.GetCompletedValue()
+    }
+}
+
 /// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
 /// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land first.
 unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {

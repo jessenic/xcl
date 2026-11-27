@@ -934,7 +934,7 @@ impl Pages {
         sorted.sort_unstable();
         for chunk in sorted.chunks(SCRUB_TILES) {
             // a list whose last copy has run, or a new one
-            let done = self.fence.GetCompletedValue();
+            let done = super::real::probe_completed(&self.fence);
             let Some(sc) = self.scrub.as_mut() else { return };
             let k = match sc.lists.iter().position(|l| l.2 <= done) {
                 Some(k) => k,
@@ -1142,7 +1142,7 @@ impl Pages {
                 let slot = &z.slots[z.next_slot];
                 (slot.alloc.clone(), slot.list.clone(), slot.fence_val, z.scratch_buf.clone(), z.zero_buf.clone())
             };
-            if fence_val > 0 && self.fence.GetCompletedValue() < fence_val {
+            if fence_val > 0 && super::real::probe_completed(&self.fence) < fence_val {
                 let _ = super::call_stats::cs!(FenceSetEvent, self.fence.SetEventOnCompletion(fence_val, windows::Win32::Foundation::HANDLE::default()));
             }
             if alloc.Reset().is_err() || list.Reset(&alloc, None).is_err() {
@@ -1916,7 +1916,7 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
         let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
         let before = rq.batches.len();
         let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| q.Signal(f, v).is_ok());
-        let (done, pruned) = rq.sweep_with(&live_keys, |f| f.GetCompletedValue());
+        let (done, pruned) = rq.sweep_with(&live_keys, |f| super::real::probe_completed(f));
         RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);
         (immediate, done, pruned)
     };
