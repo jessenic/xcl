@@ -748,6 +748,16 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// tests: held by every test that flips a process-wide lab switch, swaps or holds `STATE`, or reads
+/// counters other tests move (cargo runs tests in parallel)
+#[cfg(test)]
+pub(super) static LAB_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(super) fn lab_test_lock() -> MutexGuard<'static, ()> {
+    LAB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The state's queue again, outside `STATE` (`queue`). `STATE` is held around D3D12 calls (an
 /// upload's allocator `Reset` in `begin_slot`), and `late_release` asks for the queue from a
 /// resource's last `Release`, which D3D12 can make inside a call of its own on another thread

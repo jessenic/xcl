@@ -783,13 +783,28 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
     }
 }
 
+/// `t.remove(res)`; with `XCL_FILTER_INDEX` (`index`) `TEXTURES_GEN` moves here, with `TEXTURES` still
+/// held, when something was removed. `remove` puts shadowed aliases of the same memory back in the
+/// table, and one not unmapped comes back not pending: the filter index only finds it once rebuilt,
+/// and `forget` moved the generation only after letting the lock go and remapping. A submit in
+/// between reused the index built without it and left its written pages unread (the write watch is
+/// reset by then): stale bytes until the next CPU write there. The plain filter (switch off) reads
+/// the table itself, so off nothing changes (its later bump stays).
+fn remove_for_index(t: &mut Table, res: usize, index: bool) -> (bool, isize, Vec<usize>) {
+    let r = t.remove(res);
+    if index && r.0 {
+        TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    }
+    r
+}
+
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
     LAST_CONTENT.lock().unwrap().remove(&res);
     STREAM_RECHECK.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
-        let (removed, delta, remap_ptrs) = t.remove(res);
+        let (removed, delta, remap_ptrs) = remove_for_index(&mut t, res, filter_index_on());
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         (removed, unsafe { clone_resources(&remap_ptrs) })
@@ -4399,5 +4414,55 @@ mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    /// `XCL_FILTER_INDEX` (review F2): a texture shadowed by another over part of its memory comes back
+    /// when that one is released, not pending. With the index on, the release moves `TEXTURES_GEN` with
+    /// the lock held, so the next filter rebuilds the index and finds it on a written page, as the plain
+    /// filter does; without that bump (the old order: after the lock) the cached index misses it.
+    #[test]
+    fn a_texture_back_from_the_shadow_is_found_by_the_filter_index() {
+        let _serial = super::super::sparse::lab_test_lock();
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let size = tex.size() as usize;
+        assert!(size > 0x1000, "the texture spans more than a page");
+        let entry = |va: usize| Entry {
+            device: 0,
+            va,
+            src: Source::At(va),
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        };
+        const A: usize = 0x7E50_0000_0000;
+        const Y: usize = 0x5100;
+        const X: usize = 0x5200;
+        for bump in [true, false] {
+            let mut t = Table::new();
+            t.insert(Y, entry(A));
+            t.insert(X, entry(A + 0x1000));
+            assert!(t.shadowed.contains_key(&Y) && t.by_res.contains_key(&X), "Y shadowed by X over part of its memory");
+            // the index as a submit before the release built it (cached at a generation of this table)
+            TEXTURES_GEN.fetch_add(1, Ordering::Release);
+            let _ = filter_index(&t);
+            let (removed, _, _) = remove_for_index(&mut t, X, bump);
+            assert!(removed);
+            let e = t.by_res.get(&Y).expect("Y back in the table");
+            assert!(!e.pending, "Y comes back not pending (not unmapped)");
+            // the CPU wrote Y's first page, which only Y covers
+            let picked = filter_candidates(&t, &[A], 0x1000);
+            let plain = e.src.written(size, &[A], 0x1000);
+            assert!(plain, "the plain filter finds Y");
+            if bump {
+                assert_eq!(picked, vec![Y], "index on, generation moved under the lock: Y found");
+            } else {
+                assert!(picked.is_empty(), "the old order (generation not moved yet): the cached index misses Y");
+            }
+        }
     }
 }
