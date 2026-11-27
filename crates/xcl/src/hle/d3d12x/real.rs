@@ -1585,7 +1585,7 @@ pub(super) unsafe fn place_outside_buffer(this: *mut c_void, va: usize, desc: &[
             // (whether the title has CPU pages at its address: then it may write the buffer there,
             // and nothing carries those writes to the sparse windows yet)
             let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            windows_sys::Win32::System::Memory::VirtualQuery(va as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
+            super::call_stats::cs!(VirtualQuery, windows_sys::Win32::System::Memory::VirtualQuery(va as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)));
             let committed = mbi.State == 0x1000;
             static COMMITTED: AtomicU64 = AtomicU64::new(0);
             let c = COMMITTED.fetch_add(committed as u64, Ordering::Relaxed) + committed as u64;
@@ -8497,6 +8497,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
 /// with every submitting thread behind it.
 pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
     const PC_GET_COMPLETED_VALUE: usize = 8;
+    let _cs = super::call_stats::time(super::call_stats::C::FenceCompleted);
     let p = fence.as_raw();
     let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_adopted(p) {
         std::mem::transmute(orig_fn(p, slot_of(p, "GetCompletedValue")))
@@ -8509,6 +8510,7 @@ pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
 /// Fence::GetCompletedValue. What the title's lists wrote into its sparse memory comes back
 /// asynchronously (`sparse::readback_after_execute`): the copies back the value covers land first.
 unsafe extern "system" fn fence_get_completed_value(this: *mut c_void) -> u64 {
+    let _cs = super::call_stats::time(super::call_stats::C::TitleFenceCompleted);
     let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, slot_of(this, "GetCompletedValue")));
     let v = f(this);
     super::sparse::settle_readbacks_try();
@@ -8545,6 +8547,7 @@ unsafe extern "system" fn fence_wait_fired(ctx: *mut c_void, _timed_out: bool) {
 /// (a blocking wait) settles them after it.
 unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
     use windows_sys::Win32::System::Threading::{CreateEventW, RegisterWaitForSingleObject, UnregisterWaitEx, INFINITE, WT_EXECUTEONLYONCE};
+    let _cs = super::call_stats::time(super::call_stats::C::TitleFenceSetEvent);
     let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
     if event.is_null() || !super::sparse::readbacks_async() {
         let hr = f(this, value, event);
@@ -8578,6 +8581,7 @@ unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value
 
 /// Fence::Signal (CPU)
 unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT {
+    let _cs = super::call_stats::time(super::call_stats::C::TitleFenceSignal);
     let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
     let hr = f(this, value);
     super::fence_x::note_cpu_signal(this as usize);
@@ -8597,19 +8601,27 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
     let submit_t0 = std::time::Instant::now();
+    // lab (`XCL_CALL_STATS`): the whole hook, the title's lists and XCL's own apart; the calls
+    // made inside a title's submit go to the "in submits" bank too
+    use super::call_stats::{cs, C as Cs};
+    let own = super::title_textures::is_own_work();
+    let _cs_whole = super::call_stats::time(if own { Cs::OwnExecute } else { Cs::TitleExecute });
+    let _cs_bank = (!own && super::call_stats::on()).then(super::call_stats::in_submit);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
-    for &l in std::slice::from_raw_parts(lists, n as usize) {
-        if let Some(pc) = super::console_list::pc_list(l) {
-            mapped.push(pc);
-        } else {
-            super::list_x::record_deferred(l);
-            if !super::title_list::push_segments(l, &mut mapped) {
-                mapped.push(l);
+    cs!(MapLists, {
+        for &l in std::slice::from_raw_parts(lists, n as usize) {
+            if let Some(pc) = super::console_list::pc_list(l) {
+                mapped.push(pc);
+            } else {
+                super::list_x::record_deferred(l);
+                if !super::title_list::push_segments(l, &mut mapped) {
+                    mapped.push(l);
+                }
             }
         }
-    }
+    });
     removed_probe("execute: start");
     // page budget: evicted textures these lists transition are mapped again, uploaded below.
     // Not for XCL's own lists: the zeroing of target pages submits under the pages lock, and a
@@ -8617,35 +8629,37 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // (lab run G1: the title stood still from 72 s, its watchdog ended it at 101 s; the stalls of
     // F1 / F2 / T2 look the same, not checked). They are mapped again at the title's next submit.
     if !super::title_textures::is_own_work() {
-        super::title_textures::revive_listed(&mapped);
+        cs!(ReviveListed, super::title_textures::revive_listed(&mapped));
     }
     removed_probe("execute: after revive_listed");
     // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize));
+    cs!(Refresh, super::title_textures::refresh_for(this, std::slice::from_raw_parts(lists, n as usize)));
     removed_probe("execute: after refresh");
-    super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::gpu_profile::note_queue(this);
+    cs!(NoteQueueForLists, super::list_x::note_queue_for_lists(this as usize, &mapped));
+    cs!(GpuProfileNoteQueue, super::gpu_profile::note_queue(this));
+    let cs_waits = super::call_stats::time(Cs::ExecuteWithWaits);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         removed_probe("execute: before the PC call");
-        let _ = super::alloc_pool::note_resubmits(this, chunk);
+        let _ = cs!(NoteResubmits, super::alloc_pool::note_resubmits(this, chunk));
         let t = std::time::Instant::now();
-        f(this, chunk.len() as u32, chunk.as_ptr());
+        cs!(DriverExecute, f(this, chunk.len() as u32, chunk.as_ptr()));
         let t1 = std::time::Instant::now();
         super::submit_cost::driver(t1 - t);
         removed_probe("execute: after the PC call");
-        super::list_x::copy_scratch_submitted(this, chunk);
-        super::alloc_pool::executed(this, chunk);
+        cs!(CopyScratchSubmitted, super::list_x::copy_scratch_submitted(this, chunk));
+        cs!(AllocPoolExecuted, super::alloc_pool::executed(this, chunk));
         removed_probe("execute: after alloc_pool::executed");
-        super::list_x::signal_write64_fences(this, chunk);
-        super::list_x::readback_sparse_writes(this, chunk);
+        cs!(SignalWrite64Fences, super::list_x::signal_write64_fences(this, chunk));
+        cs!(ReadbackSparseWrites, super::list_x::readback_sparse_writes(this, chunk));
         removed_probe("execute: after readback_sparse_writes");
-        super::list_x::cpu_writes_after(this, chunk);
+        cs!(CpuWritesAfter, super::list_x::cpu_writes_after(this, chunk));
         removed_probe("execute: after cpu_writes_after");
         super::submit_cost::after(t1.elapsed());
     });
+    drop(cs_waits);
     // the next uploads into textures kept in step start from the states these lists leave
-    super::title_textures::submitted(&mapped);
-    super::present::note_execute(this, &mapped);
+    cs!(Submitted, super::title_textures::submitted(&mapped));
+    cs!(PresentNoteExecute, super::present::note_execute(this, &mapped));
     removed_probe("execute: end");
     stop_if_device_removed();
     super::submit_cost::done(submit_t0);
@@ -8813,6 +8827,7 @@ pub fn removed_probe(site: &'static str) {
     if !*ON.get_or_init(|| std::env::var("XCL_REMOVED_PROBE").is_ok_and(|v| v.trim() == "1")) {
         return;
     }
+    let _cs = super::call_stats::time(super::call_stats::C::RemovedProbe);
     let raw = device_raw();
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {

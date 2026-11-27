@@ -111,7 +111,7 @@ unsafe fn query_tile_holes(tile: usize) -> u16 {
     while cur < end {
         let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         // SAFETY: `VirtualQuery` inspects process virtual memory metadata without dereferencing `cur`.
-        let n = VirtualQuery(cur as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>());
+        let n = super::call_stats::cs!(VirtualQuery, VirtualQuery(cur as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()));
         if n == 0 || mbi.RegionSize == 0 {
             break;
         }
@@ -576,8 +576,8 @@ unsafe fn wait_fence(fence: &ID3D12Fence, target: u64) -> bool {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {at})");
             return false;
         }
-        if !event.is_invalid() && fence.SetEventOnCompletion(target, event).is_ok() {
-            WaitForSingleObject(event, left);
+        if !event.is_invalid() && super::call_stats::cs!(FenceSetEvent, fence.SetEventOnCompletion(target, event)).is_ok() {
+            super::call_stats::cs!(EventWait, WaitForSingleObject(event, left));
         } else {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -1051,7 +1051,7 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
-            self.queue.UpdateTileMappings(
+            super::call_stats::cs!(UpdateTileMappings, self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
                 Some(coords.as_ptr()),
@@ -1062,7 +1062,7 @@ impl State {
                 Some(offsets.as_ptr()),
                 Some(counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
-            );
+            ));
         }
         super::real::removed_probe("sparse: after map_tiles");
     }
@@ -1091,7 +1091,7 @@ impl State {
             counts.push(run);
             i += run as usize;
         }
-        self.queue.UpdateTileMappings(
+        super::call_stats::cs!(UpdateTileMappings, self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
             Some(coords.as_ptr()),
@@ -1102,7 +1102,7 @@ impl State {
             None,
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
-        );
+        ));
     }
 
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
@@ -1163,7 +1163,7 @@ impl State {
     #[inline]
     unsafe fn signal(&mut self) {
         self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
     }
 
     #[inline]
@@ -1177,9 +1177,9 @@ impl State {
         // Reset of an allocator the GPU was still in). So: until the fence says so, or 5 s.
         let t0 = std::time::Instant::now();
         loop {
-            let _ = self.fence.SetEventOnCompletion(target, self.event);
+            let _ = super::call_stats::cs!(FenceSetEvent, self.fence.SetEventOnCompletion(target, self.event));
             let left = 5000u64.saturating_sub(t0.elapsed().as_millis() as u64).max(1) as u32;
-            windows::Win32::System::Threading::WaitForSingleObject(self.event, left);
+            super::call_stats::cs!(EventWait, windows::Win32::System::Threading::WaitForSingleObject(self.event, left));
             if super::real::fence_completed(&self.fence) >= target {
                 return;
             }
@@ -1298,7 +1298,7 @@ impl State {
                 .ok()?;
             let r = r?;
             let mut p = std::ptr::null_mut();
-            r.Map(0, None, Some(&mut p)).ok()?;
+            super::call_stats::cs!(Map, r.Map(0, None, Some(&mut p))).ok()?;
             self.staging = Some((r, p as *mut u8));
         }
         self.staging.as_ref().map(|&(_, p)| p)
@@ -1325,11 +1325,11 @@ impl State {
             }
             let Some(r) = r else { return false };
             let mut p = std::ptr::null_mut();
-            if r.Map(0, None, Some(&mut p)).is_err() {
+            if super::call_stats::cs!(Map, r.Map(0, None, Some(&mut p))).is_err() {
                 return false;
             }
             std::ptr::write_bytes(p as *mut u8, 0, ZERO_BUF);
-            r.Unmap(0, None);
+            super::call_stats::cs!(Unmap, r.Unmap(0, None));
             self.zero_buf = Some(r);
         }
         true
@@ -1352,7 +1352,7 @@ impl State {
                 .ok()?;
             let r = r?;
             let mut p = std::ptr::null_mut();
-            r.Map(0, None, Some(&mut p)).ok()?;
+            super::call_stats::cs!(Map, r.Map(0, None, Some(&mut p))).ok()?;
             self.readback = Some((r, p as *mut u8));
         }
         self.readback.clone()
@@ -1482,7 +1482,7 @@ impl State {
                 let _ = self.rb_list.Reset(&self.rb_alloc, None);
                 crate::hle::d3d12x::gpu_profile::own_list_begin(self.rb_list.as_raw());
             }
-            self.rb_list.CopyBufferRegion(rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
+            super::call_stats::cs!(RecCopyBuffer, self.rb_list.CopyBufferRegion(rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64));
             parts.push((cur, used, chunk));
             used += chunk;
             cur += chunk;
@@ -1520,7 +1520,7 @@ impl State {
             .ok()?;
         let buf = r?;
         let mut p: *mut c_void = std::ptr::null_mut();
-        buf.Map(0, None, Some(&mut p)).ok()?;
+        super::call_stats::cs!(Map, buf.Map(0, None, Some(&mut p))).ok()?;
         Some(RbJob { alloc, list, buf, ptr: p as *mut u8, cap, rb_v: 0, done_v: 0, copies: Vec::new(), fences: None })
     }
 
@@ -1630,7 +1630,7 @@ impl State {
             let mut off = 0usize;
             for (wi, cur, chunk) in batch {
                 let (base, res) = (self.windows[wi].0, self.windows[wi].1.clone());
-                job.list.CopyBufferRegion(&job.buf, off as u64, &res, (cur - base) as u64, chunk as u64);
+                super::call_stats::cs!(RecCopyBuffer, job.list.CopyBufferRegion(&job.buf, off as u64, &res, (cur - base) as u64, chunk as u64));
                 job.copies.push((cur, off, chunk));
                 off += chunk;
             }
@@ -1650,7 +1650,7 @@ impl State {
                     self.rbq_value
                 }
             };
-            let _ = q.Signal(&done, done_v);
+            let _ = super::call_stats::cs!(QueueSignal, q.Signal(&done, done_v));
             job.rb_v = rb_v;
             job.done_v = done_v;
             job.fences = title.clone().map(|t| (t, done.clone()));
@@ -1687,7 +1687,7 @@ impl State {
                 let b = self.windows[wi].0;
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(ZERO_BUF).min(to_win_end);
-                list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, zero_buf, 0, chunk as u64);
+                super::call_stats::cs!(RecCopyBuffer, list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, zero_buf, 0, chunk as u64));
                 done += chunk;
             }
         }
@@ -1749,7 +1749,7 @@ impl State {
                 let dst_off = (aligned as usize) % STAGING;
                 jobs.push((cur, dst_off, chunk));
                 let staging_res = &self.staging.as_ref().unwrap().0;
-                self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
+                super::call_stats::cs!(RecCopyBuffer, self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64));
                 self.ring_write = aligned + chunk as u64;
                 done += chunk;
             }
@@ -1966,8 +1966,8 @@ impl State {
             // this queue's own fence and copy queue (`rb_queues`)
             let key = queue.as_raw() as usize;
             if let Some((q, title, v)) = s.rb_queue_for(key) {
-                if queue.Signal(&title, v).is_ok() {
-                    let _ = q.Wait(&title, v);
+                if super::call_stats::cs!(QueueSignal, queue.Signal(&title, v)).is_ok() {
+                    let _ = super::call_stats::cs!(QueueWait, q.Wait(&title, v));
                 }
                 s.readback_async(&merged, Some(key), v);
                 start_readback_thread();
@@ -1976,17 +1976,17 @@ impl State {
         }
         s.rb_value += 1;
         let v = s.rb_value;
-        let signalled = queue.Signal(&s.rb_fence, v).is_ok();
+        let signalled = super::call_stats::cs!(QueueSignal, queue.Signal(&s.rb_fence, v)).is_ok();
         if let Some((q, _)) = s.rbq.clone() {
             if signalled {
-                let _ = q.Wait(&s.rb_fence, v);
+                let _ = super::call_stats::cs!(QueueWait, q.Wait(&s.rb_fence, v));
             }
             s.readback_async(&merged, None, v);
             start_readback_thread();
             return Vec::new();
         }
         if signalled {
-            let _ = s.queue.Wait(&s.rb_fence, v);
+            let _ = super::call_stats::cs!(QueueWait, s.queue.Wait(&s.rb_fence, v));
             super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
         }
         merged
@@ -2210,7 +2210,7 @@ impl State {
         if ok {
             for (q, fence, val) in self.queue_fences.values_mut() {
                 let next = *val + 1;
-                if q.Signal(&*fence, next).is_ok() {
+                if super::call_stats::cs!(QueueSignal, q.Signal(&*fence, next)).is_ok() {
                     *val = next;
                     marks.push((fence.clone(), next));
                 } else {
@@ -2534,7 +2534,7 @@ unsafe fn before_execute_inner(queue: &ID3D12CommandQueue, dirty: &[usize], page
     s.scratch_runs = dirty_runs;
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
-        let _ = queue.Wait(&s.fence, s.value);
+        let _ = super::call_stats::cs!(QueueWait, queue.Wait(&s.fence, s.value));
         super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &s.fence, s.value);
         s.waited.insert(q, s.value);
     }
@@ -2664,7 +2664,7 @@ static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// `STATE`, with the buffers released while it was held let go first.
 fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = super::call_stats::lock(&STATE, super::call_stats::C::LockState);
     forget_released(&mut g);
     g
 }

@@ -483,7 +483,7 @@ static UPLOADS: AtomicU64 = AtomicU64::new(0);
 
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
-    (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
+    (super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures).by_res.len(), UPLOADS.load(Ordering::Relaxed))
 }
 
 /// Whether a non-depth render target / UAV texture is small enough to be a CPU-filled glyph or UI
@@ -558,7 +558,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         seq: 0,
     };
     let to_unmap = {
-        let mut t = TEXTURES.lock().unwrap();
+        let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
         let (delta, unmap_ptrs) = t.insert(res as usize, e);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
@@ -583,7 +583,7 @@ fn mirror_source(va: usize) -> usize {
     }
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
+    let mapped = unsafe { super::call_stats::cs!(VirtualQuery, VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m))) } != 0 && m.State == MEM_COMMIT;
     if mapped { va } else { src }
 }
 
@@ -634,7 +634,7 @@ fn recheck_gpu_view_sources() {
     }
     let mut changed = false;
     // (the shadowed textures too: one comes back when the texture over it goes)
-    let mut g = TEXTURES.lock().unwrap();
+    let mut g = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
     let t = &mut *g;
     // lab (`texture_index`): the textures whose source moved, and where it was
     let mut moved: Vec<(usize, Source)> = Vec::new();
@@ -713,7 +713,7 @@ pub fn note_gpu_write(res: usize) {
     }
     let mut marked = false;
     {
-        let mut t = TEXTURES.lock().unwrap();
+        let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
         if let Some(e) = t.get_mut(res) {
             if !e.gpu_written {
                 e.gpu_written = true;
@@ -741,7 +741,7 @@ static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
-    TEXTURES.lock().unwrap().overlapping(va, len)
+    super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures).overlapping(va, len)
 }
 
 /// A GPU-owned placement (render target / depth / UAV) now occupies `[va, va + len)`: retire
@@ -757,7 +757,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         .filter(|&g| g != va && mirror_source(g) == va)
         .collect();
     let (retired, to_unmap) = {
-        let mut t = TEXTURES.lock().unwrap();
+        let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
         let (mut delta, mut retired, mut unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
         if src != va {
             let (d2, r2, u2) = t.retire_range(src, src.saturating_add(len));
@@ -788,7 +788,7 @@ pub fn forget(res: usize) {
     LAST_CONTENT.lock().unwrap().remove(&res);
     STREAM_RECHECK.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
-        let mut t = TEXTURES.lock().unwrap();
+        let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
         let (removed, delta, remap_ptrs) = t.remove(res);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
@@ -798,7 +798,7 @@ pub fn forget(res: usize) {
         unsafe {
             super::vram::remap_if_unmapped(r);
             // (lazy levels: one the GPU wrote is not uploaded again, so all of it has pages)
-            if super::vram::level_pages() && TEXTURES.lock().unwrap().by_res.get(&(r.as_raw() as usize)).is_some_and(|e| e.gpu_written) {
+            if super::vram::level_pages() && super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures).by_res.get(&(r.as_raw() as usize)).is_some_and(|e| e.gpu_written) {
                 super::vram::map_levels(r, None);
             }
         }
@@ -810,7 +810,7 @@ pub fn forget(res: usize) {
 
 /// The title-memory address of a texture kept in step with it.
 pub fn address(res: usize) -> Option<usize> {
-    let t = TEXTURES.lock().unwrap();
+    let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
     t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| e.va)
 }
 
@@ -818,7 +818,7 @@ pub fn address(res: usize) -> Option<usize> {
 /// read from – 0: an unmapped page, not uploaded yet, written by the title's GPU work, its
 /// tiles unmapped, shadowed by a newer texture at its range).
 pub fn probe_state(res: usize) -> Option<(usize, usize, bool, bool, bool, bool)> {
-    let t = TEXTURES.lock().unwrap();
+    let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
     let (e, shadowed) = match t.by_res.get(&res) {
         Some(e) => (e, false),
         None => (t.shadowed.get(&res)?, true),
@@ -839,7 +839,7 @@ pub fn under_sources(runs: &[(usize, usize)]) -> (usize, usize, usize) {
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut n = 0;
     {
-        let t = TEXTURES.lock().unwrap();
+        let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
         for (&(va, res), &end) in t.by_va.iter() {
             let Some(e) = t.by_res.get(&res) else { continue };
             if e.gpu_written {
@@ -887,7 +887,7 @@ pub fn note_transitions(list: usize, transitions: &[Transition]) {
         return;
     }
     let kept: Vec<Transition> = {
-        let t = TEXTURES.lock().unwrap();
+        let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
         transitions.iter().filter(|(r, _, _)| t.by_res.contains_key(r) || t.shadowed.contains_key(r)).copied().collect()
     };
     if !kept.is_empty() {
@@ -939,7 +939,7 @@ pub fn submitted(lists: &[*mut c_void]) {
     }
     // page budget: a texture the title uses is recent
     super::vram::touch(notes.iter().map(|&(res, _, _)| res));
-    let mut t = TEXTURES.lock().unwrap();
+    let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
     for (res, sub, after) in notes {
         if let Some(e) = t.get_mut(res) {
             let n = subresource_count(&e.tex);
@@ -1097,7 +1097,7 @@ fn revive_named(named: Vec<usize>) {
     // a reference each while they are mapped (taken under the lock `forget` takes), and where
     // its bytes are read from
     let live: Vec<(ID3D12Resource, Source, usize)> = {
-        let t = TEXTURES.lock().unwrap();
+        let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
         named
             .iter()
             .filter_map(|&res| {
@@ -1123,7 +1123,7 @@ fn revive_named(named: Vec<usize>) {
     for &res in &revived {
         forget_content(res);
     }
-    let mut t = TEXTURES.lock().unwrap();
+    let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
     for res in revived {
         if let Some(e) = t.get_mut(res) {
             if !e.pending && !e.gpu_written {
@@ -1195,7 +1195,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().flat_map(|e| e.src.ranges(e.tex.size() as usize).map(|(s, e)| (s & !0xFFF, (e + 0xFFF) & !0xFFF)).collect::<Vec<_>>()).collect();
+    let mut wanted: Vec<(usize, usize)> = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures).by_res.values().flat_map(|e| e.src.ranges(e.tex.size() as usize).map(|(s, e)| (s & !0xFFF, (e + 0xFFF) & !0xFFF)).collect::<Vec<_>>()).collect();
     wanted.extend(super::sparse::mapped_ranges());
     // lab: every page of a tiled shadow window is watched (a first write maps its tile)
     wanted.extend(super::sparse::lazy_range());
@@ -1243,15 +1243,15 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
         super::view_mem::before_execute(q);
     }
     let t0 = std::time::Instant::now();
-    let _refresh = REFRESH.lock().unwrap();
+    let _refresh = super::call_stats::lock(&REFRESH, super::call_stats::C::LockRefresh);
     super::submit_cost::lock_wait(t0.elapsed());
     // with the lock: the look before this one is done, and its uploads are submitted
-    let covered = super::look_join::covered(lists);
+    let covered = super::call_stats::cs!(LookJoin, super::look_join::covered(lists));
     let look = !(covered && super::look_join::joins());
     let t1 = std::time::Instant::now();
     let took = own_work(|| refresh_once(queue, look));
     super::submit_cost::refresh(t1.elapsed());
-    super::look_join::submit_done(covered, took);
+    super::call_stats::cs!(LookJoin, super::look_join::submit_done(covered, took));
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
@@ -1263,7 +1263,7 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     let mut at = base;
     while at < end {
         let mut n = buf.len();
-        if GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0 {
+        if super::call_stats::cs!(GetWriteWatch, GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page)) != 0 {
             break;
         }
         dirty.extend(buf[..n].iter().map(|&p| p as usize));
@@ -1649,17 +1649,18 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return None;
     }
-    recheck_gpu_view_sources();
+    super::call_stats::cs!(RecheckViewSources, recheck_gpu_view_sources());
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     if look {
         super::look_join::look_begins();
     }
-    let ranges = cached_watch_ranges(u);
+    let ranges = super::call_stats::cs!(WatchRanges, cached_watch_ranges(u));
     let ahead_on = look_ahead().is_some();
     if ahead_on {
         *LAST_SUBMIT.lock().unwrap() = Some(std::time::Instant::now());
     }
+    let cs_look = super::call_stats::time(super::call_stats::C::Look);
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
@@ -1688,6 +1689,8 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
                 }
             }
         });
+        drop(cs_look);
+        let _cs = super::call_stats::time(super::call_stats::C::SortDirty);
         dirty.sort_unstable();
         // (a page written again after a round took it is found by the look too)
         dirty.dedup();
@@ -1703,7 +1706,7 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
         // data reach the address at all, and is the texture still kept in step?)
         static LOOKS: AtomicU64 = AtomicU64::new(0);
         if LOOKS.fetch_add(1, Ordering::Relaxed) % 600 == 599 {
-            let t = TEXTURES.lock().unwrap();
+            let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
             // 16 samples of 4 KiB over the whole texture (GFX10 keeps the small levels first,
             // level 0 last)
             let content = |e: &Entry| -> usize {
@@ -1725,29 +1728,30 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
     }
     // page budget: textures in use by their T#; evicted ones are mapped again (before the
     // queue waits for the mappings) and uploaded below
-    look_at_view_heaps();
+    super::call_stats::cs!(ViewHeaps, look_at_view_heaps());
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
-            super::sparse::before_execute(q, &dirty, page as usize);
-            super::vram::before_execute(q);
+            super::call_stats::cs!(SparseBeforeExecute, super::sparse::before_execute(q, &dirty, page as usize));
+            super::call_stats::cs!(VramBeforeExecute, super::vram::before_execute(q));
         });
     }
     let recheck_frame = {
         let (p, b) = super::present::counters();
         p.max(b)
     };
-    recheck_streamed_unwatched(&ranges, recheck_frame);
+    super::call_stats::cs!(RecheckStreamed, recheck_streamed_unwatched(&ranges, recheck_frame));
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         return took;
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
     let t_filter = std::time::Instant::now();
+    let cs_filter = super::call_stats::time(super::call_stats::C::Filter);
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
-        let mut t = TEXTURES.lock().unwrap();
+        let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
         let wanted = |e: &Entry| e.pending || (!e.gpu_written && e.src.written(e.tex.size() as usize, &dirty, page as usize));
         let take = |res: usize, e: &mut Entry| {
             if e.pending {
@@ -1783,7 +1787,7 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
             if !super::vram::is_evicted(key) {
                 return true;
             }
-            let back = super::vram::revive(r);
+            let back = super::call_stats::cs!(Revive, super::vram::revive(r));
             if back {
                 forget_content(key);
             }
@@ -1791,10 +1795,11 @@ unsafe fn refresh_once(queue: *mut c_void, look: bool) -> Option<(std::time::Dur
         });
     }
     super::vram::touch(todo.iter().map(|(r, _)| r.as_raw() as usize));
-    seed_stream_recheck(&todo, &ranges, recheck_frame);
+    super::call_stats::cs!(SeedRecheck, seed_stream_recheck(&todo, &ranges, recheck_frame));
+    drop(cs_filter);
     super::submit_cost::filter(t_filter.elapsed());
     let t_textures = std::time::Instant::now();
-    upload_all(todo);
+    super::call_stats::cs!(UploadAll, upload_all(todo));
     super::submit_cost::textures(t_textures.elapsed());
     took
 }
@@ -1988,7 +1993,7 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
     let mut check = Vec::with_capacity(due.len());
     let mut prune = Vec::new();
     {
-        let t = TEXTURES.lock().unwrap();
+        let t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
         for (res, prev_fp) in due {
             match t.by_res.get(&res) {
                 Some(e) if e.gpu_written => prune.push(res),
@@ -2044,7 +2049,7 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
     if !changed.is_empty() {
         let mut queued = 0u64;
         {
-            let mut t = TEXTURES.lock().unwrap();
+            let mut t = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures);
             for res in changed {
                 if let Some(e) = t.by_res.get_mut(&res) {
                     if !e.gpu_written && !e.pending {
@@ -2209,7 +2214,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
         }
         g.push(res);
     }
-    let Some((device, va, src, tex, gpu_written)) = TEXTURES.lock().unwrap().by_res.get(&res).map(|e| (e.device, e.va, e.src.clone(), Arc::clone(&e.tex), e.gpu_written)) else { return };
+    let Some((device, va, src, tex, gpu_written)) = super::call_stats::lock(&TEXTURES, super::call_stats::C::LockTextures).by_res.get(&res).map(|e| (e.device, e.va, e.src.clone(), Arc::clone(&e.tex), e.gpu_written)) else { return };
     let d = device as *mut c_void;
     let r = res as *mut c_void;
     let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
@@ -2253,18 +2258,18 @@ pub unsafe fn probe_gpu_content(res: usize) {
         list.ResourceBarrier(&[barrier(srv, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        super::call_stats::cs!(RecCopyTexture, list.CopyTextureRegion(&dst, 0, 0, 0, &src, None));
         list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, srv)]);
         list.Close().map_err(|e| e.to_string())?;
         queue.ExecuteCommandLists(&[Some(list.cast().map_err(|e| e.to_string())?)]);
         texture::wait(dev, &queue)?;
         let mut p: *mut c_void = std::ptr::null_mut();
-        rb.Map(0, None, Some(&mut p)).map_err(|e| e.to_string())?;
+        super::call_stats::cs!(Map, rb.Map(0, None, Some(&mut p))).map_err(|e| e.to_string())?;
         let mut out = Vec::with_capacity(rows as usize * row_bytes as usize);
         for y in 0..rows as usize {
             out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize), row_bytes as usize));
         }
-        rb.Unmap(0, None);
+        super::call_stats::cs!(Unmap, rb.Unmap(0, None));
         Ok(out)
     });
     let cpu = subresources_of(&src, &tex).into_iter().next().map(|s| s.data).unwrap_or_default();
@@ -2354,7 +2359,7 @@ pub(super) unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize)
             return;
         }
         let mut read = 0usize;
-        if ReadProcessMemory(proc, src as *const c_void, dst as *mut c_void, len, &mut read) != 0 {
+        if super::call_stats::cs!(ReadProcessMemory, ReadProcessMemory(proc, src as *const c_void, dst as *mut c_void, len, &mut read)) != 0 {
             return;
         }
         let read = read.min(len);
@@ -2384,6 +2389,7 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
 
 /// `read_committed` into `out` (zeroed).
 unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
+    let _cs = super::call_stats::time(super::call_stats::C::ReadCommitted);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let len = out.len();
     let Some(limit) = at.checked_add(len) else { return };
@@ -2396,7 +2402,7 @@ unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
     let mut p = at;
     while p < limit {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.RegionSize == 0 {
+        if super::call_stats::cs!(VirtualQuery, VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m))) == 0 || m.RegionSize == 0 {
             break;
         }
         let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);

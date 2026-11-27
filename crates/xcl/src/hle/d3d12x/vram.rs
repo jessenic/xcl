@@ -970,7 +970,7 @@ impl Pages {
                 let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; offsets.len()];
                 let coord = D3D12_TILED_RESOURCE_COORDINATE { X: at as u32, ..Default::default() };
                 let region = D3D12_TILE_REGION_SIZE { NumTiles: n as u32, UseBox: false.into(), ..Default::default() };
-                self.queue.UpdateTileMappings(
+                super::call_stats::cs!(UpdateTileMappings, self.queue.UpdateTileMappings(
                     &sc.over,
                     1,
                     Some(&coord),
@@ -981,13 +981,13 @@ impl Pages {
                     Some(offsets.as_ptr()),
                     Some(counts.as_ptr()),
                     D3D12_TILE_MAPPING_FLAG_NONE,
-                );
+                ));
                 at += n;
             }
             if alloc.Reset().is_err() || list.Reset(alloc, None).is_err() {
                 return;
             }
-            list.CopyBufferRegion(&sc.over, 0, &sc.zeros, 0, (chunk.len() * PAGE) as u64);
+            super::call_stats::cs!(RecCopyBuffer, list.CopyBufferRegion(&sc.over, 0, &sc.zeros, 0, (chunk.len() * PAGE) as u64));
             if list.Close().is_err() {
                 return;
             }
@@ -995,7 +995,7 @@ impl Pages {
             // (XCL's own work: the queue hook must not take it for the title's and refresh)
             super::title_textures::own_work(|| self.queue.ExecuteCommandLists(&[Some(cl)]));
             self.value += 1;
-            let _ = self.queue.Signal(&self.fence, self.value);
+            let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
             let busy = self.value;
             if let Some(sc) = self.scrub.as_mut() {
                 sc.lists[k].2 = busy;
@@ -1064,7 +1064,7 @@ impl Pages {
             }
             let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
             let region = D3D12_TILE_REGION_SIZE { NumTiles: num_tiles, UseBox: false.into(), ..Default::default() };
-            self.queue.UpdateTileMappings(
+            super::call_stats::cs!(UpdateTileMappings, self.queue.UpdateTileMappings(
                 res,
                 1,
                 Some(&coord),
@@ -1075,7 +1075,7 @@ impl Pages {
                 Some(self.scratch_offsets.as_ptr()),
                 Some(self.scratch_counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
-            );
+            ));
         }
     }
 
@@ -1087,7 +1087,7 @@ impl Pages {
         }
         self.map_tiles(res, sub, tiles);
         self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
         super::real::removed_probe("vram: after map");
     }
 
@@ -1100,7 +1100,7 @@ impl Pages {
         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
-        self.queue.UpdateTileMappings(
+        super::call_stats::cs!(UpdateTileMappings, self.queue.UpdateTileMappings(
             res,
             1,
             Some(&coord),
@@ -1111,7 +1111,7 @@ impl Pages {
             None,
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
-        );
+        ));
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -1122,7 +1122,7 @@ impl Pages {
         }
         self.unmap_tiles(res, total);
         self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
     }
 
     /// Zero recycled `tiles` on `self.queue` before they are mapped to a new resource.
@@ -1143,7 +1143,7 @@ impl Pages {
                 (slot.alloc.clone(), slot.list.clone(), slot.fence_val, z.scratch_buf.clone(), z.zero_buf.clone())
             };
             if fence_val > 0 && self.fence.GetCompletedValue() < fence_val {
-                let _ = self.fence.SetEventOnCompletion(fence_val, windows::Win32::Foundation::HANDLE::default());
+                let _ = super::call_stats::cs!(FenceSetEvent, self.fence.SetEventOnCompletion(fence_val, windows::Win32::Foundation::HANDLE::default()));
             }
             if alloc.Reset().is_err() || list.Reset(&alloc, None).is_err() {
                 continue;
@@ -1152,7 +1152,7 @@ impl Pages {
             let mut done = 0usize;
             while done < chunk.len() {
                 let n = (chunk.len() - done).min(ZERO_BUF_TILES);
-                list.CopyBufferRegion(&scratch_buf, (done * PAGE) as u64, &zero_buf, 0, (n * PAGE) as u64);
+                super::call_stats::cs!(RecCopyBuffer, list.CopyBufferRegion(&scratch_buf, (done * PAGE) as u64, &zero_buf, 0, (n * PAGE) as u64));
                 done += n;
             }
             if list.Close().is_err() {
@@ -1164,7 +1164,7 @@ impl Pages {
             });
             self.unmap_tiles(&scratch_buf, chunk.len() as u32);
             self.value += 1;
-            let _ = self.queue.Signal(&self.fence, self.value);
+            let _ = super::call_stats::cs!(QueueSignal, self.queue.Signal(&self.fence, self.value));
             let z = self.zeroer.as_mut().unwrap();
             z.slots[z.next_slot].fence_val = self.value;
             z.next_slot = (z.next_slot + 1) % z.slots.len();
@@ -1535,7 +1535,7 @@ fn canonical_va(va: usize) -> usize {
     }
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
+    let mapped = unsafe { super::call_stats::cs!(VirtualQuery, VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m))) } != 0 && m.State == MEM_COMMIT;
     if mapped { va } else { src }
 }
 
@@ -1942,7 +1942,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
             let key = queue.as_raw() as usize;
             if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-                let _ = queue.Wait(&pages.fence, pages.value);
+                let _ = super::call_stats::cs!(QueueWait, queue.Wait(&pages.fence, pages.value));
                 super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
                 pages.waited.insert(key, pages.value);
             }

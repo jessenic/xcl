@@ -10,6 +10,7 @@
 #![allow(non_snake_case)]
 
 mod alloc_pool;
+pub(crate) mod call_stats;
 mod clamp_runs;
 pub mod bind;
 pub mod console_heap;

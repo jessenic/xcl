@@ -377,6 +377,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
             }
         });
     }
+    // lab: `XCL_THREAD_SAMPLE=<from s>,<period ms>,<count>` – every thread's CPU and stacks, to a file (`thread_sample`)
+    crate::thread_sample::start_from_env();
     // lab: `XCL_SAMPLE=<from s>,<seconds>[,<ms>]` – a sampling profile of every thread (`eh::sample_profile`)
     if let Ok(v) = std::env::var("XCL_SAMPLE") {
         let p: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();

@@ -60,8 +60,8 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
         let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
             let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
             for job in rx {
-                if super::real::fence_completed(&job.fence) < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
-                    th::WaitForSingleObject(event, WAIT_MS);
+                if super::real::fence_completed(&job.fence) < job.value && super::call_stats::cs!(FenceSetEvent, job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void))).is_ok() {
+                    super::call_stats::cs!(EventWait, th::WaitForSingleObject(event, WAIT_MS));
                     if super::real::fence_completed(&job.fence) < job.value {
                         static LATE: AtomicU64 = AtomicU64::new(0);
                         let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -95,7 +95,7 @@ unsafe fn write_now(va: usize, words: &[u32]) {
         let _trap = super::watch_trap::guard(va, bytes);
         use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
+        if super::call_stats::cs!(VirtualQuery, VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m))) == 0 || m.State != MEM_COMMIT {
             return;
         }
         if m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + bytes {
@@ -121,7 +121,7 @@ unsafe fn u64_writable_now(va: usize) -> bool {
     let _trap = super::watch_trap::guard(va, 8);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
+    if super::call_stats::cs!(VirtualQuery, VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m))) == 0 || m.State != MEM_COMMIT {
         return false;
     }
     m.Protect & PAGE_GUARD == 0
@@ -155,7 +155,7 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
     let _trap = super::watch_trap::guard(va, bytes);
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
+    let found = unsafe { super::call_stats::cs!(VirtualQuery, VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m))) } != 0;
     found
         && m.State == MEM_COMMIT
         && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
@@ -184,7 +184,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
             }
         };
         entry.value += 1;
-        if q.Signal(&entry.fence, entry.value).is_err() {
+        if super::call_stats::cs!(QueueSignal, q.Signal(&entry.fence, entry.value)).is_err() {
             return;
         }
         Job { fence: entry.fence.clone(), value: entry.value, writes }

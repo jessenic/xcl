@@ -257,7 +257,7 @@ impl Uploader {
         drop(self.staging.take());
         let b = buffer(dev, cap)?;
         let mut p = std::ptr::null_mut();
-        b.Map(0, None, Some(&mut p)).map_err(err)?;
+        crate::hle::d3d12x::call_stats::cs!(Map, b.Map(0, None, Some(&mut p))).map_err(err)?;
         self.staging = Some((b.clone(), p as *mut u8, cap));
         Ok((b, p as *mut u8))
     }
@@ -308,7 +308,7 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
-    queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    crate::hle::d3d12x::call_stats::cs!(QueueSignal, queue.Signal(&up.fence, up.value)).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
     if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
         // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
         // uploader next time) – freeing them under the GPU removed the device
@@ -343,9 +343,9 @@ pub unsafe fn record_upload_states(
     let l = layout(dev, res, subs, before, after)?;
     let up = buffer(dev, l.total)?;
     let mut p = std::ptr::null_mut();
-    up.Map(0, None, Some(&mut p)).map_err(err)?;
+    crate::hle::d3d12x::call_stats::cs!(Map, up.Map(0, None, Some(&mut p))).map_err(err)?;
     record_into(list, res, subs, &l, before, after, &up, p as *mut u8, 0);
-    up.Unmap(0, None);
+    crate::hle::d3d12x::call_stats::cs!(Unmap, up.Unmap(0, None));
     Ok(up)
 }
 
@@ -414,7 +414,7 @@ unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, su
         };
         let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: base + fp.Offset, Footprint: fp.Footprint };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed } };
-        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        crate::hle::d3d12x::call_stats::cs!(RecCopyTexture, list.CopyTextureRegion(&dst, 0, 0, 0, &src, None));
     }
     let back = transitions(res, &[D3D12_RESOURCE_STATE_COPY_DEST], after, n);
     if !back.is_empty() {
@@ -438,7 +438,7 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
     let copy_error = |e| format!("texture copy: {e}");
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
         .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
-    queue.Signal(&fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    crate::hle::d3d12x::call_stats::cs!(QueueSignal, queue.Signal(&fence, 1)).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
     fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
 }
 

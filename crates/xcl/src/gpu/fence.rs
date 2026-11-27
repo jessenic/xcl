@@ -74,7 +74,7 @@ pub(crate) unsafe fn wait(
     let start = Instant::now();
     let mut remaining = timeout_ms;
     loop {
-        let status = WaitForSingleObject(event, remaining);
+        let status = crate::hle::d3d12x::call_stats::cs!(EventWait, WaitForSingleObject(event, remaining));
         let error = (status == WAIT_FAILED).then(Error::from_thread);
         let completed = completed_value(fence, dev)?;
         if let Some(e) = error {

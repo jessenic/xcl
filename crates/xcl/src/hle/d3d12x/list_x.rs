@@ -1942,7 +1942,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
-                if let Err(e) = q.Signal(&fence, val) {
+                if let Err(e) = super::call_stats::cs!(QueueSignal, q.Signal(&fence, val)) {
                     crate::xlog_warn!("D3D12.X: Write64 fence Signal({va:#x}, {val:#x}) failed ({e}) – signalling on CPU");
                     let _ = fence.Signal(val);
                 }
@@ -2146,7 +2146,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         )
     });
 
-    if let Err(e) = q.Wait(&fence, w.value) {
+    if let Err(e) = super::call_stats::cs!(QueueWait, q.Wait(&fence, w.value)) {
         let mut g = SYNC_GRAPH.lock().unwrap();
         if let Some(cell) = g.as_mut().and_then(|gr| gr.cells.get_mut(&w.va)) {
             if let Some(pos) = cell.armed_waits.iter().rposition(|aw| aw.val == w.value && aw.waiting_queue == q_raw && aw.wait_seq == wait_seq) {
@@ -2200,6 +2200,7 @@ unsafe fn wait_or_bridge(queue: *mut c_void, w: &PendingWait, list_writes: &[(u6
 }
 
 unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[(u64, u64)]) {
+    let _cs = super::call_stats::time(super::call_stats::C::WaitAllOn);
     static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
     static RING_DUMPED: AtomicU64 = AtomicU64::new(0);
     let timeout = wait_timeout();
@@ -2523,7 +2524,7 @@ pub(super) unsafe fn copy_scratch_submitted(queue: *mut c_void, lists: &[*mut c_
         }
         let (fence, value) = cache.fences.get_mut(&key)?;
         let next = *value + 1;
-        q.Signal(&*fence, next).ok()?;
+        super::call_stats::cs!(QueueSignal, q.Signal(&*fence, next)).ok()?;
         *value = next;
         Some((fence.clone(), next))
     })();
@@ -2624,11 +2625,11 @@ unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usi
     .ok()?;
     let b = b?;
     let mut p: *mut c_void = std::ptr::null_mut();
-    b.Map(0, None, Some(&mut p)).ok()?;
+    super::call_stats::cs!(Map, b.Map(0, None, Some(&mut p))).ok()?;
     for chunk in std::slice::from_raw_parts_mut(p as *mut u8, len as usize).chunks_exact_mut(16) {
         chunk.copy_from_slice(&pat);
     }
-    b.Unmap(0, None);
+    super::call_stats::cs!(Unmap, b.Unmap(0, None));
     let raw = b.as_raw() as usize;
     cache.push((pat, b, len));
     Some(raw)
@@ -2765,7 +2766,7 @@ unsafe fn ensure_timestamp_readback(dev: &ID3D12Device, pool: &mut TimestampPool
     dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).ok()?;
     let rb = rb?;
     let mut ptr: *mut c_void = std::ptr::null_mut();
-    rb.Map(0, None, Some(&mut ptr)).ok()?;
+    super::call_stats::cs!(Map, rb.Map(0, None, Some(&mut ptr))).ok()?;
     if ptr.is_null() {
         return None;
     }
@@ -4335,7 +4336,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
                     let data = (title != 0 && crate::gpu::shader::readable(title as usize, n)).then(|| std::slice::from_raw_parts(title as *const u8, n).iter().filter(|&&b| b != 0).count());
                     let win = crate::gpu::uma::get().and_then(|u| u.window_of(title as usize).map(|w| (w, u.window(w), u.is_sparse(title as usize))));
                     let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-                    let q = crate::hle::kernelx::VirtualQuery(title as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
+                    let q = super::call_stats::cs!(VirtualQuery, crate::hle::kernelx::VirtualQuery(title as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)));
                     crate::xlog_info!(
                         "frame trace: vertex buffer #{i} slot {}: title {title:#x} → PC {:#x}, {} bytes, stride {}; non-zero in the first {n} bytes (CPU view): {data:?}; window (index, (base, size), sparse) {win:x?}; memory state {:#x} protect {:#x} (query {q})",
                         start + k as u32,

@@ -92,7 +92,7 @@ fn install() {
 
 unsafe fn protect(a: usize, n: usize, p: u32) -> bool {
     let mut old = 0u32;
-    VirtualProtect(a as *const c_void, n, p, &mut old) != 0
+    super::call_stats::cs!(VirtualProtect, VirtualProtect(a as *const c_void, n, p, &mut old)) != 0
 }
 
 /// Give a read-only span its protection back. A part with pages decommitted since then cannot
@@ -106,7 +106,7 @@ unsafe fn thaw(c: &Cold) {
         let mut at = a;
         while at < end {
             let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            if VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
+            if super::call_stats::cs!(VirtualQuery, VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m))) == 0 {
                 break;
             }
             let next = (m.BaseAddress as usize + m.RegionSize).min(end);
@@ -142,7 +142,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         // another thread gave the span back after this write faulted: go on if it may write now
         drop(cold);
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        let now = VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0
+        let now = super::call_stats::cs!(VirtualQuery, VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m))) != 0
             && m.State == MEM_COMMIT
             && matches!(m.Protect & !MODIFIERS, PAGE_READWRITE | 0x40);
         return if now && was_ours(at) { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH };
@@ -178,7 +178,7 @@ pub fn guard_free(a: usize, n: usize) -> Guard {
     let mut at = a;
     loop {
         let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 || m.AllocationBase as usize != a {
+        if unsafe { super::call_stats::cs!(VirtualQuery, VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m))) } == 0 || m.AllocationBase as usize != a {
             break;
         }
         at = m.BaseAddress as usize + m.RegionSize;
@@ -309,7 +309,7 @@ unsafe fn overlapped_status(ov: usize) -> Option<usize> {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let (mut v, mut done) = (0usize, 0usize);
-    (ReadProcessMemory(GetCurrentProcess(), ov as *const c_void, &mut v as *mut usize as *mut c_void, 8, &mut done) != 0 && done == 8).then_some(v)
+    (super::call_stats::cs!(ReadProcessMemory, ReadProcessMemory(GetCurrentProcess(), ov as *const c_void, &mut v as *mut usize as *mut c_void, 8, &mut done)) != 0 && done == 8).then_some(v)
 }
 
 /// The committed parts of `[a, a + n)` if all of them are plain read-write (modifiers kept),
@@ -323,7 +323,7 @@ unsafe fn writable_parts(a: usize, n: usize) -> Option<Vec<(usize, usize, u32)>>
     let mut parts = Vec::new();
     while at < end {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
+        if super::call_stats::cs!(VirtualQuery, VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m))) == 0 {
             return None;
         }
         let next = (m.BaseAddress as usize + m.RegionSize).min(end);

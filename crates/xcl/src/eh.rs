@@ -588,7 +588,7 @@ extern "system" {
 }
 
 /// A thread's description (SetThreadDescription – engines name their threads).
-unsafe fn thread_name(h: *mut std::ffi::c_void) -> String {
+pub(crate) unsafe fn thread_name(h: *mut std::ffi::c_void) -> String {
     let mut p: *mut u16 = std::ptr::null_mut();
     if GetThreadDescription(h, &mut p) < 0 || p.is_null() {
         return String::new();
