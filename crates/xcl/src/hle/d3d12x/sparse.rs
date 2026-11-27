@@ -4315,9 +4315,15 @@ mod tests {
     #[test]
     fn seen_addresses_pass_once() {
         let mut seen = SeenAddrs::new();
-        let addrs = [0x10_0000_0000usize, 0x10_0000_0100, 0x10_0000_0000, 0x10_0001_0000, 0x10_0000_0100, 0x10_0000_0000];
+        // (slots 0, 4 and 8: no two of these share a slot)
+        let addrs = [0x10_0000_0000usize, 0x10_0000_0040, 0x10_0000_0000, 0x10_0000_0080, 0x10_0000_0040, 0x10_0000_0000];
         let passed: Vec<usize> = addrs.iter().copied().filter(|&a| seen.first(a)).collect();
-        assert_eq!(passed, vec![0x10_0000_0000, 0x10_0000_0100, 0x10_0001_0000]);
+        assert_eq!(passed, vec![0x10_0000_0000, 0x10_0000_0040, 0x10_0000_0080]);
+        // two addresses of one slot (16): the second evicts the first, which then passes again (lossy by design: a second
+        // use_range of an address finds nothing left to map)
+        let mut seen = SeenAddrs::new();
+        let passed: Vec<usize> = [0x10_0000_0100usize, 0x10_0001_0000, 0x10_0000_0100].into_iter().filter(|&a| seen.first(a)).collect();
+        assert_eq!(passed, vec![0x10_0000_0100, 0x10_0001_0000, 0x10_0000_0100]);
         let mut seen = SeenAddrs::new();
         let mut x = 7u64;
         let mut firsts = std::collections::HashSet::new();
