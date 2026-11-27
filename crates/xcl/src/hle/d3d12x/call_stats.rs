@@ -279,7 +279,7 @@ mod tests {
         assert!(d[1] >= 15_000_000 && d[3] >= 5_000_000 && d[3] < d[1], "{d:?}");
         // a lock got at once: a call and no time; one held by another thread: the wait
         let m = std::sync::Arc::new(Mutex::new(0u32));
-        drop(lock(&m, C::LockTextures));
+        drop(lock(&*m, C::LockTextures));
         let m2 = m.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let h = std::thread::spawn(move || {
@@ -288,7 +288,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(30));
         });
         rx.recv().unwrap();
-        *lock(&m, C::LockTextures) += 1;
+        *lock(&*m, C::LockTextures) += 1;
         h.join().unwrap();
         let d = delta(&s0, &snapshot(), C::LockTextures);
         assert_eq!(d[0], 2);
