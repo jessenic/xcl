@@ -26,6 +26,7 @@ mod indirect_clamp;
 pub mod frame;
 pub mod guard;
 mod late_release;
+mod lit_trace;
 mod look_join;
 pub mod layout;
 pub mod list_x;

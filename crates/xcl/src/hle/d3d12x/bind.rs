@@ -840,6 +840,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                     pc_dm(this, groups.min(65535), 1, 1);
                     super::targets::note_draw(this, super::targets::RAN);
                     count(DRAWS);
+                    lit_trace(this, super::lit_trace::MESH_DRAW, Some((tp.ms_hash, super::real::two_pass_ps_hash(tp.compute))));
                     native_mesh_drawn(false, groups);
                 }
                 Err(e) => {
@@ -892,6 +893,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             Ok(()) => {
                 super::targets::note_draw(this, super::targets::RAN);
                 count(DRAWS);
+                lit_trace(this, super::lit_trace::MESH_DRAW, Some((tp.ms_hash, super::real::two_pass_ps_hash(tp.compute))));
                 static LOGGED: AtomicU64 = AtomicU64::new(0);
                 let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 8 || n.is_power_of_two() {
@@ -925,6 +927,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     gp_mark(this, gp::Label::of(gp::Kind::Other));
     pc_dm(this, x, y, z);
     gp_mark(this, gp::Label::op(gp::Kind::PcDraw, (0, 0), [x, y, z]));
+    lit_trace(this, super::lit_trace::MESH_DRAW, None);
 }
 
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
@@ -1076,6 +1079,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 Ok(()) => {
                     ei_work(this, sig, super::targets::RAN);
                     count(DRAWS);
+                    lit_trace(this, super::lit_trace::INDIRECT_DRAW, Some((tp.ms_hash, super::real::two_pass_ps_hash(tp.compute))));
                     static LOGGED: AtomicU64 = AtomicU64::new(0);
                     let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 8 || n.is_power_of_two() {
@@ -1157,6 +1161,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         gp_mark(this, gp::Label::of(gp::Kind::Other));
         fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
         gp_mark(this, gp::Label::op(gp::Kind::PcIndirect, (0, 0), [max, 0, 0]));
+        // (a PC pipeline: whether its signature draws or dispatches is not looked at - a bound target counts)
+        lit_trace(this, super::lit_trace::INDIRECT_DRAW, None);
         return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -1236,6 +1242,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if compute && !gfx {
         pass_fill_at(this, pso, true);
     }
+    if compute && !gfx {
+        lit_trace(this, super::lit_trace::BEFORE_INDIRECT_DISPATCH, None);
+    }
     let timed = if compute && !gfx { gpu_time_begin(this, pso) } else { None };
     // (a compute program split into a dispatch chain runs whole through ExecuteIndirect: `dispatch_chain::whole`)
     let result = bind_abi(this, list, pso, gfx).and_then(|()| {
@@ -1263,6 +1272,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             super::list_x::depth_twin_flush(this, res, plane);
         }
         gpu_time_end(this, timed);
+        lit_trace(this, if gfx { super::lit_trace::INDIRECT_DRAW } else { super::lit_trace::INDIRECT_DISPATCH }, None);
         if compute && !gfx {
             pass_snap(this, pso);
             pass_fill(this, pso);
@@ -1999,18 +2009,47 @@ fn cpu_rect_expansion(pso: usize) -> bool {
     !super::real::has_rect_list_gs(super::pso_async::resolve(pso))
 }
 
+/// lab: `XCL_DRAW_SKIP=<hash>[,<hash>...]`: the draws of a pipeline whose console VS or PS has
+/// one of these hashes (16 hex digits, as `XCL_LIT_TRACE` prints them) are not drawn.
+pub(super) fn draw_skip_list() -> &'static [u64] {
+    static L: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::env::var("XCL_DRAW_SKIP").map_or(Vec::new(), |v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect()))
+}
+
+unsafe fn draw_skipped(this: *mut c_void) -> bool {
+    let skip = draw_skip_list();
+    if skip.is_empty() {
+        return false;
+    }
+    let pso = with(this, |s| s.pso);
+    let Some((a, b)) = super::lit_trace::shaders(pso) else { return false };
+    if !(skip.contains(&a) || skip.contains(&b)) {
+        return false;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_info!("lab: draw skip: the first skipped draw (vs {a:016x} ps {b:016x})");
+    }
+    true
+}
+
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
+    if draw_skipped(this) {
+        return;
+    }
     if let Some(list) = graphics_bound(this) {
         gp_mark(this, gp::Label::of(gp::Kind::Other));
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
             gp_draw(this, [vertices, instances, 0]);
+            lit_trace(this, super::lit_trace::DRAW, None);
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
         gp_draw(this, [vertices, instances, 0]);
+        lit_trace(this, super::lit_trace::DRAW, None);
     }
 }
 
@@ -2060,11 +2099,15 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    if draw_skipped(this) {
+        return;
+    }
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         gp_mark(this, gp::Label::of(gp::Kind::Other));
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
         gp_draw(this, [indices, instances, 0]);
+        lit_trace(this, super::lit_trace::DRAW, None);
     }
 }
 
@@ -3043,6 +3086,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         super::list_x::depth_twin_fill(this, res, plane);
     }
     pass_fill_at(this, pso, true);
+    lit_trace(this, super::lit_trace::BEFORE_DISPATCH, None);
     let timed = gpu_time_begin(this, pso);
     bind_abi(this, list, pso, false)?;
     gp_mark(this, gp::Label::of(gp::Kind::Other));
@@ -3060,13 +3104,45 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     ambient_floor(this, pso);
     if ran.is_ok() {
         scene_clamp(this, list, pso);
+        nan_fix(this, list, pso);
     }
     for (res, plane) in twins {
         super::list_x::depth_twin_flush(this, res, plane);
     }
     pass_snap(this, pso);
     pass_fill(this, pso);
+    lit_trace(this, super::lit_trace::DISPATCH, None);
     ran
+}
+
+/// lab (`XCL_LIT_TRACE`, `lit_trace`): after the command of `kind` just recorded on `this`, a
+/// snapshot of the followed targets it can have written (`hashes`: the console records of a
+/// two-pass pipeline; None: those of the bound pipeline). For a dispatch: of those among the
+/// textures in the first 128 slots of its tables.
+pub(super) unsafe fn lit_trace(this: *mut c_void, kind: u8, hashes: Option<(u64, u64)>) {
+    if !super::lit_trace::tracing() {
+        return;
+    }
+    let (layout, args, pso) = with(this, |s| (s.layout.clone(), s.args.clone(), s.pso));
+    // (resource, table << 8 | slot)
+    let mut named: Vec<(usize, u16, [u32; 8])> = Vec::new();
+    if let (true, Some(layout), Some(u)) = (kind >= super::lit_trace::DISPATCH, layout, crate::gpu::uma::get()) {
+        let alive = |r: usize| crate::gpu::shader::readable(r, 8) && crate::gpu::shader::readable((r as *const usize).read_unaligned(), 8 * 12);
+        for (ti, t) in table_addresses(&layout, &args, u.base()).into_iter().enumerate() {
+            for k in 0..128usize {
+                let slot = t + 32 * k;
+                if !crate::gpu::shader::readable(slot, 32) {
+                    break;
+                }
+                let w0 = (slot as *const u32).read_unaligned();
+                let r = super::console_heap::resource_at(slot).or_else(|| (w0 != 0).then(|| super::console_heap::resource_by_word0_cached(w0)).flatten());
+                if let Some(r) = r.filter(|&r| alive(r) && !named.iter().any(|n| n.0 == r)) {
+                    named.push((r, (ti as u16) << 8 | k as u16, (slot as *const [u32; 8]).read_unaligned()));
+                }
+            }
+        }
+    }
+    super::lit_trace::after(this, kind, pso, hashes, &named);
 }
 
 /// lab: `XCL_PASS_FILL=<cs record hash>:t<i>[<slot>][=<hex dword>]:...,<hash>:...` - right after
@@ -3467,6 +3543,55 @@ unsafe fn scene_clamp_loads(dev: &ID3D12Device, format: i32) -> bool {
         && fs.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0 != 0;
     KNOWN.lock().unwrap().push((format, ok));
     ok
+}
+
+/// lab: (console CS hash, table among the list's tables, slot) of the 1920x1080 temporal passes
+/// whose output keeps NaN / Inf texels from frame to frame (`XCL_LIT_TRACE`, lab3-littrace-12).
+const NAN_FIX: &[(u64, usize, usize)] = &[(0xa2c897d4756321dd, 0, 3), (0x56487dbf33bffb0d, 0, 1)];
+
+/// lab (`XCL_NAN_FIX=<max>`, e.g. 1000; unset: off): right after the dispatch of one of
+/// `NAN_FIX`, the image it stored has its NaN / Inf texels zeroed and is held to [0, max] a
+/// channel, by `scene_clamp`'s pass. A NaN in a temporal pass's output is read back as its
+/// history the next frame and never leaves.
+unsafe fn nan_fix(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize) {
+    static SET: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let Some(max) = *SET.get_or_init(|| std::env::var("XCL_NAN_FIX").ok()?.trim().parse::<f32>().ok().filter(|m| m.is_finite() && *m > 0.0)) else { return };
+    let Some((cs, _)) = super::real::pso_shaders(super::pso_async::resolve(pso)).or_else(|| super::real::pso_shaders(pso)) else { return };
+    let Some(&(_, ti, k)) = NAN_FIX.iter().find(|p| p.0 == cs) else { return };
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let said = call <= 8 || call.is_power_of_two();
+    let (Some(u), (Some(layout), args)) = (crate::gpu::uma::get(), with(this, |s| (s.layout.clone(), s.args.clone()))) else { return };
+    let Some(&table) = table_addresses(&layout, &args, u.base()).get(ti) else { return };
+    let what = (|| -> Result<String, String> {
+        let (d, found) = table_image(table + 32 * k).ok_or("no image descriptor in the slot")?;
+        let (res, _) = found.ok_or("no texture known for the slot")?;
+        let r = res as *mut c_void;
+        let image = ID3D12Resource::from_raw_borrowed(&r).ok_or("no resource")?;
+        let desc = image.GetDesc();
+        if !(desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1 && matches!(desc.Format.0, 2 | 10) && desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0) {
+            return Err(format!("{res:#x} {}x{} format {} flags {:#x}: not a float image with a UAV", desc.Width, desc.Height, desc.Format.0, desc.Flags.0));
+        }
+        if !(d[1] & 0xFF == 0 && d[0] < 999_999) {
+            return Err("not a descriptor the program stores through".to_string());
+        }
+        let dev = super::real::list_device(this).ok_or("no device")?;
+        let (rs, pipeline) = scene_clamp_pipeline(&dev)?;
+        emit_uav_barrier(list, Some(image));
+        list.SetComputeRootSignature(&rs);
+        list.SetPipelineState(&pipeline);
+        let consts = [max.to_bits(), d[0] + 1];
+        list.SetComputeRoot32BitConstants(0, 2, consts.as_ptr() as *const c_void, 0);
+        list.Dispatch((desc.Width as u32).div_ceil(8), desc.Height.div_ceil(8), 1);
+        emit_uav_barrier(list, Some(image));
+        if let Err(e) = bind_abi(this, list, pso, false) {
+            return Err(format!("fixed, but the title's bindings were not restored: {e}"));
+        }
+        Ok(format!("{res:#x} {}x{} format {}: NaN / Inf zeroed, held to {max} (view {})", desc.Width, desc.Height, desc.Format.0, d[0] + 1))
+    })();
+    if said {
+        crate::xlog_info!("lab: nan fix call #{call} {cs:016x} table {ti} slot {k}: {}", what.unwrap_or_else(|e| format!("left ({e})")));
+    }
 }
 
 /// lab (`XCL_SCENE_CLAMP=<max>`, e.g. 64; `=probe`: log only; unset: off): right after the

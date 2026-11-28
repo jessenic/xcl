@@ -3554,6 +3554,9 @@ macro_rules! as_usize {
 /// command list's vtable pointer on Close; adopt the runtime's new state vtable so
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    if super::lit_trace::tracing() {
+        super::lit_trace::after(this, super::lit_trace::CLOSE, 0, None, &[]);
+    }
     super::list_x::before_close(this);
     super::gpu_profile::list_close(this);
     super::look_join::note_list_closed(this as usize);
@@ -6375,6 +6378,9 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     // lab: `XCL_GPU_PROFILE` names draws by their console shaders (`XCL_SKIP_LOG`: skipped ones)
+    if super::lit_trace::on() || !super::bind::draw_skip_list().is_empty() {
+        super::lit_trace::note_graphics(*ppv as usize, crate::gpu::shader::fnv64(vs), shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64));
+    }
     if super::gpu_profile::on() || super::bind::skip_log() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
@@ -8511,6 +8517,10 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
+    // lab (`XCL_LIT_TRACE`): what a followed target holds as it is bound
+    if super::lit_trace::tracing() {
+        super::lit_trace::after(this, super::lit_trace::BIND, 0, None, &[]);
+    }
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {
@@ -9125,6 +9135,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     });
     removed_probe("execute: start");
+    // lab (`XCL_LIT_TRACE`): the order the traced frame's lists are submitted in
+    super::lit_trace::submitted(this, &mapped);
     // page budget: evicted textures these lists transition are mapped again, uploaded below.
     // Not for XCL's own lists: the zeroing of target pages submits under the pages lock, and a
     // texture a draw named meanwhile sent this thread into `vram::revive` for that same lock

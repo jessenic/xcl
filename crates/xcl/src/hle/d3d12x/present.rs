@@ -119,6 +119,8 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     // lab XCL_RT_WATCH: its lines every N frames
     super::rt_watch::tick(frames);
     super::targets::frame_end();
+    // lab (`XCL_LIT_TRACE`): the traced frame starts / ends / is read at a present
+    super::lit_trace::present(queue);
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -1563,7 +1565,7 @@ unsafe fn rt_dump_take() -> Option<Vec<(usize, u8)>> {
     Some(set)
 }
 
-fn half(v: u16) -> f32 {
+pub(super) fn half(v: u16) -> f32 {
     let (s, e, m) = (v >> 15, (v >> 10) & 31, (v & 1023) as f32 / 1024.0);
     let x = match e {
         0 => m * 2f32.powi(-14),

@@ -4411,6 +4411,7 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu_va(this, va, count.saturating_mul(stride) as usize, "DrawIndexedX indices", false), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
     super::bind::emit_prepared_indexed_draw(&list, count, 1, 0, 0, 0);
+    super::bind::lit_trace(this, super::lit_trace::DRAW, None);
     set_index_buffer(this, bound.as_ref());
 }
 
@@ -4831,6 +4832,9 @@ unsafe fn is_buffer(res: usize) -> bool {
 
 /// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
 pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
+    if super::lit_trace::tracing() {
+        super::lit_trace::after(this, super::lit_trace::CLOSE, 0, None, &[]);
+    }
     let ext = *(this as *const usize);
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
     real::preserve_vtable(this, ext);
