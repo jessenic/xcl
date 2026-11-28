@@ -3644,7 +3644,7 @@ impl Em {
             "v_min_f16" => fr(format!("min({}, {})", fh(0), fh(1))),
             "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
             "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
-            "v_med3_f16" => fr(format!("med3f({}, {}, {})", fh(0), fh(1), fh(2))),
+            "v_med3_f16" => fr(med3f_text(&fh(0), &fh(1), &fh(2))),
             "v_div_fixup_f16" => fr(format!("div_fixup({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_min3_f16" => fr(format!("min(min({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_max3_f16" => fr(format!("max(max({}, {}), {})", fh(0), fh(1), fh(2))),
@@ -4043,7 +4043,7 @@ impl Em {
             "v_madak_f32" => fr(format!("mad_nf({}, {}, asfloat({c}))", fs(0), fs(1))),
             "v_min3_f32" => fr(format!("min(min({}, {}), {})", fs(0), fs(1), fs(2))),
             "v_max3_f32" => fr(format!("max(max({}, {}), {})", fs(0), fs(1), fs(2))),
-            "v_med3_f32" => fr(format!("med3f({}, {}, {})", fs(0), fs(1), fs(2))),
+            "v_med3_f32" => fr(med3f_text(&fs(0), &fs(1), &fs(2))),
             "v_cubeid_f32" => fr(format!("cube_id({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cubesc_f32" => fr(format!("cube_sc({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cubetc_f32" => fr(format!("cube_tc({}, {}, {})", fs(0), fs(1), fs(2))),
@@ -6980,6 +6980,16 @@ uint fclass64(double f) {
     return n ? 3u : 8u;
 }
 "#;
+
+/// `v_med3_f32` / `_f16` of three HLSL float expressions. Lab (`XCL_MED3_RDNA=1`, #686): with a NaN
+/// operand the smaller of the other two (HLSL `min` gives the operand that is a number).
+fn med3f_text(a: &str, b: &str, c: &str) -> String {
+    if crate::gpu::bvh::med3_rdna() {
+        format!("((isnan({a}) || isnan({b}) || isnan({c})) ? min(min({a}, {b}), {c}) : med3f({a}, {b}, {c}))")
+    } else {
+        format!("med3f({a}, {b}, {c})")
+    }
+}
 
 #[cfg(test)]
 mod tests {

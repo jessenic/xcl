@@ -290,7 +290,7 @@ mod translated {
             // `XCL_WINDOW_NO_CARRY=1`: windows from the base address are another output
             let id = if crate::gpu::dxil::kernel::window_no_carry() && Backend::current() != Backend::Hlsl { identity_for(&id.to_string(), "xcl-window-no-carry") } else { id };
             // lab (`XCL_BVH_MISS=1`): BVH intersects that miss are another output of both backends
-            let id = if crate::gpu::bvh::miss_all() { identity_for(&id.to_string(), "xcl-bvh-miss") } else { id };
+            let id = if crate::gpu::bvh::miss_all() { identity_for(&id.to_string(), "xcl-bvh-miss") } else { id }; let id = if crate::gpu::bvh::med3_rdna() { identity_for(&id.to_string(), "xcl-med3-rdna") } else { id };
             // `XCL_DIRECT_COMPACT_NEST`: a non-default nesting policy changes the compact IR
             let id = match crate::gpu::dxil::kernel::compact_nest_tag() {
                 Some(tag) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), &tag),
@@ -545,7 +545,7 @@ mod translated {
         // the `enormous` programs that go direct without `XCL_DIRECT_DXIL`
         let id = if crate::gpu::dxil::kernel::window_no_carry() { identity_for(&id.to_string(), "xcl-window-no-carry") } else { id };
         // lab (`XCL_BVH_MISS=1`): as in `identity`
-        let id = if crate::gpu::bvh::miss_all() { identity_for(&id.to_string(), "xcl-bvh-miss") } else { id };
+        let id = if crate::gpu::bvh::miss_all() { identity_for(&id.to_string(), "xcl-bvh-miss") } else { id }; let id = if crate::gpu::bvh::med3_rdna() { identity_for(&id.to_string(), "xcl-med3-rdna") } else { id };
         if crate::gpu::recomp::lower_dxil::enabled() {
             identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
         } else {

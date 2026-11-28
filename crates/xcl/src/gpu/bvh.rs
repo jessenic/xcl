@@ -387,6 +387,14 @@ fn closest(data: &[u8], root: u32, o: [f32; 3], d: [f32; 3], tmax: f32, instance
     best
 }
 
+/// Lab (`XCL_MED3_RDNA=1`, upstream #686 by joeypercia and milesah3ad): `v_med3_f32` / `_f16`
+/// with a NaN operand give the smaller of the other two, as the hardware does, instead of what the
+/// max(min, min(max, c)) form gives. Read by both backends; part of the translated cache identity.
+pub fn med3_rdna() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_MED3_RDNA").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Lab (`XCL_BVH_MISS=1`): every translated `image_bvh(64)_intersect_ray` returns its miss result
 /// without reading the node (box nodes: no child, triangle nodes: t = +inf), so every ray the
 /// title traces ends in its miss program. Read by the HLSL emitter and the direct DXIL lowering;

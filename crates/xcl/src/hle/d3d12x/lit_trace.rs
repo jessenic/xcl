@@ -237,6 +237,28 @@ pub(super) unsafe fn after(this: *mut c_void, kind: u8, pso: usize, hashes: Opti
     }
     let hashes = if kind == CLOSE { None } else { hashes.or_else(|| shaders(pso)) };
     let mut after_compute = kind >= DISPATCH;
+    // lab: `XCL_LIT_TRACE_INPUTS=<cs hash>`: every texture the tables of that program's dispatch name, once
+    if matches!(kind, BEFORE_DISPATCH | BEFORE_INDIRECT_DISPATCH) {
+        static WANT: OnceLock<u64> = OnceLock::new();
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let want = *WANT.get_or_init(|| std::env::var("XCL_LIT_TRACE_INPUTS").ok().and_then(|v| u64::from_str_radix(v.trim(), 16).ok()).unwrap_or(0));
+        if want != 0 && hashes.map(|h| h.0) == Some(want) && !SAID.swap(true, Ordering::Relaxed) {
+            for &(_, res, place, words) in found.iter().filter(|f| f.0 == 0xFF) {
+                let r = res as *mut c_void;
+                let d = ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc());
+                crate::xlog_info!(
+                    "lab: lit trace: inputs of {want:016x}: table {} slot {} [{:08x} {:08x} {:08x} {:08x}] {res:#x} {}",
+                    place >> 8,
+                    place & 0xFF,
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3],
+                    d.map_or("?".to_string(), |d| format!("{}x{}x{} format {} mips {} flags {:#x} dim {}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels, d.Flags.0, d.Dimension.0))
+                );
+            }
+        }
+    }
     // a followed texture's address named through another resource (a view of another format?)
     for &(_, res, place, words) in found.iter().filter(|f| f.0 == 0xFF) {
         if words[0] == 0 || !t.addresses.contains(&words[0]) || t.tracked.iter().any(|k| k.res == res) {

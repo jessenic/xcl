@@ -245,7 +245,18 @@ impl Lw {
         let x = self.fmin(a, b);
         let y = self.fmax(a, b);
         let y = self.fmin(y, c);
-        self.fmax(x, y)
+        let med = self.fmax(x, y);
+        if !crate::gpu::bvh::med3_rdna() {
+            return med;
+        }
+        // lab (`XCL_MED3_RDNA=1`, #686): with a NaN operand, v_min(v_min(a, b), c)
+        let na = self.isnan(a);
+        let nb = self.isnan(b);
+        let nc = self.isnan(c);
+        let n = self.lor(na, nb);
+        let n = self.lor(n, nc);
+        let lo = self.fmin(x, c);
+        self.sel(n, lo, med)
     }
     /// `div_fixup`
     pub fn div_fixup(&mut self, q: Value, d: Value, n: Value) -> Value {
