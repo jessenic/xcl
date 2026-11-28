@@ -1096,7 +1096,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
     }
     if signature_dispatches(sig) {
-        rt_resolve_clear(this, pso);
+        // (the title's object: a skipped program's driver pipeline is a stand-in they all share)
+        rt_resolve_clear(this, raw_pso);
     }
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     if !gfx && !compute {
@@ -2498,9 +2499,10 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
         super::rt_watch::seen(watched, super::rt_watch::Outcome::PutOff);
         return super::pso_async::need_by_submit(pso);
     }
+    let title_pso = pso;
     let pso = super::pso_async::resolve_wait(pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    rt_resolve_clear(this, pso);
+    rt_resolve_clear(this, title_pso);
     if !super::real::is_translated_compute(pso) {
         super::rt_watch::seen(watched, super::rt_watch::Outcome::Untranslated);
         // a console pipeline without a translation (including a background build that
