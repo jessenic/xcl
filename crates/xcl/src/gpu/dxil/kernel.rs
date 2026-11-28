@@ -211,10 +211,11 @@ fn translate_entry_with(
     let code = code.to_vec();
     // the caller's `no_carry` (a test may set it for its own thread)
     let no_carry = super::lower_window::no_carry();
+    let bvh_miss = crate::gpu::bvh::miss_all();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || super::lower_window::with_no_carry(no_carry, || translate_on_this_thread(&code, o, entry, compact, nest, tables, rodata)))
+        .spawn(move || super::lower_window::with_no_carry(no_carry, || crate::gpu::bvh::with_miss_all(bvh_miss, || translate_on_this_thread(&code, o, entry, compact, nest, tables, rodata))))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {

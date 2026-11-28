@@ -43,6 +43,8 @@ pub(super) struct Em {
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
     uses_scratch: bool,
+    /// LOCAL: the program has a BVH intersect translated with `XCL_BVH_MISS=1` (its prelude differs)
+    uses_bvh_miss: bool,
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
     /// coherent scalar loads, 32: `ds_bpermute`)
     x64_words: usize,
@@ -615,6 +617,7 @@ impl Em {
             ps_writes_mask: false,
             uses_lds: false,
             uses_scratch: false,
+            uses_bvh_miss: false,
             x64_words: 1,
             mask_whole_live: BTreeMap::new(),
             upper: None,
@@ -2606,6 +2609,12 @@ impl Em {
             let a = self.t();
             let t = self.t();
             let act = self.act();
+            // lab (`XCL_BVH_MISS=1`): the helper returns a miss without reading the node
+            let miss = crate::gpu::bvh::miss_all();
+            if miss {
+                crate::gpu::bvh::note_miss_all();
+                self.uses_bvh_miss = true;
+            }
             // descriptor: 48-bit base address in 256-byte units (word 0 + word 1 [7:0]),
             // box sorting = word 1 bit 31; node offset is 32-bit (bvh) or 64-bit (bvh64) in 8-byte units
             let off = match node_hi {
@@ -2613,7 +2622,9 @@ impl Em {
                 None => format!("((uint64_t)({node} & ~7u) << 3)"),
             };
             self.line(&format!("uint64_t {a} = ((((uint64_t)({d1} & 0xFFu) << 32) | (uint64_t){d0}) << 8) + {off};"));
-            self.window_read(&format!("(uint)({a} >> 32)"));
+            if !miss {
+                self.window_read(&format!("(uint)({a} >> 32)"));
+            }
             self.line(&format!("uint4 {t} = bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
             let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -4974,7 +4985,13 @@ impl Em {
         }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
-        h.push_str(PRELUDE_MEM);
+        // (only a program that has such an instruction: the others keep their text, and with it their
+        // compiled shaders in the DXC cache)
+        if self.uses_bvh_miss {
+            h.push_str(&prelude_mem_bvh_miss());
+        } else {
+            h.push_str(PRELUDE_MEM);
+        }
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
@@ -6187,6 +6204,17 @@ void scr_st(uint a, uint v, uint n) {
 }
 "#;
 
+/// Lab (`XCL_BVH_MISS=1`, `gpu::bvh::miss_all`): `PRELUDE_MEM` with a `bvh_intersect` that
+/// returns the miss result of the node type first (triangle: t = +inf over 1, box and the
+/// rest: no child), so nothing of the node is read.
+fn prelude_mem_bvh_miss() -> String {
+    const HEAD: &str = "uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 inv, bool sort) {\n";
+    let at = PRELUDE_MEM.find(HEAD).expect("bvh_intersect in PRELUDE_MEM") + HEAD.len();
+    format!("{}{BVH_MISS_RETURN}{}", &PRELUDE_MEM[..at], &PRELUDE_MEM[at..])
+}
+
+const BVH_MISS_RETURN: &str = "    // XCL_BVH_MISS=1: every node is a miss\n    if (type <= 3u) return uint4(0x7F800000u, asuint(1.0f), 0u, 0u);\n    return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);\n";
+
 const PRELUDE_MEM: &str = r#"
 uint4 ld_raw(uint a) {
     // one Load4 + one Load (with several memory windows each is a switch) and no branch
@@ -6965,6 +6993,30 @@ mod tests {
         assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
         assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
         assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+
+    /// Lab `XCL_BVH_MISS=1`: the emitted `bvh_intersect` returns the miss before any load and
+    /// the call selects no window; with the switch off the output is the usual one.
+    #[test]
+    fn bvh_miss_switch_returns_the_miss_before_any_load() {
+        use crate::gpu::rdna2::encode;
+        let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+        code.extend(encode("IMAGE_BVH64_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 104), ("VADDR", 20), ("SRSRC", 2), ("DMASK", 15)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let hlsl = |on: bool, windows: u32| {
+            let opt = super::super::Options { mem_windows: windows, ..Default::default() };
+            crate::gpu::bvh::with_miss_all(on, || super::super::translate(&code, &opt)).unwrap().hlsl
+        };
+        let (off, on) = (hlsl(false, 1), hlsl(true, 1));
+        assert!(off.contains(PRELUDE_MEM) && !off.contains(super::BVH_MISS_RETURN), "the switch off changes nothing");
+        assert!(on.contains(&format!("float3 inv, bool sort) {{\n{}", super::BVH_MISS_RETURN)), "the miss comes first");
+        assert_eq!(on.replace(super::BVH_MISS_RETURN, ""), off, "nothing else changes");
+        // several windows: the two calls select no window either
+        assert_eq!(hlsl(true, 2).lines().count() + 2, hlsl(false, 2).lines().count() + super::BVH_MISS_RETURN.lines().count());
+        // the direct translator (its own thread) takes the switch too: a smaller module, no node loads
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 2, sampler_base: 0 };
+        let direct = |on: bool| crate::gpu::bvh::with_miss_all(on, || crate::gpu::dxil::kernel::translate(&code, o)).unwrap();
+        assert!(direct(true).len() < direct(false).len());
     }
 
     #[test]

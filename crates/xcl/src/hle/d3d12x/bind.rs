@@ -2499,6 +2499,24 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
         super::rt_watch::seen(watched, super::rt_watch::Outcome::PutOff);
         return super::pso_async::need_by_submit(pso);
     }
+    // LOCAL (`XCL_BVH_BUILDER=0`): the dispatches with thread dimensions are the title's BVH builder's
+    // (all of a retail title's 39,474 DispatchX calls in a run, CharlyRien on xcl-dev/xcl#505). Left out,
+    // no acceleration structure gets a root, every ray misses and the title's own miss programs
+    // light the scene - what ScarlettPort's engine does by default (it drops every builder
+    // dispatch unless all of the builder's pipelines exist: a partly working builder corrupted
+    // title memory).
+    {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if flags & DISPATCH_THREAD_DIMENSIONS != 0 && *OFF.get_or_init(|| std::env::var("XCL_BVH_BUILDER").is_ok_and(|v| v.trim() == "0")) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 4 || n.is_power_of_two() {
+                crate::xlog_info!("lab: BVH builder off: {n} DispatchX calls with thread dimensions left out (XCL_BVH_BUILDER=0)");
+            }
+            count(DISPATCHES_SKIPPED);
+            return;
+        }
+    }
     let title_pso = pso;
     let pso = super::pso_async::resolve_wait(pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };

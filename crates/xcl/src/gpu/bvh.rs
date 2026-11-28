@@ -387,6 +387,37 @@ fn closest(data: &[u8], root: u32, o: [f32; 3], d: [f32; 3], tmax: f32, instance
     best
 }
 
+/// Lab (`XCL_BVH_MISS=1`): every translated `image_bvh(64)_intersect_ray` returns its miss result
+/// without reading the node (box nodes: no child, triangle nodes: t = +inf), so every ray the
+/// title traces ends in its miss program. Read by the HLSL emitter and the direct DXIL lowering;
+/// part of the translated cache identity (`pso::translated::identity`).
+pub fn miss_all() -> bool {
+    if let Some(on) = MISS_ALL_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_BVH_MISS").is_ok_and(|v| v.trim() == "1"))
+}
+
+thread_local! {
+    /// `miss_all` for translations on this thread (`with_miss_all`; unset: `XCL_BVH_MISS`)
+    static MISS_ALL_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `f` with `miss_all` set to `on` on this thread (the direct translator thread takes its caller's).
+pub fn with_miss_all<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let old = MISS_ALL_TEST.with(|c| c.replace(Some(on)));
+    let r = f();
+    MISS_ALL_TEST.with(|c| c.set(old));
+    r
+}
+
+/// One log line for the first program with a BVH intersect translated under `miss_all`.
+pub fn note_miss_all() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("lab: XCL_BVH_MISS=1: bvh intersect instructions return a miss"));
+}
+
 impl Bvh {
     /// Closest hit in a bottom level, as a shader's traversal loop finds it: (t, primitive).
     pub fn trace(&self, o: [f32; 3], d: [f32; 3], tmax: f32) -> Option<(f32, u32)> {

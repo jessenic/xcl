@@ -82,6 +82,17 @@ impl Lw {
     #[allow(clippy::too_many_arguments)]
     fn bvh_intersect(&mut self, ty: Value, at: Value, tmax: Value, o: [Value; 3], dir: [Value; 3], inv: [Value; 3], sort: Value, out: [u32; 4]) -> LResult<()> {
         let ones = self.c(u32::MAX);
+        if crate::gpu::bvh::miss_all() {
+            // lab (`XCL_BVH_MISS=1`): the miss of the node type, nothing read. Triangle (0..3):
+            // (t = +inf, denominator 1.0, 0, 0); box and the rest: no child
+            let tri = self.cmpc(Pred::ULe, ty, 3);
+            for (&t, k) in out.iter().zip([0x7F80_0000u32, 0x3F80_0000, 0, 0]) {
+                let k = self.c(k);
+                let v = self.sel(tri, k, ones);
+                self.wr(t, v);
+            }
+            return Ok(());
+        }
         for &t in &out {
             self.wr(t, ones);
         }
@@ -918,8 +929,12 @@ impl Lw {
             let base_lo = self.shlc(d0, 8);
             let off_lo = self.shlc(nlo, 3);
             let a = self.add(base_lo, off_lo);
-            // the window: bits 32.. of the 64-bit address
-            if self.mems.len() > 1 {
+            // the window: bits 32.. of the 64-bit address (lab `XCL_BVH_MISS=1`: nothing is read)
+            let miss = crate::gpu::bvh::miss_all();
+            if miss {
+                crate::gpu::bvh::note_miss_all();
+            }
+            if self.mems.len() > 1 && !miss {
                 let d1lo = self.andc(d1, 0xFF);
                 let b64 = self.pack64(d0, d1lo);
                 let k8 = self.c64(8);
