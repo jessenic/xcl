@@ -3031,6 +3031,9 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     gpu_time_end(this, timed);
     backlight_clear(this, pso);
     ambient_floor(this, pso);
+    if ran.is_ok() {
+        scene_clamp(this, list, pso);
+    }
     for (res, plane) in twins {
         super::list_x::depth_twin_flush(this, res, plane);
     }
@@ -3350,6 +3353,220 @@ unsafe fn ambient_floor(this: *mut c_void, pso: usize) {
             desc.Flags.0,
             crate::log::uptime()
         );
+    }
+}
+
+// lab: a clamp of the first bloom mip ("firefly clamp").
+// The scrub of a texel that is not a finite number is ported from ScarlettPort
+// (https://github.com/ZigZagBoi1/ScarlettPort), engine/crates/scarlett-gpu/src/ambient.rs (the
+// `keep` pass: `c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c` after `max(radiance, 0.0)`) at commit
+// 7ff4755, GPL-3.0-or-later. ScarlettPort has no clamp of the scene or of the bloom's input: that
+// pass only keeps such texels out of its own ambient estimate (and weighs bright ones down by
+// their luminance). Changed for XCL: the test is on the bits (exponent all ones), the texel is
+// written back in place, and what is finite is held to [0, max] a channel.
+// Where: the title's bloom is four compute programs, each sampling the image in slot 1 of the
+// table in s5 and storing a half-size image to slot 2 (`KarisTAAHistory`: slot 3 as well). A
+// `Karis` one reads the scene; `Simple` makes each next mip from the one before. `Simple` is a
+// mean of its taps (0.25 each; the Karis ones are taken to be weighted means too, by their name),
+// so once the first mip is in [0, max] the mips after it are too:
+// the clamp runs right after a dispatch whose input is not itself a bloom output, on what that
+// dispatch stored. The scene is left as the title made it (the tone map, the exposure and the
+// TAA history still read the texels as they are).
+
+/// The retail title's `Bloom:CS_BloomDownsample*_d9c717d8` programs with the slots of the table
+/// in s5 each stores to, and whether it is a first downsample by its name (a `Karis` one).
+const BLOOM_DOWNSAMPLE: [(u64, &[usize], bool); 4] = [
+    // CS_BloomDownsampleKaris
+    (0xbe7a084f47ea94d5, &[2], true),
+    // CS_BloomDownsampleKarisTAAHistory
+    (0xdd572ac17b05b97c, &[3, 2], true),
+    // CS_BloomDownsampleKarisWithOpticalMask
+    (0x4ef76f69bf3b5606, &[2], true),
+    // CS_BloomDownsampleSimple
+    (0x40feb8645c2e80ee, &[2], false),
+];
+
+/// The view index `view` of the shared heap is an image the translated store wrote through
+/// (`ResourceDescriptorHeap[word 0 + 1]`): the same view here, so no heap or table of ours.
+const SCENE_CLAMP_HLSL: &str = "cbuffer C : register(b0) { float limit; uint view; };\nfloat held(float v) { return min(max(v, 0.0), limit); }\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {\n    RWTexture2D<float4> image = ResourceDescriptorHeap[view];\n    uint w, h;\n    image.GetDimensions(w, h);\n    if (id.x >= w || id.y >= h) return;\n    float4 c = image[id.xy];\n    uint3 e = asuint(c.rgb) & 0x7F800000u;\n    bool special = e.x == 0x7F800000u || e.y == 0x7F800000u || e.z == 0x7F800000u;\n    float3 o = special ? float3(0.0, 0.0, 0.0) : float3(held(c.r), held(c.g), held(c.b));\n    uint3 d = asuint(o) ^ asuint(c.rgb);\n    if ((d.x | d.y | d.z) != 0u) image[id.xy] = float4(o, c.a);\n}\n";
+
+unsafe fn scene_clamp_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
+    let key = dev.as_raw() as usize;
+    if let Some(pair) = CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
+        return Ok(pair);
+    }
+    let dxil = crate::gpu::recomp::dxc::compile_cached(SCENE_CLAMP_HLSL, "main", "cs_6_6")?.0;
+    let params = [D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 2 },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
+        ..Default::default()
+    };
+    let mut blob = None;
+    D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).map_err(|e| format!("scene clamp rs serialize: {e}"))?;
+    let blob = blob.ok_or("scene clamp rs blob")?;
+    let rs: ID3D12RootSignature = dev
+        .CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()))
+        .map_err(|e| format!("scene clamp rs create: {e}"))?;
+    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
+        ..Default::default()
+    };
+    let res_pso: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
+    std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
+    let pso = res_pso.map_err(|e| format!("scene clamp pso create: {e}"))?;
+    // (the first pair put in the cache wins, as in `scale_indirect_pipeline`)
+    Ok(CACHE.lock().unwrap().get_or_insert_with(HashMap::new).entry(key).or_insert((rs, pso)).clone())
+}
+
+/// Whether a shader may read an image of DXGI format `format` through its UAV on `dev` (the
+/// clamp reads what it writes; R11G11B10_FLOAT is not among the formats every device loads).
+unsafe fn scene_clamp_loads(dev: &ID3D12Device, format: i32) -> bool {
+    static KNOWN: Mutex<Vec<(i32, bool)>> = Mutex::new(Vec::new());
+    if let Some(&(_, ok)) = KNOWN.lock().unwrap().iter().find(|k| k.0 == format) {
+        return ok;
+    }
+    let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format), ..Default::default() };
+    let ok = dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut fs as *mut _ as *mut c_void, std::mem::size_of_val(&fs) as u32).is_ok()
+        && fs.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0 != 0;
+    KNOWN.lock().unwrap().push((format, ok));
+    ok
+}
+
+/// lab (`XCL_SCENE_CLAMP=<max>`, e.g. 64; `=probe`: log only; unset: off): right after the
+/// dispatch of a bloom downsample that reads the scene, the mip it stored is held to [0, max] a
+/// channel and its texels that are not finite numbers are zeroed (see above), by a compute pass
+/// of ours on the title's list. A few texels of the scene with huge values or NaN otherwise go
+/// through every mip of the bloom and over the whole frame. The title's arguments, root
+/// signature and pipeline are bound again afterwards (`bind_abi`, as before its dispatch).
+unsafe fn scene_clamp(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize) {
+    // (probe: Some(None))
+    static SET: std::sync::OnceLock<Option<Option<f32>>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        let v = std::env::var("XCL_SCENE_CLAMP").ok()?;
+        if v.trim() == "probe" {
+            return Some(None);
+        }
+        let max = v.trim().parse::<f32>().ok().filter(|m| m.is_finite() && *m > 0.0)?;
+        crate::xlog_info!("lab: scene clamp: the first bloom mip is held to [0, {max}], NaN / Inf zeroed (XCL_SCENE_CLAMP)");
+        Some(Some(max))
+    });
+    let Some(max) = set else { return };
+    let Some((cs, _)) = super::real::pso_shaders(super::pso_async::resolve(pso)) else { return };
+    let Some(&(_, slots, first)) = BLOOM_DOWNSAMPLE.iter().find(|p| p.0 == cs) else { return };
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    // the images bloom downsamples stored to: a dispatch that reads one makes a later mip
+    static MIPS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let said = call <= 16 || call.is_power_of_two();
+    let Some(table) = second_table(this) else {
+        if said {
+            crate::xlog_info!("lab: scene clamp call #{call} {cs:016x}: no table in s5 – left");
+        }
+        return;
+    };
+    let describe = |res: usize| {
+        let r = res as *mut c_void;
+        ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc())
+    };
+    let input = table_image(table + 32).and_then(|(_, found)| found).map(|f| f.0);
+    // (a `Karis` program is a first downsample whatever it reads: its TAA history may be an
+    // image a bloom program stored)
+    let later = !first && input.is_some_and(|r| MIPS.lock().unwrap().contains(&r));
+    if said {
+        let d = input.and_then(describe);
+        crate::xlog_info!(
+            "lab: scene clamp call #{call} {cs:016x}: reads {:#x} {}x{} format {}{} (at {:.1} s)",
+            input.unwrap_or(0),
+            d.map_or(0, |d| d.Width),
+            d.map_or(0, |d| d.Height),
+            d.map_or(0, |d| d.Format.0),
+            if first { ": the first downsample" } else if later { ": a bloom mip – its output is left" } else { ": not a bloom mip – taken as the first downsample" },
+            crate::log::uptime()
+        );
+    }
+    let mut ran = false;
+    for &k in slots {
+        let Some((d, found)) = table_image(table + 32 * k) else { continue };
+        let Some((res, by)) = found else {
+            if said {
+                crate::xlog_info!("lab: scene clamp call #{call} {cs:016x}: slot {k} ({:08x} .. {:08x}): {}", d[0], d[3], no_texture(d));
+            }
+            continue;
+        };
+        {
+            let mut m = MIPS.lock().unwrap();
+            if !m.contains(&res) {
+                if m.len() >= 64 {
+                    m.clear();
+                }
+                m.push(res);
+            }
+        }
+        let Some(desc) = describe(res) else { continue };
+        // R32G32B32A32_FLOAT, R16G16B16A16_FLOAT, R11G11B10_FLOAT with a UAV
+        let ours = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1 && matches!(desc.Format.0, 2 | 10 | 26) && desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0;
+        // (what the translated store asks of the descriptor before it writes through view word 0 + 1)
+        let stored = d[1] & 0xFF == 0 && d[0] < 999_999;
+        let what = match max {
+            _ if later => "a later mip – left".to_string(),
+            _ if !ours => "not a float image with a UAV – left".to_string(),
+            _ if !stored => "not a descriptor the program stores through – left".to_string(),
+            None => "would be clamped".to_string(),
+            Some(_) if FAILED.load(Ordering::Relaxed) >= 4 => "NOT clamped (no pipeline)".to_string(),
+            Some(max) => match super::real::list_device(this) {
+                None => "NOT clamped (no device)".to_string(),
+                Some(dev) if !scene_clamp_loads(&dev, desc.Format.0) => "NOT clamped (the device does not load this format through a UAV)".to_string(),
+                Some(dev) => match scene_clamp_pipeline(&dev) {
+                    Err(e) => {
+                        // (tried again at the next calls: a program missing from the DXIL
+                        // cache can fail once where compiles are deferred)
+                        let n = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 4 {
+                            crate::xlog_warn!("lab: scene clamp: no pipeline, try {n} of 4 ({e}){}", if n == 4 { " – off" } else { "" });
+                        }
+                        "NOT clamped (no pipeline)".to_string()
+                    }
+                    Ok((rs, pipeline)) => {
+                        let r = res as *mut c_void;
+                        let image = ID3D12Resource::from_raw_borrowed(&r);
+                        // (after the title's stores to it, and before what reads it next)
+                        emit_uav_barrier(list, image);
+                        list.SetComputeRootSignature(&rs);
+                        list.SetPipelineState(&pipeline);
+                        let consts = [max.to_bits(), d[0] + 1];
+                        list.SetComputeRoot32BitConstants(0, 2, consts.as_ptr() as *const c_void, 0);
+                        list.Dispatch((desc.Width as u32).div_ceil(8), desc.Height.div_ceil(8), 1);
+                        emit_uav_barrier(list, image);
+                        ran = true;
+                        format!("clamped to {max}")
+                    }
+                },
+            },
+        };
+        if said {
+            crate::xlog_info!("lab: scene clamp call #{call} {cs:016x}: {res:#x} {}x{} format {}: {what} (slot {k}, by {by}, view {}, flags {:#x})", desc.Width, desc.Height, desc.Format.0, d[0] + 1, desc.Flags.0);
+        }
+    }
+    // the title's compute bindings as its dispatch had them (ours replaced the root signature,
+    // with it every root argument, and the pipeline)
+    if ran {
+        if let Err(e) = bind_abi(this, list, pso, false) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!("lab: scene clamp call #{call} {cs:016x}: the title's bindings were not set again: {e}");
+            }
+        }
     }
 }
 
