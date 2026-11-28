@@ -1248,6 +1248,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             None => pc(this, sig, max, args, args_off, count_buf, count_off),
         });
         gp_mark(this, gp::Label::op(gp_kind, gp_name, [max, 0, 0]));
+        if compute && !gfx {
+            backlight_clear(this, pso);
+            ambient_floor(this, pso);
+        }
         for (res, plane) in twins {
             super::list_x::depth_twin_flush(this, res, plane);
         }
@@ -3025,6 +3029,8 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         gp_mark(this, gp::Label::op(gp::Kind::Dispatch, cs, [x, y, z]));
     }
     gpu_time_end(this, timed);
+    backlight_clear(this, pso);
+    ambient_floor(this, pso);
     for (res, plane) in twins {
         super::list_x::depth_twin_flush(this, res, plane);
     }
@@ -3096,6 +3102,254 @@ unsafe fn pass_fill_at(this: *mut c_void, pso: usize, before: bool) {
         if n <= 24 || n.is_power_of_two() {
             crate::xlog_info!("pass {}fill #{n}: cs {cs:016x} t{ti}[{k}] {:#x} with {pat:#010x} at {:.1} s: {}", if before { "pre" } else { "" }, r.unwrap_or(0), crate::log::uptime(), if done { "done" } else { "NOT done" });
         }
+    }
+}
+
+// lab: the clear of the translucent back-light after the final gather.
+// Ported from ScarlettPort (https://github.com/ZigZagBoi1/ScarlettPort),
+// engine/crates/scarlett-gpu/src/ambient.rs (`BACKLIGHT`, `backlight_form`, `clear_backlight`) and
+// its caller in draw.rs (`State::ambient`, `Role::Gather`) at commit 207b634, GPL-3.0-or-later.
+// Changed for XCL: the programs are known by their console record hashes (ScarlettPort looks for
+// "CS_FinalGather" in the container; its register check, u32 / u36, is replaced by the list of
+// records whose console code stores to both places); the places are slots of the table in s5
+// (ScarlettPort: root parameter 1, dwords 120 / 112 of its table = slots 15 / 14); the image is
+// cleared by a copy from a buffer of zeros (`list_x::pass_fill`) and not by a compute pass of our
+// own, so the list's pipeline and root signature stay; it runs before the alias copies of the
+// dispatch (`depth_twin_flush`), which carry the zeros to the R9G9B9E5 texture of a pair; and it
+// is off unless `XCL_BACKLIGHT_CLEAR` is set (ScarlettPort: on whenever its BVH builder is off).
+
+/// The retail title's `indirect_diffuse_lighting:CS_FinalGather_<a>_<b>_<c>_<d>_a1d0fa7d` programs
+/// (all 16; each stores to slots 14 and 15 of its second table and reads neither).
+const FINAL_GATHER: [u64; 16] = [
+    0xf6be8452baf45680, 0x811d74bbe53fcd05, 0xb1b67758fd0a32f6, 0xda0a887b902f484a, 0x0607b318f111187b, 0x9c1e6716e59ecf21,
+    0x49839ce6ed49e4a9, 0x90ae30d4cf8c9562, 0x0e6eec8c51be6a42, 0x077c59f4226e8d65, 0x6e36e3f6e301ce04, 0xae6ed826aa4a01b2,
+    0xc636a2f97238d94e, 0xcb04fcf3d6d02854, 0x836ebb050d111009, 0x72a3d4cd81800c70,
+];
+
+/// Whether the image of DXGI format `format` in slot `slot` of the final gather's second table
+/// is the back-light: packed (R9G9B9E5 in R32_UINT) in slot 15 or 14, floats in slot 14 only
+/// (ScarlettPort's `backlight_form`).
+fn backlight_format(slot: usize, format: i32) -> bool {
+    match (slot, format) {
+        // R32_UINT
+        (15 | 14, 42) => true,
+        // R32G32B32A32_FLOAT, R16G16B16A16_FLOAT, R11G11B10_FLOAT, R32_FLOAT
+        (14, 2 | 10 | 26 | 41) => true,
+        _ => false,
+    }
+}
+
+/// lab (`XCL_BACKLIGHT_CLEAR=1`; `=probe`: log only): right after a dispatch of a final gather
+/// program, the image it wrote the light translucent surfaces get from behind to is cleared.
+/// Without the title's ray-traced light that light is not occluded and such surfaces glow.
+unsafe fn backlight_clear(this: *mut c_void, pso: usize) {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("XCL_BACKLIGHT_CLEAR").as_deref().map(str::trim) {
+        Ok("1") => 2,
+        Ok("probe") => 1,
+        _ => 0,
+    });
+    if mode == 0 {
+        return;
+    }
+    let Some((cs, _)) = super::real::pso_shaders(super::pso_async::resolve(pso)).filter(|s| FINAL_GATHER.contains(&s.0)) else { return };
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static CLEARS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let said = call <= 16 || call.is_power_of_two();
+    let Some(table) = second_table(this) else {
+        if said {
+            crate::xlog_info!("lab: back-light call #{call} {cs:016x}: no table in s5 – nothing cleared");
+        }
+        return;
+    };
+    let mut cleared: Vec<usize> = Vec::new();
+    for k in [15usize, 14] {
+        let Some((d, found)) = table_image(table + 32 * k) else { continue };
+        let Some((res, by)) = found else {
+            if said {
+                crate::xlog_info!("lab: back-light call #{call} {cs:016x}: slot {k} ({:08x} .. {:08x}): {}", d[0], d[3], no_texture(d));
+            }
+            continue;
+        };
+        let r = res as *mut c_void;
+        let Some(desc) = ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc()) else { continue };
+        let plane = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1;
+        let ours = plane && backlight_format(k, desc.Format.0);
+        let pair = super::depth_twin::alias_info(res).map(|a| a.dst);
+        if mode == 1 || !ours {
+            if said {
+                crate::xlog_info!(
+                    "lab: back-light call #{call} {cs:016x}: slot {k} {res:#x} (by {by}) {}x{} format {} dimension {} mips {} flags {:#x}, alias pair {pair:x?}: {}",
+                    desc.Width,
+                    desc.Height,
+                    desc.Format.0,
+                    desc.Dimension.0,
+                    desc.MipLevels,
+                    desc.Flags.0,
+                    if !ours { "not the back-light's format – left" } else if cleared.contains(&res) { "the same image again" } else { "would be cleared" }
+                );
+            }
+            if ours && !cleared.contains(&res) {
+                cleared.push(res);
+            }
+            continue;
+        }
+        if cleared.contains(&res) {
+            continue;
+        }
+        cleared.push(res);
+        // (as a title's own copy into it: its CPU view is not uploaded over the zeros)
+        super::title_textures::note_gpu_write(res);
+        let done = super::list_x::pass_fill(this, res, 0);
+        let n = CLEARS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() || !done && said {
+            crate::xlog_info!(
+                "lab: back-light clear #{n} {cs:016x}: {res:#x} {}x{} format {}{} (slot {k}, by {by}, alias pair {pair:x?}, at {:.1} s)",
+                desc.Width,
+                desc.Height,
+                desc.Format.0,
+                if done { "" } else { " NOT done" },
+                crate::log::uptime()
+            );
+        }
+    }
+}
+
+/// lab: the second descriptor table of the compute arguments bound on the list: the root
+/// argument in s5 (bytes 4..8 of the arguments), as a CPU address.
+unsafe fn second_table(this: *mut c_void) -> Option<usize> {
+    let u = crate::gpu::uma::get()?;
+    let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+    layout
+        .filter(|l| l.params.contains(&Param::Table { at: 4 }))
+        .and_then(|_| args.get(4..8).map(|b| u32::from_le_bytes(b.try_into().unwrap())))
+        .filter(|&v| v != 0)
+        .map(|v| u.base() + v as usize)
+}
+
+/// lab: the first words of the descriptor in the table slot at `slot`, and the texture its
+/// views were made of with how it was found. An image descriptor's word 0 is the index of its
+/// SRV in the shared PC heap (its UAV is the next one: what a translated `image_store` writes
+/// through), and nothing maps that index to a resource but `console_heap::note_resource`, which
+/// follows views made and copied through the device – only while a diagnostic asks for it
+/// (`XCL_BACKLIGHT_CLEAR` and `XCL_AMBIENT` do). None for the texture: no image descriptor, a
+/// null view, or a view made before that map was kept.
+unsafe fn table_image(slot: usize) -> Option<([u32; 4], Option<(usize, &'static str)>)> {
+    if !crate::gpu::shader::readable(slot, 32) {
+        return None;
+    }
+    let d = (slot as *const [u32; 4]).read_unaligned();
+    let alive = |r: usize| crate::gpu::shader::readable(r, 8) && crate::gpu::shader::readable((r as *const usize).read_unaligned(), 8 * 12);
+    // (an image descriptor: type in the top bits of word 3)
+    let found = if d[3] >> 28 < 8 {
+        None
+    } else if let Some(r) = super::console_heap::resource_at(slot) {
+        Some((r, "slot"))
+    } else if let Some(r) = (d[0] != 0).then(|| super::console_heap::resource_by_word0_cached(d[0])).flatten() {
+        Some((r, "word 0"))
+    } else {
+        super::console_heap::index_resource(d[0]).map(|r| (r, "pages"))
+    };
+    Some((d, found.filter(|f| alive(f.0))))
+}
+
+fn no_texture(d: [u32; 4]) -> &'static str {
+    if d[3] >> 28 < 8 { "no image descriptor" } else { "null / placeholder image (no texture's view was made in a slot with this index)" }
+}
+
+// lab: a floor for the diffuse indirect light without the title's rays.
+// After ScarlettPort (https://github.com/ZigZagBoi1/ScarlettPort),
+// engine/crates/scarlett-gpu/src/ambient.rs (`LIGHT`, `Role::Resolve`, the `RAISE` pass with
+// `constant > 0`: `SCARLETT_AMBIENT=constant:<level>`, which is beloooo's find, see that file's
+// header) and its caller in draw.rs (`State::ambient`), same lineage as commit 207b634,
+// GPL-3.0-or-later; `rgb9e5` is its HLSL `pack` in Rust.
+// What is here is NOT its estimate (the light of visible surfaces, kept from
+// `CS_CacheScreenSpaceRadiance` in 64x36 cells, gathered at 160x90 points as first-order
+// harmonics and put under each pixel by depth and normal, max(what the title left, estimate)):
+// that needs compute passes of our own. It is its constant mode without the shade in creases:
+// after a `CS_ScreenProbes_TemporalResolve` program the whole image in slot 22 of the table in
+// s5 (ScarlettPort: root parameter 1, dword 176) is REPLACED by (1, 0.98, 0.94) x strength,
+// packed, by a copy from a pattern buffer (`list_x::pass_fill`); the alias copies after the
+// dispatch carry it to the R9G9B9E5 texture of a pair.
+
+/// The retail title's `indirect_diffuse_lighting:CS_ScreenProbes_TemporalResolve[_CB][_ReflectiveCaustics]_*`
+/// programs (all 6; each stores to slot 22 of its second table and does not read it).
+const TEMPORAL_RESOLVE: [u64; 6] = [0x6c2602da6f054649, 0x64021c4c25c9f2d0, 0xb63c45317cd2ae74, 0x4e276532d3bac1f0, 0x892df26f9c8796d2, 0xc1aa04fd59ec93f6];
+
+/// `c` as R9G9B9E5 (9-bit mantissas, red lowest, a shared 5-bit exponent with bias 15 on top:
+/// a channel is mantissa x 2^(exponent - 24)).
+fn rgb9e5(c: [f32; 3]) -> u32 {
+    let c = c.map(|v| if v.is_finite() { v.clamp(0.0, 65408.0) } else { 0.0 });
+    let top = c[0].max(c[1]).max(c[2]);
+    let mut e = (top.max(1e-9).log2().floor() as i32 + 16).clamp(0, 31);
+    if top * 2f32.powi(24 - e) >= 511.5 {
+        e = (e + 1).min(31);
+    }
+    let scale = 2f32.powi(24 - e);
+    let m = c.map(|v| ((v * scale + 0.5) as u32).min(511));
+    m[0] | m[1] << 9 | m[2] << 18 | (e as u32) << 27
+}
+
+/// lab (`XCL_AMBIENT=<strength>`, e.g. 0.8; `=probe`: log only; unset: off): right after a
+/// dispatch of a screen-probe temporal resolve program, the diffuse-light image it wrote is
+/// filled with a constant (see above). Without the title's rays that image is zero indoors and a
+/// character lighting pass divides by it.
+unsafe fn ambient_floor(this: *mut c_void, pso: usize) {
+    // (probe: Some(None))
+    static SET: std::sync::OnceLock<Option<Option<u32>>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        let v = std::env::var("XCL_AMBIENT").ok()?;
+        if v.trim() == "probe" {
+            return Some(None);
+        }
+        let s = v.trim().parse::<f32>().ok().filter(|s| s.is_finite() && *s > 0.0)?;
+        let word = rgb9e5([s, 0.98 * s, 0.94 * s]);
+        crate::xlog_info!("lab: ambient: strength {s} = R9G9B9E5 word {word:#010x} after the screen probes' temporal resolve (XCL_AMBIENT)");
+        Some(Some(word))
+    });
+    let Some(word) = set else { return };
+    let Some((cs, _)) = super::real::pso_shaders(super::pso_async::resolve(pso)).filter(|s| TEMPORAL_RESOLVE.contains(&s.0)) else { return };
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let said = call <= 16 || call.is_power_of_two();
+    let k = 22usize;
+    let Some((d, found)) = second_table(this).and_then(|t| table_image(t + 32 * k)) else {
+        if said {
+            crate::xlog_info!("lab: ambient call #{call} {cs:016x}: no table in s5, or no slot {k} in it – left");
+        }
+        return;
+    };
+    let Some((res, by)) = found else {
+        if said {
+            crate::xlog_info!("lab: ambient call #{call} {cs:016x}: slot {k} ({:08x} .. {:08x}): {}", d[0], d[3], no_texture(d));
+        }
+        return;
+    };
+    let r = res as *mut c_void;
+    let Some(desc) = ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc()) else { return };
+    // (R32_UINT holding R9G9B9E5, as ScarlettPort asks)
+    let ours = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1 && desc.Format.0 == 42;
+    let pair = super::depth_twin::alias_info(res).map(|a| a.dst);
+    let what = match word {
+        _ if !ours => "not the light's format – left".to_string(),
+        None => "would be raised".to_string(),
+        Some(word) => {
+            // (as a title's own copy into it: its CPU view is not uploaded over the fill)
+            super::title_textures::note_gpu_write(res);
+            if super::list_x::pass_fill(this, res, word) { format!("raised to {word:#010x}") } else { "NOT raised (no fill)".to_string() }
+        }
+    };
+    if said {
+        crate::xlog_info!(
+            "lab: ambient call #{call} {cs:016x}: slot {k} {res:#x} (by {by}) {}x{} format {} mips {} flags {:#x}, alias pair {pair:x?}: {what} (at {:.1} s)",
+            desc.Width,
+            desc.Height,
+            desc.Format.0,
+            desc.MipLevels,
+            desc.Flags.0,
+            crate::log::uptime()
+        );
     }
 }
 
@@ -4359,5 +4613,25 @@ void main(uint t : SV_GroupIndex) {
         );
         DISPATCH_MESH_SIGS.lock().unwrap().as_mut().unwrap().remove(&sig);
         assert_eq!(dispatch_mesh_sig_of(sig), None);
+    }
+
+    /// R9G9B9E5 words: a channel is mantissa x 2^(exponent - 24), red in the low bits.
+    #[test]
+    fn rgb9e5_packs_mantissas_under_a_shared_exponent() {
+        let unpack = |v: u32| [v & 511, (v >> 9) & 511, (v >> 18) & 511].map(|m| m as f32 * 2f32.powi((v >> 27) as i32 - 24));
+        assert_eq!(rgb9e5([0.0; 3]), 0);
+        // 1.0 = 256 x 2^(16 - 24)
+        assert_eq!(rgb9e5([1.0, 1.0, 1.0]), 256 | 256 << 9 | 256 << 18 | 16 << 27);
+        assert_eq!(rgb9e5([1.0, 0.5, 0.25]), 256 | 128 << 9 | 64 << 18 | 16 << 27);
+        // a mantissa that would round to 512 takes the next exponent
+        assert_eq!(rgb9e5([1.9999, 0.0, 0.0]), 256 | 17 << 27);
+        assert_eq!(rgb9e5([f32::NAN, -1.0, f32::INFINITY]), 0);
+        for c in [[0.8, 0.784, 0.752], [0.05, 0.2, 0.01], [300.0, 2.0, 0.5]] {
+            let back = unpack(rgb9e5(c));
+            let top = c[0].max(c[1]).max(c[2]);
+            for (a, b) in c.iter().zip(back) {
+                assert!((a - b).abs() <= top / 256.0, "{c:?} -> {back:?}");
+            }
+        }
     }
 }
