@@ -1143,8 +1143,9 @@ pub unsafe fn bring_page(at: usize) -> bool {
     let Ok(mut g) = AWAY.try_lock() else { return false };
     let Some(away) = g.as_mut() else { return false };
     let Some(page) = away.title_page(at) else { return false };
-    let Some(&now) = away.page.get(&page) else { return false };
-    if now == at || u.contains(now) || away.at.contains_key(&at) {
+    // where the page is: away at another address, or at its home (in unified memory)
+    let Some(now) = away.page.get(&page).copied().or_else(|| page_home(page)) else { return false };
+    if now == at || away.at.contains_key(&at) {
         return false;
     }
     // only an address that is reserved and not committed: one the title has committed again since
@@ -1156,21 +1157,11 @@ pub unsafe fn bring_page(at: usize) -> bool {
             return false;
         }
     }
-    mirrors::page_moved(page);
-    let moved = match move_away(away, now, at, page, false) {
-        Ok(true) => true,
-        // never used where it was: zeros here
-        Ok(false) => {
-            if mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
-                false
-            } else {
-                away.at.insert(at, page);
-                away.page.insert(page, at);
-                true
-            }
-        }
-        Err(()) => false,
-    };
+    // as if the title mapped the page here again: `map_pages` moves it from wherever it is (another
+    // address, a sparse window, its home), with the bookkeeping that goes with each
+    let mut number = page;
+    let moved = !map_pages(away, at as *mut c_void, 1, &mut number).is_null();
+    give_back_homes(away);
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 16 || n.is_power_of_two() {
@@ -1192,7 +1183,7 @@ pub unsafe fn bring_range(p: usize, len: usize) {
         if away.title.is_empty() {
             return;
         }
-        let left = |at: &usize| !away.at.contains_key(at) && away.title_page(*at).is_some_and(|pg| away.page.get(&pg).is_some_and(|&now| now != *at));
+        let left = |at: &usize| !away.at.contains_key(at) && away.title_page(*at).is_some();
         // (a caller may give a length of gigabytes: then the addresses the title mapped pages at are
         // walked, not the range – stepping through such a range stalled the title until its watchdog
         // ended it)

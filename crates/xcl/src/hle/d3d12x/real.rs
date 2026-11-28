@@ -2077,7 +2077,8 @@ static CONSOLE_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 /// lab (`XCL_SKIP_LOG`): the console shaders of a stand-in or fallback pipeline, so that a
 /// skipped or put-off call of it can be named (`bind::skip_note_pso`).
 unsafe fn skip_log_name(ppv: *mut *mut c_void, first: &D3D12_SHADER_BYTECODE, second: Option<&D3D12_SHADER_BYTECODE>) {
-    if !super::bind::skip_log() || ppv.is_null() || (*ppv).is_null() {
+    // (lab: `bind::rt_resolve_clear` knows a skipped program's stand-in by this too)
+    if !(super::bind::skip_log() || super::bind::rt_resolve_clear_mode() != 0) || ppv.is_null() || (*ppv).is_null() {
         return;
     }
     let hash = |b: &D3D12_SHADER_BYTECODE| shader_bytes(b).map_or(0, crate::gpu::shader::fnv64);

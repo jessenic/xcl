@@ -2639,6 +2639,16 @@ unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usi
 /// in every dword from this point of the list on (0: cleared). Copied from a pattern buffer; the
 /// texture is written in whatever state it is in, as the alias copies do.
 pub(super) unsafe fn pass_fill(list: *mut c_void, res: usize, pattern: u32) -> bool {
+    let mut pat = [0u8; 16];
+    for c in pat.chunks_exact_mut(4) {
+        c.copy_from_slice(&pattern.to_le_bytes());
+    }
+    pass_fill_bytes(list, res, pat)
+}
+
+/// lab (`bind::rt_resolve_clear`): as `pass_fill`, with a 16-byte pattern (texels of 4, 8 or 16
+/// bytes: rows start on a multiple of 16 bytes of the pattern buffer).
+pub(super) unsafe fn pass_fill_bytes(list: *mut c_void, res: usize, pat: [u8; 16]) -> bool {
     let r = res as *mut c_void;
     let Some(d) = ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc()) else { return false };
     let Some(dev) = device_of(list) else { return false };
@@ -2647,10 +2657,6 @@ pub(super) unsafe fn pass_fill(list: *mut c_void, res: usize, pattern: u32) -> b
     dev.GetCopyableFootprints(&d, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
     if total == 0 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 {
         return false;
-    }
-    let mut pat = [0u8; 16];
-    for c in pat.chunks_exact_mut(4) {
-        c.copy_from_slice(&pattern.to_le_bytes());
     }
     let Some(buf) = pattern_buffer(list, pat, total) else { return false };
     let uav: [u32; 8] = [2, 0, 0, 0, 0, 0, 0, 0];

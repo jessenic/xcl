@@ -40,6 +40,8 @@ struct State {
     /// the next dispatch's thread limits (`IO_THREAD_LIMIT`; a `DispatchX` with thread
     /// dimensions), taken by its `bind_abi`
     limits: [u32; 3],
+    /// lab (`rt_resolve_clear`): word 0 of the image descriptors this recording has dealt with
+    rt_cleared: Vec<u32>,
 }
 
 static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>>> = Mutex::new(None);
@@ -193,6 +195,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.pso = initial_pso;
+        s.rt_cleared.clear();
         s.layout = None;
         s.args.clear();
         s.layout_gfx = None;
@@ -1091,6 +1094,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             return;
         }
+    }
+    if signature_dispatches(sig) {
+        rt_resolve_clear(this, pso);
     }
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     if !gfx && !compute {
@@ -2494,6 +2500,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
     }
     let pso = super::pso_async::resolve_wait(pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    rt_resolve_clear(this, pso);
     if !super::real::is_translated_compute(pso) {
         super::rt_watch::seen(watched, super::rt_watch::Outcome::Untranslated);
         // a console pipeline without a translation (including a background build that
@@ -3567,6 +3574,189 @@ unsafe fn scene_clamp(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: 
                 crate::xlog_warn!("lab: scene clamp call #{call} {cs:016x}: the title's bindings were not set again: {e}");
             }
         }
+    }
+}
+
+// lab: the image the title's `CS_RaytracingResolve_*` programs shade ray hits into, cleared once
+// a frame. Each material has three such programs; the two large ones store a colour with alpha
+// 1.0 to a 2-D image (one slot of the table in s5, which slot depends on the material) at the
+// pixel of each hit of that material, and the first of them stores (0, 0, 0, 1.0) on its
+// early-out path: the title's own "nothing" value. A program that is skipped
+// (`XCL_PSO_SKIP_FILE`) leaves its pixels as they were, so what reads the image (the lighting of
+// characters among others) gets stale texels. Here the whole image holds (0, 0, 0, 1.0) before
+// the first resolve dispatch of a frame, skipped or not, so the programs that do run still
+// write over it. (The third, small program of a material stores the hits' surface records to
+// two buffers and, in one mode, to a 3-D image in its slot: those are left.)
+
+/// lab: `XCL_RT_RESOLVE_CLEAR`: 0 off, 1 `probe` (log only), 2 `1`.
+pub(super) fn rt_resolve_clear_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("XCL_RT_RESOLVE_CLEAR").as_deref().map(str::trim) {
+        Ok("1") => 2,
+        Ok("probe") => 1,
+        _ => 0,
+    })
+}
+
+/// The resolve programs and the slot of the table in s5 each stores its image to: the lines
+/// `<16 hex digits of the record hash> ... img=<slot> ...` of the file `XCL_RT_RESOLVE_SLOTS`
+/// names (made from the translated programs' console code; it may be the skip file itself,
+/// which reads only the hash of a line).
+fn rt_resolve_slots() -> &'static HashMap<u64, usize> {
+    static SLOTS: std::sync::OnceLock<HashMap<u64, usize>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let path = std::env::var("XCL_RT_RESOLVE_SLOTS").or_else(|_| std::env::var("XCL_PSO_SKIP_FILE")).unwrap_or_default();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let map: HashMap<u64, usize> = text
+            .lines()
+            .filter_map(|l| {
+                let hash = u64::from_str_radix(l.get(..16)?, 16).ok()?;
+                let slot = l.split_whitespace().find_map(|w| w.strip_prefix("img=")?.parse().ok())?;
+                Some((hash, slot))
+            })
+            .collect();
+        crate::xlog_info!("lab: rt resolve clear: {} programs with an image slot from {path:?} (XCL_RT_RESOLVE_SLOTS)", map.len());
+        map
+    })
+}
+
+/// (0, 0, 0, 1.0) as texels of DXGI format `format`, 16 bytes of them.
+fn rt_resolve_nothing(format: i32) -> Option<[u8; 16]> {
+    let words = |w: [u32; 4]| {
+        let mut p = [0u8; 16];
+        for (c, w) in p.chunks_exact_mut(4).zip(w) {
+            c.copy_from_slice(&w.to_le_bytes());
+        }
+        p
+    };
+    match format {
+        // R32G32B32A32_FLOAT
+        2 => Some(words([0, 0, 0, 0x3F80_0000])),
+        // R16G16B16A16_FLOAT
+        10 => Some(words([0, 0x3C00_0000, 0, 0x3C00_0000])),
+        // R16G16B16A16_UNORM
+        11 => Some(words([0, 0xFFFF_0000, 0, 0xFFFF_0000])),
+        // R10G10B10A2_UNORM
+        24 => Some(words([0xC000_0000; 4])),
+        // R8G8B8A8_UNORM, _SRGB
+        28 | 29 => Some(words([0xFF00_0000; 4])),
+        // R11G11B10_FLOAT, R32_UINT (R9G9B9E5 words), R9G9B9E5: no alpha
+        26 | 42 | 67 => Some([0; 16]),
+        _ => None,
+    }
+}
+
+/// lab (`XCL_RT_RESOLVE_CLEAR=1`; `=probe`: log only; with `XCL_RT_RESOLVE_SLOTS=<file>`): before
+/// a dispatch of a ray-tracing resolve program – run or skipped – the image it stores to is
+/// cleared to the title's "nothing", once a frame and list (see above). `pso`: the pipeline as
+/// the title bound it (a skipped program's stand-in is known by its record all the same).
+unsafe fn rt_resolve_clear(this: *mut c_void, pso: usize) {
+    let mode = rt_resolve_clear_mode();
+    if mode == 0 {
+        return;
+    }
+    let slots = rt_resolve_slots();
+    if slots.is_empty() {
+        return;
+    }
+    let real = super::pso_async::resolve(pso);
+    {
+        // LOCAL debug: what the untranslated dispatches look like to this hook
+        static UNTR: AtomicU64 = AtomicU64::new(0);
+        static NAMED: AtomicU64 = AtomicU64::new(0);
+        static INSET: AtomicU64 = AtomicU64::new(0);
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        if !super::real::is_translated_compute(real) {
+            let u = UNTR.fetch_add(1, Ordering::Relaxed) + 1;
+            let sh = super::real::pso_shaders(real).or_else(|| super::real::pso_shaders(pso));
+            if let Some(s) = sh {
+                NAMED.fetch_add(1, Ordering::Relaxed);
+                if slots.contains_key(&s.0) {
+                    INSET.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let now = crate::log::uptime() as u64;
+            let due = NEXT.load(Ordering::Relaxed);
+            if now >= due && NEXT.compare_exchange(due, now + 10, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                crate::xlog_info!("lab: rt resolve clear debug: {u} untranslated dispatches, {} with a known record, {} of them resolves; this one: pso {pso:#x} real {real:#x} record {:x?}", NAMED.load(Ordering::Relaxed), INSET.load(Ordering::Relaxed), sh.map(|s| s.0));
+            }
+        }
+    }
+    let Some((cs, &k)) = super::real::pso_shaders(real).or_else(|| super::real::pso_shaders(pso)).and_then(|s| Some((s.0, slots.get(&s.0)?))) else { return };
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    static CLEARS: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    static SUMMARY: AtomicU64 = AtomicU64::new(0);
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    let skipped = !super::real::is_translated_compute(real);
+    if skipped {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    let now = crate::log::uptime();
+    let due = SUMMARY.load(Ordering::Relaxed);
+    if now as u64 >= due && SUMMARY.compare_exchange(due, now as u64 + 10, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        crate::xlog_info!(
+            "lab: rt resolve clear: {seen} resolve dispatches seen ({} of skipped programs), {} image clears, {} without an image, at {now:.1} s",
+            SKIPPED.load(Ordering::Relaxed),
+            CLEARS.load(Ordering::Relaxed),
+            MISSES.load(Ordering::Relaxed)
+        );
+    }
+    let said = |n: u64| n <= 16 || n.is_power_of_two();
+    let Some(slot) = second_table(this).map(|t| t + 32 * k).filter(|&s| crate::gpu::shader::readable(s, 32)) else {
+        let n = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if said(n) {
+            crate::xlog_info!("lab: rt resolve clear: {cs:016x}: no table in s5, or no slot {k} in it (miss #{n})");
+        }
+        return;
+    };
+    // (the image this recording has dealt with already, by its descriptor's index: no lookups)
+    let w0 = (slot as *const u32).read_unaligned();
+    if with(this, |s| s.rt_cleared.contains(&w0)) {
+        return;
+    }
+    with(this, |s| s.rt_cleared.push(w0));
+    let Some((d, Some((res, by)))) = table_image(slot) else {
+        let n = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if said(n) {
+            let d = (slot as *const [u32; 4]).read_unaligned();
+            crate::xlog_info!("lab: rt resolve clear: {cs:016x}: slot {k} ({:08x} .. {:08x}): {} (miss #{n})", d[0], d[3], no_texture(d));
+        }
+        return;
+    };
+    let _ = d;
+    // (another list of this frame cleared it: the programs that ran there have written since)
+    static FRAME: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+    let frame = super::present::presents();
+    if FRAME.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, frame) == Some(frame) {
+        return;
+    }
+    let r = res as *mut c_void;
+    let Some(desc) = ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc()) else { return };
+    let plane = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1;
+    let pat = rt_resolve_nothing(desc.Format.0).filter(|_| plane);
+    let pair = super::depth_twin::alias_info(res).map(|a| a.dst);
+    let what = match pat {
+        None => "not a 2-D image of a format known here – left",
+        Some(_) if mode == 1 => "would be cleared",
+        Some(pat) => {
+            // (as a title's own copy into it: its CPU view is not uploaded over the fill)
+            super::title_textures::note_gpu_write(res);
+            if super::list_x::pass_fill_bytes(this, res, pat) { "cleared" } else { "NOT cleared (no fill)" }
+        }
+    };
+    let n = CLEARS.fetch_add(1, Ordering::Relaxed) + 1;
+    if said(n) {
+        crate::xlog_info!(
+            "lab: rt resolve clear #{n} {cs:016x}{}: slot {k} {res:#x} (by {by}) {}x{} format {} dimension {} mips {} (alias pair {pair:x?}): {what}, frame {frame} at {now:.1} s",
+            if skipped { " (skipped)" } else { "" },
+            desc.Width,
+            desc.Height,
+            desc.Format.0,
+            desc.Dimension.0,
+            desc.MipLevels
+        );
     }
 }
 

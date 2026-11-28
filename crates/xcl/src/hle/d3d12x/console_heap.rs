@@ -521,7 +521,7 @@ pub fn note_resource(s: &Slot, res: usize) {
     static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // (lab: `bind::backlight_clear`, `bind::ambient_floor` and `bind::scene_clamp` find their
     // images through this map)
-    if s.sampler || !(super::present::trace_frame() || *PROBE.get_or_init(|| ["XCL_POST_PROBE", "XCL_BACKLIGHT_CLEAR", "XCL_AMBIENT", "XCL_SCENE_CLAMP"].iter().any(|v| std::env::var_os(v).is_some()))) {
+    if s.sampler || !(super::present::trace_frame() || *PROBE.get_or_init(|| ["XCL_POST_PROBE", "XCL_BACKLIGHT_CLEAR", "XCL_AMBIENT", "XCL_SCENE_CLAMP", "XCL_RT_RESOLVE_CLEAR"].iter().any(|v| std::env::var_os(v).is_some()))) {
         return;
     }
     let mut g = RES.lock().unwrap();
